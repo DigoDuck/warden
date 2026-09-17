@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+.coverage
+htmlcov/
+
+# Node / frontend
+node_modules/
+dist-ssr/
+*.local
+.vite/
+
+# Ambiente e segredos
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# Editor / OS
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+
+# AI tooling (nunca versionar)
+.claude/*
+!.claude/settings.json
+!.claude/skills/
+!.claude/agents/
+!.claude/commands/
+.impeccable/
+docs/superpowers/
+estudos/
