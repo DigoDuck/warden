@@ -5,6 +5,9 @@ abre threads (cloud sessions) em paralelo, cada uma num branch e num PR próprio
 
 Docs oficiais: <https://code.claude.com/docs/en/claude-projects>
 
+> **Status em 2026-09-17: o rollout não chegou nesta conta** (web, desktop e CLI). O setup abaixo
+> fica pronto para quando chegar. Até lá, ver [Plano B](#plano-b-enquanto-o-rollout-não-chega).
+
 ## Pré-requisitos
 
 - [ ] Plano Pro ou Max e **Projects** visível na sidebar de <https://claude.ai/code> (rollout gradual).
@@ -105,3 +108,34 @@ O sandbox do Warden é `--network none` de propósito, então isso não conflita
 
 `ANTHROPIC_API_KEY` **não** vai para o ambiente das threads: elas testam com `FakeProvider`, que é
 determinístico e de graça. A demo com modelo real (`make demo`) roda na máquina local.
+
+## Plano B: enquanto o rollout não chega
+
+### O que abre a fila
+
+O primeiro lote vai para contas que **já usaram cloud sessions** e que **não têm projects antigos**
+no chat do claude.ai nem no Cowork.
+
+1. Entrar na waitlist: <https://claude.com/form/projects>
+2. Usar cloud session ao menos uma vez (é o pré-requisito citado na doc, e research preview já está
+   liberado no Pro): abrir <https://claude.ai/code>, conectar o GitHub no fluxo da primeira visita,
+   e rodar uma tarefa pequena. Do terminal, depois de conectado: `claude --cloud "..."`.
+3. Conferir <https://claude.ai/projects>. Se houver projects antigos ali, eles são o que segura a
+   conta fora do primeiro lote. Não deletar nada sem antes salvar o conteúdo que importa.
+
+### Como paralelizar sem Project
+
+| Preciso de | Ferramenta |
+|---|---|
+| Trabalho que continua com a máquina desligada, um branch e um PR por tarefa | **cloud session**: `claude --cloud "implementa o item 2 da checklist da semana 1"`. É a mesma coisa que uma thread, só que a coordenação é sua |
+| Várias tarefas independentes na máquina local, com Docker real e Postgres local | **agent view**: `claude agents` dispatcha sessões em background, cada uma no seu worktree, e mostra qual precisa de você |
+| Uma tarefa lateral que ia poluir a conversa (varredura, pesquisa, log grande) | subagent, dentro da própria sessão |
+
+O `CLAUDE.md` da raiz já serve os dois caminhos: cloud session clona o repo e lê o `CLAUDE.md` do
+mesmo jeito que uma thread de project leria. O que **não** existe fora do Project é a memória
+compartilhada entre sessões: correção feita numa sessão não chega na próxima sozinha. Enquanto
+isso, correção que vale para sempre vai para o `CLAUDE.md` por PR, não para o chat.
+
+Para o Warden especificamente: os testes de sandbox (container non-root, sem rede, fs read-only) e
+os de resume passam melhor na máquina local no começo, porque você vai querer olhar `docker ps` e
+`docker inspect` com o próprio olho antes de confiar no relato de qualquer agente.
