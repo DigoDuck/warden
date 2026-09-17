@@ -83,3 +83,25 @@ concordar por cortesia.
   trabalham vai nas project instructions.
 - Skills e subagents só chegam às threads se estiverem commitados em `.claude/skills/` ou
   `.claude/agents/` do repo — o `.gitignore` daqui já abre exceção para eles.
+
+## Ambiente das threads
+
+Thread = VM nova, sem nada da máquina local. O que já vem instalado e importa aqui: **Docker
+(docker, dockerd, docker compose)** e **PostgreSQL 16** — ambos presentes, nenhum rodando por
+padrão. Ou seja, o sandbox Docker da semana 2 e a fila em Postgres da semana 1 rodam em thread.
+
+Em **Project settings → Environment**, setup script do ambiente:
+
+```bash
+service postgresql start
+```
+
+Se as imagens do `sandbox-images/` ficarem pesadas, acrescentar `docker compose pull` ou
+`docker compose build` ao setup script: o cache do ambiente guarda as imagens no disco, então cada
+sessão nova já começa com elas.
+
+Network access fica em **Trusted** (padrão): PyPI, npm e Docker Hub liberados, o resto bloqueado.
+O sandbox do Warden é `--network none` de propósito, então isso não conflita.
+
+`ANTHROPIC_API_KEY` **não** vai para o ambiente das threads: elas testam com `FakeProvider`, que é
+determinístico e de graça. A demo com modelo real (`make demo`) roda na máquina local.
