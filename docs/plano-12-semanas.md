@@ -244,13 +244,22 @@
 **Estudar antes (3 h):** Semgrep rules, CodeQL no GitHub, pip-audit, gitleaks, template de postmortem.
 
 **Entregas:**
-- Lifecycle `draft → pending_review → approved → active → deprecated → revoked` com endpoints, roles e audit; tela Agent Registry completa.
+- `registry/manifest.py`: schema Pydantic do capability manifest (filesystem, shell, network, mcp, skills, secrets) com globs compiláveis e tools validadas contra o catálogo.
+- `registry/fit.py`: `manifest_fits_policy()`, que recusa promoção quando o manifest pede capability fora da policy, apontando qual; e injeção do manifest como deny implícito na avaliação (interseção policy ∩ manifest).
+- `registry/risk.py`: função pura e versionada (`risk_model: v1`) manifest → `low|medium|high|critical`, alimentando o campo `risk` do `PolicyContext`.
+- Pipeline de admissão nas transições: schema → policy fit → security scan → risk → aprovação humana (obrigatória em `risk >= high`, por role diferente do owner) → `active` com `manifest_hash` no audit.
+- Lifecycle `draft → pending_review → approved → active → deprecated → revoked` com endpoints, roles e audit; tela Agent Registry completa, com a linha de resumo de capabilities, o diff contra a versão anterior e o detalhe da pontuação de risco.
 - `incidents/detectors.py` (os 6 detectores da seção 25), `incidents/contain.py` (cancel, revoke jti, preservar sandbox e workspace), tela Incidents com timeline e postmortem.
 - Regra: incidente gera stub de behavioral eval em `evals/datasets/from_incidents.yaml`.
 - CI: Semgrep, pip-audit, npm audit, gitleaks, CodeQL semanal; `permissions:` mínimas; environments para deploy.
 - Se sobrar tempo: `ClaudeAgentSDKRuntime` como segundo adapter e comparação de 5 tarefas (ADR-012).
 
 **Pronto quando:**
+- [ ] manifest pedindo `write: ["**"]` é recusado na promoção com a capability excedente nomeada na resposta
+- [ ] manifest mais restrito que a policy reduz de fato: `write_file("tests/x.py")` permitido pela policy vira deny para esse agent_version (teste)
+- [ ] `risk.py` tem tabela de casos (manifest → score esperado) e dois manifests diferindo só em `network.allow` caem em faixas diferentes
+- [ ] alterar uma capability de um manifest `active` é rejeitado; o caminho é versão nova em `draft`
+- [ ] a UI mostra a linha `N MCPs · Network restricted · N credenciais temporárias · Risk: X` e o detalhe explica cada ponto somado
 - [ ] agente `revoked` não faz claim e seus tokens em aberto são rejeitados
 - [ ] injeção simulada dispara incidente: tarefa CANCELLED, jti revogado, sandbox preservado, trace linkado; postmortem salvo
 - [ ] CI de segurança verde com zero findings high

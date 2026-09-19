@@ -662,7 +662,7 @@ Regra: **todo incidente vira um behavioral eval.** É assim que o sistema melhor
 
 ### 26. Sistema de Agent Registry
 
-Um agente é uma **especificação versionada**, não um processo. `agent_versions.manifest`:
+Um agente é uma **especificação versionada**, não um processo. O manifest é a unidade de governança: é ele que entra em revisão, recebe aprovação, ganha um hash e fica no audit. `agent_versions.manifest`:
 
 ```yaml
 name: claude-coder
@@ -671,21 +671,62 @@ runtime: native            # native | claude_agent_sdk
 model_policy: capability_based
 role: worker
 tools: [read_file, list_files, write_file, apply_patch, run_command, run_tests, finish]
-mcp_servers:
-  - { name: warden-repo, version: 0.2.0, hash: "sha256:..." }
-  - { name: warden-github, version: 0.1.0, hash: "sha256:..." }
-skills:
-  - { name: python-testing, source: "git+https://...", version: 1.0.0, hash: "sha256:..." }
-scopes: [repo:read, repo:write, tests:run, github:pr:open]
+
+# Capability Manifest: a superfície de ataque que este agente PEDE.
+# Declaração, não concessão (regra 1 abaixo).
+capabilities:
+  filesystem:
+    read:  ["src/**", "tests/**", "*.md", "pyproject.toml"]
+    write: ["src/**", "tests/**"]
+  shell:
+    allow: [pytest, ruff, mypy]
+  network:
+    allow: ["api.github.com"]    # alcançável só via gateway; o sandbox segue --network none
+  mcp:
+    - { name: warden-repo,   version: 0.2.0, hash: "sha256:..." }
+    - { name: warden-github, version: 0.1.0, hash: "sha256:..." }
+  skills:
+    - { name: python-testing, source: "git+https://...", version: 1.0.0, hash: "sha256:..." }
+  secrets:
+    github_token: { scope: "pull_requests:write", lifetime: 15m }
+
+scopes: [repo:read, repo:write, tests:run, github:pr:open]   # derivado das capabilities, não escrito à mão
 sandbox_profile: python-restricted
 policy: policies/worker-default.yaml
 budget_default: { max_usd: 0.50, max_iterations: 30, max_seconds: 900 }
 system_prompt_version: 2026-09-14
+risk: computed               # derivado do manifest, nunca escrito à mão (regra 2)
 ```
 
-Lifecycle: `draft → pending_review → approved → active → deprecated → revoked`. Transições são endpoints com autorização por role e auditoria. `revoked` invalida tokens em aberto e impede claim de tarefas.
+**Regra 1: o manifest restringe, nunca concede.** Permissão efetiva = `interseção(policy, manifest)`. Um manifest pedindo `write: ["**"]` não ganha nada: continua valendo o que a policy permite. Um manifest pedindo `write: ["src/**"]` num agente cuja policy permite `src/**` e `tests/**` **perde** o acesso a `tests/**`. Implementação: na avaliação, o manifest entra como um conjunto de regras de `deny` implícitas com escopo daquele `agent_version`: nada de novo na engine, porque "o efeito mais restritivo vence" já é a semântica (seção 17).
+
+Sem essa regra o manifest vira um segundo ponto de autorização, contradiz a tese do projeto e cria exatamente o furo que ele aparenta fechar: um agente com manifest generoso *parece* autorizado na UI sem que ninguém tenha autorizado nada. O policy engine continua sendo a única autoridade. **Frase para defender em entrevista: capability manifest é pedido, policy é concessão.**
+
+**Regra 2: `risk` é computado, não declarado.** Risco auto-atestado pelo autor do agente é a mesma auto-atestação que o control plane existe para eliminar. `registry/risk.py` é uma função pura e versionada que lê o manifest e soma pontos: rede permitida, shell fora da allowlist conhecida, `write` fora de `src/`|`tests/`, segredo com `lifetime > 1h` ou scope de escrita, MCP/skill com `trust_level < verified`, ausência de `sandbox_profile`. O score cai em `low | medium | high | critical`, que é exatamente o campo `risk` do `PolicyContext` (seção 17), então a regra `require_approval when risk >= high` passa a valer sobre um número derivado de evidência. Versionar a função: `risk_model: v1` junto do score, senão a comparação histórica mente.
+
+`scopes` deixa de ser lista escrita à mão e passa a ser **derivada** das capabilities: é o teto do que um token de run pode receber. Manter as duas listas independentes seria a mesma duplicação que a regra 1 evita, um nível acima. A decisão de policy continua escolhendo, por chamada, um subconjunto desse teto (seção 17).
+
+**O que o manifest não é:** não é uma linguagem de política. Listas e globs, sem `when`, sem `unless`, sem condicional. No dia em que precisar de lógica, a lógica vai para `policies/`, que já tem engine, testes de tabela e `simulate`. Duas engines de política é o modo mais rápido de ter zero.
+
+**Pipeline de admissão** (dá nome e tela às transições do lifecycle):
+
+```
+manifest (draft)
+  → schema validation      Pydantic; globs compiláveis; tools existentes no catálogo
+  → policy fit             manifest ⊄ policy? recusa apontando a capability excedente
+  → security scan          baixa MCP/skills, confere hash contra warden.lock, trust_level,
+                           Semgrep na skill, descrições de tool passam pelo guard
+  → risk score             risk.py v1 → low|medium|high|critical
+  → human approval         obrigatório para risk >= high; role != owner do agente
+  → registry (active)      manifest_hash no audit; capabilities viram deny implícito na policy
+  → runtime                worker só faz claim com agent_version active; hash confere no claim
+```
+
+Lifecycle: `draft → pending_review → approved → active → deprecated → revoked`. Transições são endpoints com autorização por role e auditoria. `revoked` invalida tokens em aberto e impede claim de tarefas. Mudou uma capability? É **versão nova** em `draft`, não edição in-place. Um manifest `active` é imutável, senão o hash no audit não significa nada.
 
 Supply chain (v0.3): ao registrar MCP server ou skill, o sistema baixa, calcula hash, extrai permissões declaradas, guarda origem e data, e exige aprovação de `trust_level >= verified` para agentes `active`. Um `warden.lock` no repo lista tudo com hash (o conceito de lockfile aplicado a dependências de agente). Bônus: SBOM simples em JSON gerado do lock.
+
+Custo real desta seção: o manifest já é `JSONB` em `agent_versions` (seção 13), então não há migração. O que entra é schema Pydantic, `risk.py`, `manifest_fits_policy()` e a linha de badges da tela. Tudo dentro de E16, semana 11. Não move o MVP.
 
 ---
 
@@ -696,7 +737,7 @@ Supply chain (v0.3): ao registrar MCP server ou skill, o sistema baixa, calcula 
 1. **Control Plane (home):** tabela de agentes/tarefas ativas. Colunas: Agent · Status · Task · Runtime · Model · Cost · Sandbox · Policy · Trace. Atualiza por SSE. Filtros por status e agente.
 2. **Task Detail:** navegação lateral em etapas: Spec → Context → Execution (timeline de iterações e tool calls com decisão de policy inline) → Diff → Tests/Evidence → Security → Cost → Decision (aprovações e verdict). Botões: Cancel, Resume, abrir trace.
 3. **Decision Queue:** cards de aprovação pendente com ação, agente, risco (badge), justificativa (marcada como gerada pelo modelo), recursos afetados, diff parcial, Approve/Reject com nota.
-4. **Agent Registry:** lista com nome, owner, versão, runtime, modelo, trust level, status, custo acumulado. Detalhe mostra manifest, tools, scopes, skills, MCP servers e botões de transição de lifecycle.
+4. **Agent Registry:** lista com nome, owner, versão, runtime, modelo, trust level, status, custo acumulado. Cada linha traz o **resumo de capabilities** derivado do manifest, uma frase legível por humano: `Backend Coder · 2 MCPs · Network restricted · 1 credencial temporária · Risk: Medium`. O badge de risco leva ao detalhe da pontuação (que capability somou quanto, com `risk_model` usado), porque badge sem justificativa é decoração. Detalhe mostra o manifest completo, o diff de capabilities contra a versão anterior, o resultado do pipeline de admissão e os botões de transição de lifecycle.
 5. **Policies:** editor YAML com validação, hash atual, e painel **Simulate** (preenche contexto e vê decisão e regras que casaram).
 6. **Evals:** datasets, runs, comparação entre estratégias (tabela + gráfico de custo por sucesso).
 7. **Metrics:** success rate, custo/tarefa, tokens/tarefa, latência, tool failures, iterações médias, intervenção humana, escalation rate. Filtro por período, agente, estratégia.
@@ -820,6 +861,7 @@ Formato: contexto, decisão, alternativas, consequências. Escrever no momento e
 - ADR-012 Worker com acesso ao socket Docker: risco aceito e alternativas
 - ADR-013 Contexto por AST antes de embeddings (e critério para adicionar RAG)
 - ADR-014 Guard detecta, policy impõe
+- ADR-015 Capability manifest: pedido do agente, não concessão; risco computado e versionado em vez de auto-declarado
 
 ---
 
@@ -844,7 +886,7 @@ Classificação: **[MVP]** obrigatório · **[EVO]** evolução importante · **
 - E13 Segundo provider + resiliência (retry, circuit breaker, fallback) **[EVO]**
 - E14 Model Router com 3 estratégias + experimento publicado **[EVO]**
 - E15 Reviewer independente vs self-review + experimento **[EVO]**
-- E16 Agent Registry com lifecycle + UI **[EVO]**
+- E16 Agent Registry: capability manifest, risk computado, pipeline de admissão, lifecycle + UI **[EVO]**
 - E17 MCP Gateway + servers próprios **[EVO]**
 - E18 Supply chain: registro com hash, trust level, lockfile **[EVO]**
 - E19 Context engineering por AST + experimento com/sem **[EVO]**
@@ -880,7 +922,7 @@ Traces no Jaeger; página Metrics; segundo provider (OpenAI-compatible, apontand
 
 ### 40. v0.3: governar
 
-Registry com lifecycle e UI; MCP gateway com authn/authz/validação/rate limit/audit; servers `warden-repo`, `warden-github`, `warden-security`; supply chain com hash, trust level e lockfile; contexto por AST com experimento; guard com evals de injeção; incidentes com contenção e postmortem; CodeQL/Semgrep/pip-audit/gitleaks no CI.
+Registry com capability manifest (pipeline de admissão e risco computado), lifecycle e UI; MCP gateway com authn/authz/validação/rate limit/audit; servers `warden-repo`, `warden-github`, `warden-security`; supply chain com hash, trust level e lockfile; contexto por AST com experimento; guard com evals de injeção; incidentes com contenção e postmortem; CodeQL/Semgrep/pip-audit/gitleaks no CI.
 
 ### 41. Versão portfolio-ready (v1.0)
 
