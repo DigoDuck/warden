@@ -1,0 +1,63 @@
+[project]
+name = "warden"
+version = "0.1.0"
+description = "Control plane para workloads agentic"
+requires-python = ">=3.13"
+dependencies = [
+    "sqlalchemy[asyncio]>=2.0.36",
+    "asyncpg>=0.30.0",
+    "alembic>=1.14.0",
+    "pydantic>=2.10.0",
+    "pydantic-settings>=2.7.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.25.0",
+    "ruff>=0.8.0",
+    "mypy>=1.14.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["warden"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "ASYNC"]
+
+[tool.mypy]
+python_version = "3.13"
+warn_redundant_casts = true
+warn_unused_ignores = true
+files = ["warden", "tests"]
+
+# strict so em policy/ e core/ (briefing, secao 43 item 1). "strict = true" nao e
+# aceito em secao por modulo, entao vai expandido nas flags que ele liga.
+[[tool.mypy.overrides]]
+module = ["warden.policy.*", "warden.core.*"]
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+disallow_untyped_calls = true
+disallow_untyped_decorators = true
+disallow_any_generics = true
+check_untyped_defs = true
+warn_return_any = true
+no_implicit_reexport = true
+strict_equality = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+# Fixture e teste precisam da MESMA loop: o engine e criado uma vez por sessao, e uma
+# conexao asyncpg aberta numa loop nao pode ser usada em outra. Deixar o default
+# ("function" para teste, "session" para fixture) da "Event loop is closed" no segundo teste.
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
+testpaths = ["tests"]

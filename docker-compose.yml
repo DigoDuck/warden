@@ -1,0 +1,25 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: warden
+      POSTGRES_PASSWORD: warden
+      POSTGRES_DB: warden
+    ports:
+      # A porta do host e configuravel porque 5432 quase nunca esta livre: costuma haver
+      # um PostgreSQL nativo no Windows, e os outros projetos com Compose ja tomam as
+      # vizinhas. O conflito nao falha no bind, falha com "connection closed" na primeira
+      # query, que e bem mais caro de diagnosticar. Dentro do container segue 5432.
+      - "${WARDEN_DB_PORT:-5434}:5432"
+    volumes:
+      - warden-db:/var/lib/postgresql/data
+    healthcheck:
+      # migrate roda logo depois de db-up; sem healthcheck o primeiro alembic pega o
+      # Postgres ainda inicializando e falha com "connection refused".
+      test: ["CMD-SHELL", "pg_isready -U warden -d warden"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  warden-db:

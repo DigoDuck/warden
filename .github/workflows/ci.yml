@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: warden
+          POSTGRES_PASSWORD: warden
+          POSTGRES_DB: warden
+        ports:
+          # mesma porta padrao do compose local, para a URL ser identica nos dois lugares
+          - 5434:5432
+        options: >-
+          --health-cmd "pg_isready -U warden -d warden"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgresql+asyncpg://warden:warden@localhost:5434/warden
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: backend/uv.lock
+
+      - run: uv sync --directory backend --locked
+
+      - run: uv run --directory backend ruff check
+
+      - run: uv run --directory backend ruff format --check
+
+      - run: uv run --directory backend mypy
+
+      # A migracao inicial foi escrita a mao. `alembic check` compara o schema aplicado
+      # com os modelos e falha se alguem mexer num sem mexer no outro.
+      - run: uv run --directory backend alembic upgrade head
+
+      - run: uv run --directory backend alembic check
+
+      - run: uv run --directory backend pytest
