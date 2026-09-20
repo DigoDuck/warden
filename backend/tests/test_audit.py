@@ -11,7 +11,7 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from warden import audit
-from warden.audit.log import GENESIS_HASH, VerifyResult, _canonical_json, _compute_hash
+from warden.audit.log import _LOCK_KEY, GENESIS_HASH, VerifyResult, _canonical_json, _compute_hash
 from warden.models import AuditLog
 
 
@@ -230,22 +230,46 @@ async def test_truncate_fails_under_the_app_role(session: AsyncSession) -> None:
 # --- the advisory lock: concurrent appenders must not fork the chain ----------------------
 
 
-async def test_concurrent_appends_from_two_sessions_produce_a_valid_chain(
+async def test_a_held_lock_blocks_a_second_appender_until_the_holder_commits(
     session: AsyncSession,
     session_factory: async_sessionmaker[AsyncSession],
     clean_committed_audit_log: None,
 ) -> None:
-    """Without pg_advisory_xact_lock, two sessions could both read the same last hash as
-    `prev_hash` and each insert a row claiming to extend the chain, forking it instead of
-    extending it. Run genuinely concurrently, each in its own session, each committing.
+    """Exercises `pg_advisory_xact_lock` directly instead of racing two coroutines and
+    hoping they overlap in time. An earlier version of this test ran `append()` from two
+    sessions under `asyncio.gather` and asserted the chain came out unforked; with the lock
+    call deleted from `append()`, that version still passed 4 times out of 5 locally,
+    because forcing two coroutines to race in real wall-clock time against a real
+    database is exactly the kind of thing that doesn't reproduce reliably. Holding the
+    lock open in one session and asserting the second session's `append()` cannot
+    proceed within a timeout is deterministic: it goes red on every run with the lock
+    call removed, not most of them.
     """
+    holder = session_factory()
+    waiter = session_factory()
+    try:
+        await holder.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": _LOCK_KEY})
 
-    async def append_with(actor: str) -> None:
-        async with session_factory() as own_session:
-            await audit.append(own_session, actor_type="system", actor_id=actor, action="race")
-            await own_session.commit()
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(
+                audit.append(waiter, actor_type="system", actor_id="waiter", action="race"),
+                timeout=0.5,
+            )
 
-    await asyncio.gather(append_with("worker-a"), append_with("worker-b"))
+        await holder.commit()  # releases the transaction-scoped advisory lock
+    finally:
+        await holder.close()
+        # `waiter`'s query was cancelled mid-flight; close it rather than trust its
+        # connection is still in a reusable state, and open a fresh session below.
+        await waiter.close()
+
+    async with session_factory() as fresh:
+        row = await audit.append(fresh, actor_type="system", actor_id="waiter", action="race")
+        await fresh.commit()
+
+    # The holder only ever held the lock, it never called append(): the row above is the
+    # only one in the log, and it chains from genesis, not from some phantom predecessor.
+    assert row.prev_hash == GENESIS_HASH
 
     result = await audit.verify(session)
-    assert result == VerifyResult(ok=True, rows_checked=2)
+    assert result == VerifyResult(ok=True, rows_checked=1)
