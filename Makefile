@@ -1,4 +1,4 @@
-.PHONY: db-up db-down migrate revision test lint fmt demo-fake demo
+.PHONY: db-up db-down migrate revision test lint fmt demo-fake demo worker
 
 # --directory avoids "cd backend &&", which breaks when the Windows make picks
 # cmd.exe instead of sh. Each recipe stays a single command.
@@ -35,3 +35,7 @@ demo-fake:
 # Calls the real API. Needs ANTHROPIC_API_KEY in .env, and spends money.
 demo:
 	$(UV) python -m warden.demo --provider anthropic
+
+# Claims queued tasks and runs them until stopped. Several may run at once.
+worker:
+	$(UV) python -m warden.core.worker

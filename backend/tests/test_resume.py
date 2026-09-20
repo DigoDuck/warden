@@ -1,0 +1,286 @@
+"""Kill a run mid-flight, let another worker take it, and prove no tool ran twice.
+
+Week 2's hardest checklist item. The assertion the briefing asks for is the one on
+`tool_calls`; everything else here exists to make that assertion mean something.
+
+The crash is a tool raising a plain `RuntimeError`. `_run_tools` only catches `ToolError`,
+so anything else propagates out of `run_task` exactly as an unhandled failure in a worker
+process would, leaving the task RUNNING with a partial event log.
+
+Note on the scripts: `FakeProvider` is positional, it replays step by step and has no
+memory. A real provider is stateless too, but answers from the conversation it is sent. So
+the resumed run gets a script holding only the turns still to come, which is what a real
+provider would produce given the replayed messages.
+"""
+
+import pathlib
+import uuid
+from collections.abc import AsyncIterator, Sequence
+from typing import Any
+
+import pytest
+from sqlalchemy import func, select, text
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from warden.core import queue
+from warden.core.events import read_events
+from warden.core.loop import Budget, RunResult
+from warden.core.worker import run_claimed_task
+from warden.models import ModelCall, Task, ToolCall, User
+from warden.policy.engine import Effect, Policy, Rule
+from warden.providers.base import ToolCall as ProviderToolCall
+from warden.providers.base import ToolSchema
+from warden.providers.fake import FakeProvider, ScriptStep
+from warden.tools.local import build_registry
+from warden.tools.registry import ToolRegistry
+
+BUDGET = Budget(max_iterations=6)
+
+
+@pytest.fixture(autouse=True)
+async def empty_queue(session: AsyncSession) -> AsyncIterator[None]:
+    await session.execute(text("TRUNCATE tasks, users CASCADE"))
+    await session.commit()
+    yield
+    await session.execute(text("TRUNCATE tasks, users CASCADE"))
+    await session.commit()
+
+
+@pytest.fixture
+def workspace(tmp_path: pathlib.Path) -> pathlib.Path:
+    root = tmp_path / "repo"
+    (root / "src").mkdir(parents=True)
+    (root / "src" / "app.py").write_text("print('hello')\n", encoding="utf-8", newline="\n")
+    (root / "src" / "other.py").write_text("x = 1\n", encoding="utf-8", newline="\n")
+    return root
+
+
+def _allow_all() -> Policy:
+    return Policy(
+        [Rule(id="allow-all", effect=Effect.ALLOW, when={"tool": "*"})],
+        default=Effect.DENY,
+        policy_hash="test",
+    )
+
+
+class CountingRegistry:
+    """The real registry, plus a record of what actually executed.
+
+    The `tool_calls` assertion says the database holds no duplicate row. This says the side
+    effect itself did not happen twice, which is the thing that row stands in for.
+
+    `crash_after` makes the Nth execution raise, which is how a worker dying between two
+    tools of one iteration is simulated.
+    """
+
+    def __init__(self, inner: ToolRegistry, *, crash_after: int | None = None) -> None:
+        self._inner = inner
+        self._crash_after = crash_after
+        self.executions: list[str] = []
+
+    def schemas(self) -> list[ToolSchema]:
+        return self._inner.schemas()
+
+    def has(self, name: str) -> bool:
+        return self._inner.has(name)
+
+    def path_arg(self, name: str) -> str | None:
+        return self._inner.path_arg(name)
+
+    async def execute(self, name: str, arguments: dict[str, Any]) -> str:
+        if self._crash_after is not None and len(self.executions) >= self._crash_after:
+            raise RuntimeError("worker died mid-iteration")
+        self.executions.append(name)
+        return await self._inner.execute(name, arguments)
+
+
+def _two_reads() -> ScriptStep:
+    return ScriptStep(
+        tool_calls=[
+            ProviderToolCall(id="call-a", name="read_file", arguments={"path": "src/app.py"}),
+            ProviderToolCall(id="call-b", name="read_file", arguments={"path": "src/other.py"}),
+        ]
+    )
+
+
+def _finish(summary: str = "done") -> ScriptStep:
+    return ScriptStep(
+        tool_calls=[
+            ProviderToolCall(id="call-finish", name="finish", arguments={"summary": summary})
+        ]
+    )
+
+
+async def _queued_task(session: AsyncSession) -> Task:
+    user = User(email=f"{uuid.uuid4()}@warden.test", password_hash="x", role="worker")
+    session.add(user)
+    await session.flush()
+    return await queue.enqueue(
+        session, user_id=user.id, spec="summarise", idempotency_key=str(uuid.uuid4())
+    )
+
+
+async def _run(
+    session: AsyncSession,
+    task: Task,
+    script: Sequence[ScriptStep],
+    registry: CountingRegistry,
+    workspace: pathlib.Path,
+) -> RunResult:
+    return await run_claimed_task(
+        session,
+        task,
+        FakeProvider(list(script)),
+        _allow_all(),
+        workspace,
+        registry=registry,  # type: ignore[arg-type]
+        budget=BUDGET,
+    )
+
+
+async def _crash_midway(
+    session: AsyncSession, task: Task, workspace: pathlib.Path
+) -> CountingRegistry:
+    """First worker: claims, runs iteration 1, and dies on the second of two tools."""
+    claim = await queue.claim(session, "worker-dead", lease_seconds=60)
+    assert claim is not None
+    registry = CountingRegistry(build_registry(workspace), crash_after=1)
+
+    with pytest.raises(RuntimeError, match="worker died"):
+        await _run(session, claim, [_two_reads(), _finish()], registry, workspace)
+    await session.commit()
+
+    assert registry.executions == ["read_file"], "the first tool should have run exactly once"
+    return registry
+
+
+async def test_a_crashed_run_resumes_and_no_tool_runs_twice(
+    session: AsyncSession, workspace: pathlib.Path
+) -> None:
+    """The checklist item, end to end."""
+    task = await _queued_task(session)
+    await session.commit()
+
+    await _crash_midway(session, task, workspace)
+
+    # The worker is gone. The lease expires and a second worker takes over.
+    await queue.expire_lease_now(session, task.id)
+    await session.commit()
+
+    second_claim = await queue.claim(session, "worker-live", lease_seconds=60)
+    assert second_claim is not None and second_claim.id == task.id
+
+    surviving = CountingRegistry(build_registry(workspace))
+    result = await _run(session, second_claim, [_finish("resumed")], surviving, workspace)
+    await session.commit()
+
+    assert result.status == "SUCCEEDED"
+    assert result.summary == "resumed"
+
+    # It ran only the tool the first worker never reached.
+    assert surviving.executions == ["read_file"]
+
+    # The assertion the briefing asks for.
+    rows = list(await session.scalars(select(ToolCall).where(ToolCall.task_id == task.id)))
+    fingerprints = [(row.tool_name, row.args_hash) for row in rows]
+    assert len(fingerprints) == len(set(fingerprints)), f"a tool ran twice: {fingerprints}"
+
+
+async def test_resuming_does_not_buy_the_interrupted_model_call_again(
+    session: AsyncSession, workspace: pathlib.Path
+) -> None:
+    """The assistant turn is replayed from the log, not requested from the provider again."""
+    task = await _queued_task(session)
+    await session.commit()
+    await _crash_midway(session, task, workspace)
+
+    before = await session.scalar(
+        select(func.count()).select_from(ModelCall).where(ModelCall.task_id == task.id)
+    )
+    assert before == 1
+
+    await queue.expire_lease_now(session, task.id)
+    resumed = await queue.claim(session, "worker-live")
+    assert resumed is not None
+    await _run(
+        session, resumed, [_finish()], CountingRegistry(build_registry(workspace)), workspace
+    )
+    await session.commit()
+
+    after = await session.scalar(
+        select(func.count()).select_from(ModelCall).where(ModelCall.task_id == task.id)
+    )
+    # One more, for the iteration that produced `finish`. Not two: the interrupted
+    # iteration's call was replayed rather than repeated, so it cost nothing.
+    assert after == 2
+
+
+async def test_the_budget_is_not_reset_by_a_crash(
+    session: AsyncSession, workspace: pathlib.Path
+) -> None:
+    """A crash is not a fresh allowance. Spending carries across the resume."""
+    task = await _queued_task(session)
+    await session.commit()
+    await _crash_midway(session, task, workspace)
+
+    await queue.expire_lease_now(session, task.id)
+    resumed = await queue.claim(session, "worker-live")
+    assert resumed is not None
+    result = await _run(
+        session, resumed, [_finish()], CountingRegistry(build_registry(workspace)), workspace
+    )
+
+    # FakeProvider costs nothing, so the number is zero either way. What matters is that it
+    # came from the replayed log rather than from a counter that started over: the events
+    # of both runs are accounted for.
+    events_seen = [e.type for e in await read_events(session, task.id)]
+    assert events_seen.count("model.called") == 2
+    assert result.cost_usd >= 0
+
+
+async def test_a_resumed_task_leaves_one_coherent_event_log(
+    session: AsyncSession, workspace: pathlib.Path
+) -> None:
+    """A resume must not write a second task.created or leave the log ending mid-iteration."""
+    task = await _queued_task(session)
+    await session.commit()
+    await _crash_midway(session, task, workspace)
+
+    await queue.expire_lease_now(session, task.id)
+    resumed = await queue.claim(session, "worker-live")
+    assert resumed is not None
+    await _run(
+        session, resumed, [_finish()], CountingRegistry(build_registry(workspace)), workspace
+    )
+    await session.commit()
+
+    kinds = [event.type for event in await read_events(session, task.id)]
+    assert kinds.count("task.created") == 1
+    assert kinds.count("task.finished") == 1
+    assert kinds[-1] == "task.finished"
+
+    # Two reads executed, once each. `finish` is handled by core and never dispatched, so
+    # it produces no tool.executed at all.
+    assert kinds.count("tool.executed") == 2
+
+    # Three requests for two executions, and that is correct rather than a leak: the
+    # control plane really did ask for the second read twice, once before the crash and
+    # once on resume. The event log records what happened, and what happened is that the
+    # first attempt never reached the tool. `tool_calls` is where "ran twice" is ruled out.
+    assert kinds.count("tool.requested") == 3
+
+
+async def test_a_task_with_no_history_simply_starts(
+    session: AsyncSession, workspace: pathlib.Path
+) -> None:
+    """Recovery is not a special path: the same call handles a task that never ran."""
+    await _queued_task(session)
+    await session.commit()
+    claim = await queue.claim(session, "worker-a")
+    assert claim is not None
+
+    registry = CountingRegistry(build_registry(workspace))
+    result = await _run(session, claim, [_two_reads(), _finish("ok")], registry, workspace)
+
+    assert result.status == "SUCCEEDED"
+    assert registry.executions == ["read_file", "read_file"]

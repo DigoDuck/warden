@@ -20,6 +20,7 @@ from uuid import UUID
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from warden.core import events
+from warden.core.replay import ResumeState
 from warden.models import Task, User
 from warden.policy.engine import Decision, Effect, Policy, PolicyContext, UserRef
 from warden.providers.base import (
@@ -101,9 +102,10 @@ async def run_task(
     *,
     workspace: pathlib.Path,
     budget: Budget | None = None,
+    resume: ResumeState | None = None,
 ) -> RunResult:
     budget = budget or Budget()
-    spent = Decimal("0")
+    spent = resume.spent if resume else Decimal("0")
 
     user = await session.get(User, task.user_id)
     user_ref = UserRef(id=task.user_id, role=user.role if user else "worker")
@@ -119,17 +121,41 @@ async def run_task(
         )
     )
 
-    messages: list[Message] = [UserMessage(text=task.spec)]
     task.status = "RUNNING"
-    task.started_at = datetime.now(UTC)
-    await events.append_event(
-        session,
-        task.id,
-        events.TASK_CREATED,
-        {"spec": task.spec, "policy_hash": policy.policy_hash[:12]},
-    )
 
-    for iteration in range(1, budget.max_iterations + 1):
+    if resume is None:
+        messages: list[Message] = [UserMessage(text=task.spec)]
+        first_iteration = 1
+        task.started_at = datetime.now(UTC)
+        await events.append_event(
+            session,
+            task.id,
+            events.TASK_CREATED,
+            {"spec": task.spec, "policy_hash": policy.policy_hash[:12]},
+        )
+    else:
+        messages = list(resume.messages)
+        first_iteration = resume.next_iteration
+        if resume.is_mid_iteration:
+            # The interrupted iteration is finished, not restarted: its assistant turn is
+            # already in the messages and its tool_use blocks are still unanswered. Running
+            # only the calls that never executed is what keeps "no tool runs twice" true.
+            fresh = await _run_tools(
+                session,
+                task.id,
+                first_iteration,
+                resume.pending_tool_calls,
+                registry,
+                policy,
+                user_ref,
+                workspace,
+            )
+            # Results already obtained travel with the new ones: the API wants every
+            # tool_use from a turn answered in a single message.
+            messages.append(ToolResultsMessage(results=[*resume.partial_results, *fresh]))
+            first_iteration += 1
+
+    for iteration in range(first_iteration, budget.max_iterations + 1):
         await events.append_event(session, task.id, events.ITERATION_STARTED, {"n": iteration})
 
         completion = await provider.generate(messages, tools=tool_schemas, system=SYSTEM_PROMPT)
@@ -145,6 +171,10 @@ async def run_task(
                 "tokens_in": completion.usage.input_tokens,
                 "tokens_out": completion.usage.output_tokens,
                 "cost_usd": str(cost),
+                # Verbatim, because ADR-016 says the assistant turn goes back to the
+                # provider exactly as it came. This is the field that makes replay possible
+                # at all, and without it the conversation cannot be rebuilt after a crash.
+                "raw_content": completion.raw_content,
             },
         )
 
@@ -272,7 +302,14 @@ async def _run_tools(
     results: list[ToolResult] = []
     for call in calls:
         await events.append_event(
-            session, task_id, events.TOOL_REQUESTED, {"tool": call.name, "id": call.id}
+            session,
+            task_id,
+            events.TOOL_REQUESTED,
+            # Full arguments, not the redacted ones that go to `tool_calls.args_safe`.
+            # Replay needs to re-issue a pending call, and "[redacted]" is not a path. Safe
+            # because the model never sees credentials: the broker injects them at
+            # execution, so an argument the model produced contains no secret by design.
+            {"tool": call.name, "id": call.id, "arguments": call.arguments},
         )
 
         decision = policy.evaluate(_build_context(call, registry, user, workspace, task_id))
@@ -327,6 +364,11 @@ async def _run_tools(
                 "ok": error is None,
                 "effect": decision.effect.value,
                 "duration_ms": duration_ms,
+                # The full output, not the 500-character summary in `tool_calls`. That one
+                # is for a human reading the timeline; this one has to rebuild the exact
+                # tool_result the model already saw.
+                "output": output,
+                "is_error": error is not None,
             },
         )
         results.append(ToolResult(tool_call_id=call.id, content=output, is_error=error is not None))

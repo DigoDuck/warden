@@ -116,3 +116,22 @@ def test_registry_exposes_a_stable_tool_order(workspace: pathlib.Path) -> None:
     """A varying tool list silently invalidates the prompt cache."""
     names = [schema.name for schema in build_registry(workspace).schemas()]
     assert names == sorted(names)
+
+
+async def test_listing_skips_vendored_dependencies(workspace: pathlib.Path) -> None:
+    """A target repo with a .venv would otherwise fill the listing with site-packages.
+
+    Not merely noisy: the cap is 200 entries, so the agent would spend its whole listing on
+    someone else's code and never see src/ at all.
+    """
+    vendored = workspace / ".venv" / "Lib" / "site-packages" / "pytest"
+    vendored.mkdir(parents=True)
+    (vendored / "__init__.py").write_text("", encoding="utf-8", newline="\n")
+    (workspace / "__pycache__").mkdir()
+    (workspace / "__pycache__" / "app.cpython-313.pyc").write_bytes(b"\x00")
+
+    listing = await list_files(workspace, ListFilesArgs(pattern="**/*"))
+
+    assert "src/app.py" in listing
+    assert ".venv" not in listing
+    assert "__pycache__" not in listing
