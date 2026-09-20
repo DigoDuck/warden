@@ -180,6 +180,30 @@ class ModelCall(Base):
     error: Mapped[str | None] = mapped_column(Text, default=None)
 
 
+class IssuedToken(Base):
+    """One row per JWT this control plane has signed. See warden/identity/jwt.py and ADR-005.
+
+    Keyed by `jti` itself rather than a separate surrogate id: the token's own identifier is
+    already the row's natural key, so a second uuid column would only duplicate it. Unlike
+    `audit_log`, this table has a real foreign key to `tasks`: it is bookkeeping for a token's
+    own lifecycle (verify's fail-closed lookup, revocation), not an independent trail that has
+    to keep making sense after the task it names is gone.
+    """
+
+    __tablename__ = "issued_tokens"
+
+    jti: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    subject: Mapped[str] = mapped_column(String(128))
+    # NULL for a user token: only an agent token is scoped to one run of one task.
+    task_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("tasks.id", ondelete="CASCADE"), index=True, default=None
+    )
+    scopes: Mapped[list[str]] = mapped_column(JSONB, default=list)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    issued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class AuditLog(Base):
     """One append-only, hash-chained entry. See warden/audit/log.py and ADR-007.
 

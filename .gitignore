@@ -25,6 +25,10 @@ dist-ssr/
 *.pem
 *.key
 secrets/
+# Chave de assinatura JWT gerada por `make keys` (warden/identity/generate_keys.py).
+# *.pem acima já cobre o arquivo em si; esta entrada nomeada é intencional (defesa em
+# profundidade e clareza) caso algo mais acabe indo para essa pasta.
+.keys/
 
 # Editor / OS
 .vscode/*
