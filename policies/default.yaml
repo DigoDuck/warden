@@ -1,0 +1,91 @@
+# Default policy for worker agents.
+#
+# Semantics (ADR-003): default deny, every matching rule is collected, the most restrictive
+# effect wins, and the order of the rules in this file changes nothing. There is no way to
+# write an exception to a deny. When a deny is too broad, you write a narrower deny.
+#
+# Path patterns match one segment at a time: `*` does not cross a `/`. That is why every
+# deny below starts with `**/`, which matches zero or more leading segments and therefore
+# catches both `.env` and `config/.env`. A pattern written `.env*` would only catch the
+# first, which is the mistake this comment exists to prevent.
+
+version: 1
+default: deny
+
+rules:
+  - id: read-source
+    effect: allow
+    reason: "reading project source is the agent's job"
+    scopes: [repo:read]
+    when:
+      tool: [read_file]
+      path:
+        - "src/**"
+        - "tests/**"
+        - "**/*.md"
+        - "pyproject.toml"
+
+  - id: list-workspace
+    effect: allow
+    reason: "listing file names is bounded by the workspace itself"
+    scopes: [repo:read]
+    when:
+      # No path condition: the argument is a glob, not a path, and what it can reach is
+      # already bounded by workspace containment in the tool. The exposure is file names,
+      # which briefing section 15 rates low. Narrowing this belongs with the capability
+      # manifest, where an agent declares which subtrees it asks for.
+      tool: [list_files]
+
+  - id: never-read-secrets
+    effect: deny
+    reason: "secrets are never readable by agents, whatever the model asked for"
+    when:
+      tool: "*"
+      path:
+        - "**/.env"
+        - "**/.env.*"
+        - "**/secrets/**"
+        - "**/*.pem"
+        - "**/*.key"
+        - "**/id_rsa*"
+        - "**/credentials*"
+
+  - id: write-source
+    effect: allow
+    reason: "a worker may edit source and tests"
+    scopes: [repo:write]
+    when:
+      tool: [write_file, apply_patch]
+      path:
+        - "src/**"
+        - "tests/**"
+      user.role: worker
+
+  - id: run-project-commands
+    effect: allow
+    reason: "test and lint runners are the evidence the control plane trusts"
+    scopes: [tests:run]
+    when:
+      tool: run_command
+      args.cmd: "^(pytest|ruff|mypy|npm (test|run lint))( |$)"
+
+  - id: no-destructive-commands
+    effect: deny
+    reason: "destructive or history-rewriting command"
+    when:
+      tool: run_command
+      args.cmd: "(rm -rf|git push --force|git reset --hard|DROP TABLE|sudo |mkfs|:\\(\\)\\{)"
+
+  - id: no-network-commands
+    effect: deny
+    reason: "the sandbox has no network; external calls go through gateway tools"
+    when:
+      tool: run_command
+      args.cmd: "(^|[|;&`$( ])(curl|wget|nc|ssh|scp|pip install|npm install)( |$)"
+
+  - id: open-pr-needs-human
+    effect: require_approval
+    reason: "opening a pull request is visible outside the control plane"
+    scopes: [github:pr:open]
+    when:
+      tool: "github.open_pr"

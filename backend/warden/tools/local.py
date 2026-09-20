@@ -49,6 +49,16 @@ def resolve_in_workspace(workspace: pathlib.Path, candidate: str) -> pathlib.Pat
     return target
 
 
+def normalize_path(workspace: pathlib.Path, candidate: str) -> str:
+    """Workspace-relative POSIX form of `candidate`, for the policy engine to judge.
+
+    Built on resolve_in_workspace so that normalisation and containment cannot drift apart.
+    POSIX separators because the policy globs are written `src/**`.
+    """
+    resolved = resolve_in_workspace(workspace, candidate)
+    return resolved.relative_to(workspace.resolve()).as_posix()
+
+
 def _read_file_sync(workspace: pathlib.Path, path: str) -> str:
     target = resolve_in_workspace(workspace, path)
     if not target.is_file():
@@ -105,11 +115,14 @@ def build_registry(workspace: pathlib.Path) -> ToolRegistry:
         description="Read a UTF-8 text file from the workspace.",
         args_model=ReadFileArgs,
         execute=lambda args: read_file(workspace, args),
+        path_arg="path",
     )
     registry.register(
         name="list_files",
         description="List files in the workspace matching a glob pattern.",
         args_model=ListFilesArgs,
+        # No path_arg: the argument is a glob, not a path. What it can reach is already
+        # bounded by workspace containment, and the policy rules it by tool name.
         execute=lambda args: list_files(workspace, args),
     )
     return registry

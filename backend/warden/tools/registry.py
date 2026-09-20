@@ -41,6 +41,9 @@ class RegisteredTool:
     schema: ToolSchema
     args_model: type[BaseModel]
     execute: Callable[[Any], Awaitable[str]]
+    # Which argument carries a filesystem path, if any. The loop asks for this so it can
+    # normalise that argument once and hand the same value to the policy engine.
+    path_arg: str | None = None
 
 
 class ToolRegistry:
@@ -53,6 +56,7 @@ class ToolRegistry:
         description: str,
         args_model: type[BaseModel],
         execute: Callable[[Any], Awaitable[str]],
+        path_arg: str | None = None,
     ) -> None:
         if name in self._tools:
             raise ValueError(f"tool {name!r} is already registered")
@@ -64,7 +68,12 @@ class ToolRegistry:
             ),
             args_model=args_model,
             execute=execute,
+            path_arg=path_arg,
         )
+
+    def path_arg(self, name: str) -> str | None:
+        tool = self._tools.get(name)
+        return tool.path_arg if tool else None
 
     def schemas(self) -> list[ToolSchema]:
         # Sorted so the tool list is byte-identical between runs. A varying tool order
