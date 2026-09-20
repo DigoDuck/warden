@@ -16,6 +16,7 @@ import io
 import pathlib
 import tarfile
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -98,8 +99,16 @@ def _owned_by_sandbox(info: tarfile.TarInfo) -> tarfile.TarInfo:
     return info
 
 
-def _workspace_tar(workspace: pathlib.Path) -> io.BytesIO:
-    """Pack the workspace into a tar owned by the sandbox user."""
+def _workspace_tar(
+    workspace: pathlib.Path, exclude: Callable[[str], bool] | None = None
+) -> io.BytesIO:
+    """Pack the workspace into a tar owned by the sandbox user.
+
+    `exclude` takes a workspace-relative POSIX path and says whether the file must stay out
+    of the container. It is how secrets are kept from code the agent gets to execute: see
+    `never_readable` in the policy engine and ADR-018. This module stays ignorant of policy
+    on purpose and only takes a predicate.
+    """
     stream = io.BytesIO()
     root = workspace.resolve()
     with tarfile.open(fileobj=stream, mode="w") as tar:
@@ -113,10 +122,19 @@ def _workspace_tar(workspace: pathlib.Path) -> io.BytesIO:
         for path in sorted(root.rglob("*")):
             # Same exclusion list the listing tool uses, imported rather than repeated: two
             # copies would drift, and the agent would see files the sandbox does not have.
-            if is_ignored(pathlib.PurePosixPath(path.relative_to(root).as_posix())):
+            relative = path.relative_to(root).as_posix()
+            if is_ignored(pathlib.PurePosixPath(relative)):
                 continue
-            arcname = f"workspace/{path.relative_to(root).as_posix()}"
-            tar.add(path, arcname=arcname, filter=_owned_by_sandbox)
+            if exclude is not None and exclude(relative):
+                continue
+            # recursive=False is load-bearing. rglob already yields every descendant, and
+            # tarfile's default is to add a directory together with everything under it,
+            # which does not go through the two checks above. With the default, skipping
+            # `config/.env` here meant nothing, because adding `config` had already carried
+            # it in, and a nested `pkg/node_modules` got in the same way.
+            tar.add(
+                path, arcname=f"workspace/{relative}", recursive=False, filter=_owned_by_sandbox
+            )
     stream.seek(0)
     return stream
 
@@ -214,6 +232,7 @@ class Sandbox:
         workspace: pathlib.Path,
         *,
         task_id: str | None = None,
+        exclude: Callable[[str], bool] | None = None,
         client: docker.DockerClient | None = None,
     ) -> "Sandbox":
         """Start a container holding `task_id`'s workspace.
@@ -226,7 +245,9 @@ class Sandbox:
         world the disk had stopped agreeing with.
         """
         client = client or docker.from_env()
-        return await asyncio.to_thread(cls._create_sync, profile, workspace, client, task_id)
+        return await asyncio.to_thread(
+            cls._create_sync, profile, workspace, client, task_id, exclude
+        )
 
     @staticmethod
     def _create_sync(
@@ -234,6 +255,7 @@ class Sandbox:
         workspace: pathlib.Path,
         client: docker.DockerClient,
         task_id: str | None,
+        exclude: Callable[[str], bool] | None = None,
     ) -> "Sandbox":
         volume, is_new = _workspace_volume(client, task_id)
 
@@ -283,7 +305,7 @@ class Sandbox:
             # An existing task volume already holds the workspace, including whatever the
             # task changed before it was interrupted. Copying over it would undo that.
             if is_new:
-                container.put_archive(MOUNT_ROOT, _workspace_tar(workspace).getvalue())
+                container.put_archive(MOUNT_ROOT, _workspace_tar(workspace, exclude).getvalue())
         except ImageNotFound as exc:
             discard_new_volume()
             raise SandboxError(

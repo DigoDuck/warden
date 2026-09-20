@@ -20,7 +20,7 @@ from warden.core.loop import Budget, run_task
 from warden.db import make_engine, make_session_factory
 from warden.models import Task as TaskRow
 from warden.models import User
-from warden.policy.engine import load_policy
+from warden.policy.engine import load_policy, never_readable
 from warden.providers.base import ModelProvider
 from warden.sandbox.docker import Sandbox, SandboxProfile, discard_workspace_volume
 from warden.tools.sandboxed import build_registry
@@ -84,7 +84,9 @@ async def main(kind: str) -> int:
 
         # The same path the worker takes. A demo running tools on the host while the real
         # thing sandboxes them would be demonstrating something that does not ship.
-        sandbox = await Sandbox.create(SandboxProfile(), WORKSPACE, task_id=str(task.id))
+        sandbox = await Sandbox.create(
+            SandboxProfile(), WORKSPACE, task_id=str(task.id), exclude=never_readable(policy)
+        )
         print(f"sandbox {sandbox.id[:12]}  image={SandboxProfile().image}\n")
         try:
             result = await run_task(

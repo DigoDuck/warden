@@ -257,7 +257,7 @@ async def test_a_failure_while_creating_leaves_nothing_behind(
             len(client.volumes.list(filters={"label": "warden.sandbox=1"})),
         )
 
-    def boom(_: pathlib.Path) -> None:
+    def boom(*_: object) -> None:
         raise RuntimeError("copying the workspace failed")
 
     monkeypatch.setattr(sandbox_module, "_workspace_tar", boom)
