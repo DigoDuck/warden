@@ -53,4 +53,8 @@ jobs:
 
       - run: uv run --directory backend alembic check
 
+      # The sandbox has no network, so the image tools run in must exist before any test
+      # that starts a container. Built here rather than pulled: nothing publishes it yet.
+      - run: docker build -t warden-sandbox:dev sandbox-images/python
+
       - run: uv run --directory backend pytest

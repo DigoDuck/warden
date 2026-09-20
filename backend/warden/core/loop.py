@@ -22,7 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from warden.core import events
 from warden.core.replay import ResumeState
 from warden.models import Task, User
-from warden.policy.engine import Decision, Effect, Policy, PolicyContext, UserRef
+from warden.policy.engine import Decision, Effect, Policy, PolicyContext, UserRef, combine
 from warden.providers.base import (
     AssistantMessage,
     Message,
@@ -254,28 +254,63 @@ async def run_task(
     )
 
 
-def _build_context(
-    call: ToolCall, registry: ToolRegistry, user: UserRef, task_id: UUID
-) -> PolicyContext:
-    """Normalise the path once, here, so policy and tool judge the same string.
+async def _decide(
+    call: ToolCall, registry: ToolRegistry, policy: Policy, user: UserRef, task_id: UUID
+) -> tuple[Decision, list[str | None]]:
+    """Judge one call: find what it would touch, normalise each path, decide, combine.
 
-    The two layers still do different work, and that is intentional. The policy rules on the
-    normalised string, deterministically and without touching a disk, so the decision is
-    reproducible from the event log. The tool resolves the path again inside the container
-    when it opens the file, which is the only place a symlink the agent created is visible.
-    Neither layer alone covers both cases.
+    Normalising here, once, is why policy and tool judge the same string: the policy rules
+    on the normalised string, deterministically and without touching a disk, so the
+    decision is reproducible from the event log. The tool resolves each path again inside
+    the container when it opens the file, which is the only place a symlink the agent
+    created is visible. Neither layer alone covers both cases.
+
+    A call can touch more than one path (`apply_patch` on a diff that renames a file into
+    a denied tree is one call, two paths), so this evaluates the policy once per path and
+    folds the results with `combine()` rather than picking just one. Finding those paths
+    means running `apply_patch`'s inspector, which stages the diff and asks git what it
+    would touch *before* this decision exists: a deliberate trade-off, not an oversight.
+    The command is fixed and read-only, the container has no network and no capabilities,
+    and the alternative, deciding without knowing what a multi-file patch touches, is
+    worse: either every apply_patch call gets refused on principle, or the policy ends up
+    judging arguments instead of paths.
+
+    Not knowing what a call would touch is itself a reason to refuse it. A patch the
+    inspector cannot even parse gets a synthesised deny rather than a guess, and it is
+    recorded exactly like any other decision, just with no rule and no path behind it: the
+    tool never ran, so there is nothing for `matched_rules` to point at.
     """
-    path_arg = registry.path_arg(call.name)
-    normalised: str | None = None
-    if path_arg is not None:
-        raw = call.arguments.get(path_arg)
-        if isinstance(raw, str):
-            # None when the path escapes: no allow rule can match an unset path, so the
-            # default deny applies before the container is ever asked.
-            normalised = normalize_path(raw)
-    return PolicyContext(
-        tool=call.name, args=call.arguments, path=normalised, user=user, task_id=task_id
-    )
+    try:
+        raw_paths = await registry.touched_paths(call.name, call.arguments)
+    except ToolError as exc:
+        return (
+            Decision(
+                effect=Effect.DENY,
+                matched_rules=[],
+                reason=f"the paths this call would touch could not be determined: {exc}",
+                policy_hash=policy.policy_hash,
+            ),
+            [],
+        )
+
+    # None when a path escapes: no allow rule can match an unset path, so the default deny
+    # applies before the container is ever asked to resolve it for real.
+    paths = [normalize_path(raw) if isinstance(raw, str) else None for raw in raw_paths]
+    if not paths:
+        # An inspector that reports no paths at all is not a case any current tool
+        # produces, but `combine()` is a pure function that refuses empty input by
+        # contract; judging "no path" once is the correct fallback, not a crash.
+        paths = [None]
+
+    decisions = [
+        policy.evaluate(
+            PolicyContext(
+                tool=call.name, args=call.arguments, path=path, user=user, task_id=task_id
+            )
+        )
+        for path in paths
+    ]
+    return combine(decisions), paths
 
 
 async def _run_tools(
@@ -306,7 +341,7 @@ async def _run_tools(
             {"tool": call.name, "id": call.id, "arguments": call.arguments},
         )
 
-        decision = policy.evaluate(_build_context(call, registry, user, task_id))
+        decision, judged_paths = await _decide(call, registry, policy, user, task_id)
         await events.append_event(
             session,
             task_id,
@@ -317,6 +352,10 @@ async def _run_tools(
                 "effect": decision.effect.value,
                 "matched_rules": decision.matched_rules,
                 "policy_hash": decision.policy_hash[:12],
+                # Every path judged, in the order they were evaluated. One entry for a
+                # single-path tool, several for a multi-path one, so a reader of the audit
+                # trail does not have to guess which of a patch's files decided the call.
+                "paths": judged_paths,
             },
         )
 

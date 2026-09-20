@@ -26,7 +26,7 @@ from warden.core.loop import Budget, RunResult, run_task
 from warden.core.replay import ResumeState, rebuild
 from warden.db import make_engine, make_session_factory
 from warden.models import Task
-from warden.policy.engine import Policy, load_policy
+from warden.policy.engine import Policy, load_policy, never_readable
 from warden.providers.base import ModelProvider
 from warden.sandbox.docker import Sandbox, SandboxProfile, discard_workspace_volume
 from warden.tools.registry import ToolRegistry
@@ -145,7 +145,13 @@ class Worker:
         beat = asyncio.create_task(_beat(self._sessions, task_id, self.id, self._lease_seconds))
         # The workspace volume is named after the task, so a sandbox created here attaches
         # to whatever a previous worker left behind rather than starting from a fresh copy.
-        sandbox = await Sandbox.create(self._profile, self._workspace, task_id=str(task_id))
+        sandbox = await Sandbox.create(
+            self._profile,
+            self._workspace,
+            task_id=str(task_id),
+            # What a deny rule names never enters the container (ADR-018).
+            exclude=never_readable(self._policy),
+        )
         try:
             async with self._sessions() as session:
                 claimed = await session.get(Task, task_id)

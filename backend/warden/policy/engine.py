@@ -15,6 +15,7 @@ instruction. That is what makes the guarantee hold even when the model is compro
 import hashlib
 import json
 import pathlib
+from collections.abc import Callable
 from datetime import datetime
 from enum import StrEnum
 from typing import Any
@@ -87,8 +88,8 @@ class Policy:
             for rule in rules
         }
 
-    def evaluate(self, context: PolicyContext) -> Decision:
-        matched = [
+    def _matching(self, context: PolicyContext) -> list[Rule]:
+        return [
             rule
             for rule in self.rules
             if all(
@@ -96,6 +97,20 @@ class Policy:
                 for matcher in self._matchers[rule.id]
             )
         ]
+
+    def explicitly_denies(self, context: PolicyContext) -> bool:
+        """True when a deny RULE matched, as opposed to the default deny merely applying.
+
+        The distinction matters to whoever populates a sandbox. A file nobody wrote an allow
+        rule for (a CI config, say) is unreadable through `read_file` but is still a normal
+        part of the project that the test suite may need on disk. A file a rule explicitly
+        denies is one the policy author decided the agent must never see, and that intent
+        can only be honoured by the file not being there at all (ADR-018).
+        """
+        return any(rule.effect is Effect.DENY for rule in self._matching(context))
+
+    def evaluate(self, context: PolicyContext) -> Decision:
+        matched = self._matching(context)
 
         if not matched:
             return Decision(
@@ -122,6 +137,48 @@ class Policy:
         )
 
 
+def combine(decisions: list[Decision]) -> Decision:
+    """Fold the per-path decisions of one multi-path call into a single verdict.
+
+    Same ADR-003 semantics as `Policy.evaluate`, one level up: there the inputs are the
+    rules that matched one context, here they are the decisions already made for each path
+    a call touches (`apply_patch` on a diff that renames a file into `.github/` is one call
+    but two paths). The most restrictive effect still wins, `matched_rules` is still the
+    full union, and scopes still come only from the decisions that decided.
+
+    `scopes` is the one place this is stricter than a single evaluate(): they are handed
+    out only when *every* path was itself allowed. A call spanning N files is authorised as
+    one action, so a call where 9 paths are allowed and 1 is denied must not leak the
+    scopes of the 9, because `effect` on the combined decision is deny and those scopes
+    would otherwise look like they belonged to a call the control plane actually approved.
+    Since ALLOW is the least severe effect, "every decision is allow" and "the combined
+    effect is allow" are the same condition, checked once below.
+    """
+    if not decisions:
+        raise ValueError("combine() requires at least one decision")
+
+    effect = max((decision.effect for decision in decisions), key=lambda e: _SEVERITY[e])
+    deciding = [decision for decision in decisions if decision.effect == effect]
+    reason = next(
+        (decision.reason for decision in deciding if decision.reason),
+        f"{effect.value} across {len(decisions)} path(s)",
+    )
+
+    return Decision(
+        effect=effect,
+        matched_rules=sorted({rule for decision in decisions for rule in decision.matched_rules}),
+        reason=reason,
+        scopes=(
+            sorted({scope for decision in decisions for scope in decision.scopes})
+            if effect is Effect.ALLOW
+            else []
+        ),
+        # Every decision folded here came from evaluating the same loaded Policy, so they
+        # all carry the same hash; the first is as good as any other.
+        policy_hash=decisions[0].policy_hash,
+    )
+
+
 def load_policy(path: str | pathlib.Path) -> Policy:
     document = yaml.safe_load(pathlib.Path(path).read_text(encoding="utf-8")) or {}
     rules = [Rule.model_validate(raw) for raw in document.get("rules", [])]
@@ -140,3 +197,25 @@ def load_policy(path: str | pathlib.Path) -> Policy:
             json.dumps(document, sort_keys=True, default=str).encode()
         ).hexdigest(),
     )
+
+
+def never_readable(policy: Policy) -> Callable[[str], bool]:
+    """A predicate over workspace-relative paths: must this file stay out of the sandbox?
+
+    Path-based denies do not survive code execution. An agent allowed to write a test and to
+    run the test runner can have that test open any file in the workspace and print it, and
+    the output comes back as a tool result: `never-read-secrets` would be advisory. What is
+    not in the container cannot be read by anything running in it, so every file a deny rule
+    names is filtered out when the workspace is copied in (ADR-018).
+
+    Judged as `read_file` for the worker role. A deny rule conditioned on some other role
+    would not be seen here; none exists, and one that did would deserve its own thought.
+    """
+    user = UserRef(role="worker")
+
+    def excluded(relative_path: str) -> bool:
+        return policy.explicitly_denies(
+            PolicyContext(tool="read_file", path=relative_path, user=user)
+        )
+
+    return excluded

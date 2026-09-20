@@ -82,6 +82,14 @@ cases:
     context: { tool: apply_patch, path: "src/app.py", user_role: worker }
     expect: { effect: allow, rules: [write-source] }
 
+  - name: patching-ci-config-is-denied
+    context: { tool: apply_patch, path: ".github/workflows/ci.yml", user_role: worker }
+    expect: { effect: deny, rules: [] }
+
+  - name: patching-a-secret-is-denied
+    context: { tool: apply_patch, path: ".env", user_role: worker }
+    expect: { effect: deny, rules: [never-read-secrets] }
+
   - name: a-non-worker-may-not-write
     context: { tool: write_file, path: "src/app.py", user_role: viewer }
     expect: { effect: deny, rules: [] }
@@ -106,6 +114,14 @@ cases:
   - name: mypy-is-allowed
     context: { tool: run_command, args: { cmd: "mypy" } }
     expect: { effect: allow, rules: [run-project-commands] }
+
+  - name: run-tests-is-allowed
+    context: { tool: run_tests, args: {} }
+    expect: { effect: allow, rules: [run-tests] }
+
+  - name: run-tests-scoped-to-a-path-is-allowed
+    context: { tool: run_tests, args: { path: "tests/test_app.py" } }
+    expect: { effect: allow, rules: [run-tests] }
 
   - name: an-unlisted-command-falls-through-to-default-deny
     context: { tool: run_command, args: { cmd: "python manage.py shell" } }

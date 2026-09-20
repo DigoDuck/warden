@@ -12,7 +12,16 @@ from typing import Any
 import pytest
 import yaml
 
-from warden.policy.engine import Effect, Policy, PolicyContext, Rule, UserRef, load_policy
+from warden.policy.engine import (
+    Decision,
+    Effect,
+    Policy,
+    PolicyContext,
+    Rule,
+    UserRef,
+    combine,
+    load_policy,
+)
 from warden.policy.matchers import UnknownFieldError
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -113,6 +122,68 @@ def test_scopes_come_only_from_the_rules_that_decided() -> None:
     decision = _policy(allow, DENY_SECRET).evaluate(READ_ENV)
     assert decision.effect == Effect.DENY
     assert decision.scopes == []
+
+
+# --- combine(): folding a multi-path call's decisions into one ----------------------------
+
+
+def _decision(effect: Effect, *, rules: list[str], scopes: list[str] | None = None) -> Decision:
+    return Decision(
+        effect=effect,
+        matched_rules=rules,
+        reason=f"test: {effect.value}",
+        scopes=scopes or [],
+        policy_hash="test",
+    )
+
+
+def test_combine_of_a_single_decision_is_that_decision() -> None:
+    solo = _decision(Effect.ALLOW, rules=["write-source"], scopes=["repo:write"])
+    assert combine([solo]) == solo
+
+
+def test_combine_the_most_restrictive_effect_wins() -> None:
+    allowed = _decision(Effect.ALLOW, rules=["write-source"])
+    denied = _decision(Effect.DENY, rules=["never-read-secrets"])
+    assert combine([allowed, denied]).effect == Effect.DENY
+
+
+def test_combine_require_approval_beats_allow_but_not_deny() -> None:
+    allowed = _decision(Effect.ALLOW, rules=["write-source"])
+    approval = _decision(Effect.REQUIRE_APPROVAL, rules=["needs-human"])
+    denied = _decision(Effect.DENY, rules=["never-read-secrets"])
+    assert combine([allowed, approval]).effect == Effect.REQUIRE_APPROVAL
+    assert combine([allowed, approval, denied]).effect == Effect.DENY
+
+
+def test_combine_matched_rules_is_the_sorted_union_of_every_decision() -> None:
+    """Not just the winning decision's rules: a rename touching two allowed paths under
+    different rules must show both in the audit trail, same as one rule and another
+    conflicting one both show up within a single evaluate()."""
+    a = _decision(Effect.ALLOW, rules=["write-source"])
+    b = _decision(Effect.ALLOW, rules=["list-workspace"])
+    assert combine([a, b]).matched_rules == ["list-workspace", "write-source"]
+
+
+def test_combine_scopes_only_when_every_decision_is_allow() -> None:
+    """The case ADR-017 exists for: a patch touching src/a.py (allow) and .github/ci.yml
+    (deny) must not hand out repo:write just because most of the paths were fine."""
+    allowed = _decision(Effect.ALLOW, rules=["write-source"], scopes=["repo:write"])
+    denied = _decision(Effect.DENY, rules=["no-ci-writes"])
+    combined = combine([allowed, denied])
+    assert combined.effect == Effect.DENY
+    assert combined.scopes == []
+
+
+def test_combine_scopes_are_the_union_when_every_decision_allows() -> None:
+    a = _decision(Effect.ALLOW, rules=["write-source"], scopes=["repo:write"])
+    b = _decision(Effect.ALLOW, rules=["list-workspace"], scopes=["repo:read"])
+    assert combine([a, b]).scopes == ["repo:read", "repo:write"]
+
+
+def test_combine_of_no_decisions_raises() -> None:
+    with pytest.raises(ValueError, match="at least one"):
+        combine([])
 
 
 # --- loading ------------------------------------------------------------------------------

@@ -36,6 +36,12 @@ rules:
       # manifest, where an agent declares which subtrees it asks for.
       tool: [list_files]
 
+  # Second layer, not the first. A path-based deny does not survive code execution: an
+  # agent allowed to write a test and to run the test runner can have that test open any
+  # file in the workspace and print it. So every path this rule names is also filtered out
+  # when the workspace is copied into the sandbox (ADR-018), and what is not in the container
+  # cannot be read by anything running in it. This rule remains for the direct read, and as
+  # the single list both layers are driven from.
   - id: never-read-secrets
     effect: deny
     reason: "secrets are never readable by agents, whatever the model asked for"
@@ -68,6 +74,13 @@ rules:
     when:
       tool: run_command
       args.cmd: "^(pytest|ruff|mypy|npm (test|run lint))( |$)"
+
+  - id: run-tests
+    effect: allow
+    reason: "running the test suite is the same evidence run-project-commands already trusts, just through its own tool"
+    scopes: [tests:run]
+    when:
+      tool: [run_tests]
 
   - id: no-destructive-commands
     effect: deny

@@ -16,11 +16,12 @@ import io
 import pathlib
 import tarfile
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
 import docker
-from docker.errors import NotFound
+from docker.errors import ImageNotFound, NotFound
 from docker.models.containers import Container
 
 from warden.tools.workspace import is_ignored
@@ -46,6 +47,22 @@ class CommandTimeout(SandboxError):
     """A command ran past its deadline and the container was killed."""
 
 
+def _default_env() -> dict[str, str]:
+    """Environment every sandbox gets unless a profile overrides it.
+
+    The image user (10001) has no passwd entry, so tools that assume a real home directory
+    (ruff, mypy, pip's own cache) need one pointed somewhere writable; the rootfs is
+    read-only everywhere except the workspace volume and /tmp. Caches are kept out of the
+    workspace so they never show up in a listing or a diff the agent produces.
+    """
+    return {
+        "HOME": "/tmp",
+        "RUFF_CACHE_DIR": "/tmp/ruff",
+        "MYPY_CACHE_DIR": "/tmp/mypy",
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+
+
 @dataclass(frozen=True)
 class SandboxProfile:
     """What a sandbox is allowed to be.
@@ -56,7 +73,9 @@ class SandboxProfile:
     """
 
     name: str = "python-restricted"
-    image: str = "python:3.13-slim"
+    # Built by `make sandbox-image` (sandbox-images/python/Dockerfile), not pulled: the
+    # sandbox has no network, so whatever a tool needs has to be baked in ahead of time.
+    image: str = "warden-sandbox:dev"
     memory_mb: int = 512
     cpus: float = 1.0
     pids_limit: int = 128
@@ -65,39 +84,83 @@ class SandboxProfile:
     # the design is that the sandbox has no network and every external action is a gateway
     # tool run by the control plane (ADR-004).
     network: str = "none"
-    env: dict[str, str] = field(default_factory=dict)
+    env: dict[str, str] = field(default_factory=_default_env)
 
 
-def _workspace_tar(workspace: pathlib.Path) -> io.BytesIO:
+def _owned_by_sandbox(info: tarfile.TarInfo) -> tarfile.TarInfo:
+    """A tar filter that reassigns ownership to the sandbox user.
+
+    Shared by every tar this module builds: the container has no CAP_CHOWN, so a chown after
+    extraction would fail, and running the fixup as root would mean starting the container
+    as root. Ownership has to be set on the way in.
+    """
+    info.uid = info.gid = SANDBOX_UID
+    info.uname = info.gname = "sandbox"
+    return info
+
+
+def _workspace_tar(
+    workspace: pathlib.Path, exclude: Callable[[str], bool] | None = None
+) -> io.BytesIO:
     """Pack the workspace into a tar owned by the sandbox user.
 
-    Ownership is set here rather than fixed up afterwards with chown: the container has no
-    CAP_CHOWN, so a chown inside would fail, and running the fixup as root would mean
-    starting the container as root.
+    `exclude` takes a workspace-relative POSIX path and says whether the file must stay out
+    of the container. It is how secrets are kept from code the agent gets to execute: see
+    `never_readable` in the policy engine and ADR-018. This module stays ignorant of policy
+    on purpose and only takes a predicate.
     """
     stream = io.BytesIO()
     root = workspace.resolve()
     with tarfile.open(fileobj=stream, mode="w") as tar:
-
-        def owned_by_sandbox(info: tarfile.TarInfo) -> tarfile.TarInfo:
-            info.uid = info.gid = SANDBOX_UID
-            info.uname = info.gname = "sandbox"
-            return info
-
         # The workspace directory itself is the first entry, so extraction creates it owned
         # by the sandbox user instead of inheriting the volume root's root-owned 755.
         workspace_dir = tarfile.TarInfo("workspace")
         workspace_dir.type = tarfile.DIRTYPE
         workspace_dir.mode = 0o755
-        tar.addfile(owned_by_sandbox(workspace_dir))
+        tar.addfile(_owned_by_sandbox(workspace_dir))
 
         for path in sorted(root.rglob("*")):
             # Same exclusion list the listing tool uses, imported rather than repeated: two
             # copies would drift, and the agent would see files the sandbox does not have.
-            if is_ignored(pathlib.PurePosixPath(path.relative_to(root).as_posix())):
+            relative = path.relative_to(root).as_posix()
+            if is_ignored(pathlib.PurePosixPath(relative)):
                 continue
-            arcname = f"workspace/{path.relative_to(root).as_posix()}"
-            tar.add(path, arcname=arcname, filter=owned_by_sandbox)
+            if exclude is not None and exclude(relative):
+                continue
+            # recursive=False is load-bearing. rglob already yields every descendant, and
+            # tarfile's default is to add a directory together with everything under it,
+            # which does not go through the two checks above. With the default, skipping
+            # `config/.env` here meant nothing, because adding `config` had already carried
+            # it in, and a nested `pkg/node_modules` got in the same way.
+            tar.add(
+                path, arcname=f"workspace/{relative}", recursive=False, filter=_owned_by_sandbox
+            )
+    stream.seek(0)
+    return stream
+
+
+def _file_tar(relative_path: str, data: bytes) -> io.BytesIO:
+    """Pack one file, plus a directory entry for each parent, into a tar.
+
+    The directory entries are not decoration: `put_archive` extracts into the mount root,
+    and a parent directory that does not already exist there (`.warden/` on the first call,
+    for instance) makes the whole archive fail to extract without one.
+    """
+    stream = io.BytesIO()
+    parts = pathlib.PurePosixPath(relative_path).parts
+    with tarfile.open(fileobj=stream, mode="w") as tar:
+        built = pathlib.PurePosixPath()
+        for part in parts[:-1]:
+            built = built / part
+            directory = tarfile.TarInfo(str(built))
+            directory.type = tarfile.DIRTYPE
+            directory.mode = 0o755
+            tar.addfile(_owned_by_sandbox(directory))
+
+        info = tarfile.TarInfo(relative_path)
+        info.size = len(data)
+        info.mode = 0o644
+        tar.addfile(_owned_by_sandbox(info), io.BytesIO(data))
     stream.seek(0)
     return stream
 
@@ -169,6 +232,7 @@ class Sandbox:
         workspace: pathlib.Path,
         *,
         task_id: str | None = None,
+        exclude: Callable[[str], bool] | None = None,
         client: docker.DockerClient | None = None,
     ) -> "Sandbox":
         """Start a container holding `task_id`'s workspace.
@@ -181,7 +245,9 @@ class Sandbox:
         world the disk had stopped agreeing with.
         """
         client = client or docker.from_env()
-        return await asyncio.to_thread(cls._create_sync, profile, workspace, client, task_id)
+        return await asyncio.to_thread(
+            cls._create_sync, profile, workspace, client, task_id, exclude
+        )
 
     @staticmethod
     def _create_sync(
@@ -189,44 +255,63 @@ class Sandbox:
         workspace: pathlib.Path,
         client: docker.DockerClient,
         task_id: str | None,
+        exclude: Callable[[str], bool] | None = None,
     ) -> "Sandbox":
         volume, is_new = _workspace_volume(client, task_id)
-        container = client.containers.run(
-            image=profile.image,
-            # Idles so that commands can be exec'd into it. The container has no entrypoint
-            # work of its own: it exists to be a contained filesystem and process namespace.
-            command=["sleep", "infinity"],
-            detach=True,
-            user=f"{SANDBOX_UID}:{SANDBOX_UID}",
-            working_dir=WORKSPACE,
-            environment=profile.env,
-            # --- the hardening, every line of which has a test ---
-            network_mode=profile.network,
-            read_only=True,
-            # A named volume, not tmpfs. Docker's archive endpoint refuses to write into a
-            # container whose rootfs is read-only unless the target is a real mount, and a
-            # tmpfs target silently swallows the upload: put_archive reports success while
-            # writing underneath the mount, where nothing can read it. Both were verified
-            # against the daemon rather than assumed.
-            volumes={volume.name: {"bind": MOUNT_ROOT, "mode": "rw"}},
-            tmpfs={"/tmp": f"rw,size={profile.tmp_size_mb}m,mode=1777"},
-            cap_drop=["ALL"],
-            security_opt=["no-new-privileges:true"],
-            pids_limit=profile.pids_limit,
-            mem_limit=f"{profile.memory_mb}m",
-            nano_cpus=int(profile.cpus * 1_000_000_000),
-            # The workspace volume above is the only mount. No bind mount from the host,
-            # and in particular never the Docker socket: mounting it would hand the agent
-            # root on the host.
-            labels={"warden.sandbox": "1", "warden.profile": profile.name},
-        )
+
+        def discard_new_volume() -> None:
+            # Only if this call created it. An existing task volume holds work that
+            # predates this container and must survive a failure to start one.
+            if is_new:
+                with contextlib.suppress(Exception):
+                    volume.remove(force=True)
 
         try:
+            # containers.run belongs inside the try too: it is the call most likely to fail
+            # (a missing image, most often), and it used to sit outside this block, so a
+            # volume this call had just created was never cleaned up when it did. Regression
+            # test: test_a_missing_image_does_not_leak_the_volume.
+            container = client.containers.run(
+                image=profile.image,
+                # Idles so that commands can be exec'd into it. The container has no
+                # entrypoint work of its own: it exists to be a contained filesystem and
+                # process namespace.
+                command=["sleep", "infinity"],
+                detach=True,
+                user=f"{SANDBOX_UID}:{SANDBOX_UID}",
+                working_dir=WORKSPACE,
+                environment=profile.env,
+                # --- the hardening, every line of which has a test ---
+                network_mode=profile.network,
+                read_only=True,
+                # A named volume, not tmpfs. Docker's archive endpoint refuses to write into
+                # a container whose rootfs is read-only unless the target is a real mount,
+                # and a tmpfs target silently swallows the upload: put_archive reports
+                # success while writing underneath the mount, where nothing can read it.
+                # Both were verified against the daemon rather than assumed.
+                volumes={volume.name: {"bind": MOUNT_ROOT, "mode": "rw"}},
+                tmpfs={"/tmp": f"rw,size={profile.tmp_size_mb}m,mode=1777"},
+                cap_drop=["ALL"],
+                security_opt=["no-new-privileges:true"],
+                pids_limit=profile.pids_limit,
+                mem_limit=f"{profile.memory_mb}m",
+                nano_cpus=int(profile.cpus * 1_000_000_000),
+                # The workspace volume above is the only mount. No bind mount from the host,
+                # and in particular never the Docker socket: mounting it would hand the
+                # agent root on the host.
+                labels={"warden.sandbox": "1", "warden.profile": profile.name},
+            )
             # The mount exists only once the container is running, so the copy happens after.
             # An existing task volume already holds the workspace, including whatever the
             # task changed before it was interrupted. Copying over it would undo that.
             if is_new:
-                container.put_archive(MOUNT_ROOT, _workspace_tar(workspace).getvalue())
+                container.put_archive(MOUNT_ROOT, _workspace_tar(workspace, exclude).getvalue())
+        except ImageNotFound as exc:
+            discard_new_volume()
+            raise SandboxError(
+                f"sandbox image {profile.image!r} was not found; run `make sandbox-image` "
+                "to build it"
+            ) from exc
         except BaseException:
             # Anything failing past this point must not leave the container or the volume
             # behind: the caller never receives a Sandbox, so nobody is left to call
@@ -234,11 +319,7 @@ class Sandbox:
             # here on every call and left fourteen containers running.
             with contextlib.suppress(Exception):
                 container.remove(force=True)
-            if is_new:
-                # Only if this call created it. An existing task volume holds work that
-                # predates this container and must survive a failure to start one.
-                with contextlib.suppress(Exception):
-                    volume.remove(force=True)
+            discard_new_volume()
             raise
         return Sandbox(container, client, volume.name, task_scoped=task_id is not None)
 
@@ -268,18 +349,42 @@ class Sandbox:
         raw = result.output or b""
         return ExecResult(exit_code=int(result.exit_code), output=raw.decode("utf-8", "replace"))
 
+    async def put_file(self, relative_path: str, data: bytes) -> None:
+        """Upload one file under the mount root, owned by the sandbox user.
+
+        The staging mechanism for `write_file`: content travels here as bytes on an archive
+        upload, never interpolated into a command or a script argument the model influenced.
+        """
+        await asyncio.to_thread(self._put_file_sync, relative_path, data)
+
+    def _put_file_sync(self, relative_path: str, data: bytes) -> None:
+        self._container.put_archive(MOUNT_ROOT, _file_tar(relative_path, data).getvalue())
+
     def _kill_sync(self) -> None:
         # Already gone or already stopped; either way the deadline is satisfied.
         with contextlib.suppress(NotFound, docker.errors.APIError):
             self._container.kill()
 
-        # kill() only sends the signal, so the caller could otherwise get CommandTimeout
-        # while the process is briefly still alive. Under load that window is wide enough
-        # to matter, and it made the deadline test flaky in a full suite run.
-        #
-        # Polled rather than container.wait(timeout=...): that timeout is the HTTP read
-        # timeout on the daemon socket, so a busy daemon raises a connection error instead
-        # of reporting that the container is still up. Own deadline, own semantics.
+        # kill() only sends the signal, so the caller could otherwise see the container
+        # still briefly alive. Under load that window is wide enough to matter, and it made
+        # the deadline test flaky in a full suite run.
+        self._wait_until_stopped()
+
+        # A dead container would otherwise end the whole task the first time a command
+        # hangs, even though the workspace volume is task-scoped and survived the kill just
+        # fine. Restarting hands the caller a live container again; only the command that
+        # overran its deadline is lost, not the rest of the task.
+        with contextlib.suppress(NotFound, docker.errors.APIError):
+            self._container.start()
+        self._wait_until_started()
+
+    def _wait_until_stopped(self) -> None:
+        """Poll until the container is confirmed dead, or give up and report nothing.
+
+        Not finding out either way is treated as "stopped": the caller already gets
+        `CommandTimeout` for the command, and `destroy()` removes the container by force
+        regardless, so there is nothing further to report here.
+        """
         deadline = time.monotonic() + KILL_GRACE_SECONDS
         while time.monotonic() < deadline:
             try:
@@ -289,8 +394,27 @@ class Sandbox:
             if not self._container.attrs.get("State", {}).get("Running"):
                 return
             time.sleep(0.05)
-        # Still up after the grace period. destroy() removes it by force, and the caller
-        # already gets CommandTimeout, so this is reported rather than raised over it.
+
+    def _wait_until_started(self) -> None:
+        """Poll until the container is confirmed running, or raise trying.
+
+        Unlike `_wait_until_stopped`, a failed or inconclusive check here cannot be treated
+        as success: silently returning let a caller's next `exec` hit a stopped container
+        and fail with an opaque "cannot exec in a stopped state" instead of the honest
+        `SandboxError` below. `reload()` erroring is retried rather than trusted either way,
+        since docker start briefly returns before the daemon reports the new state.
+        """
+        deadline = time.monotonic() + KILL_GRACE_SECONDS
+        while time.monotonic() < deadline:
+            try:
+                self._container.reload()
+            except (NotFound, docker.errors.APIError):
+                time.sleep(0.05)
+                continue
+            if self._container.attrs.get("State", {}).get("Running"):
+                return
+            time.sleep(0.05)
+        raise SandboxError("the sandbox did not come back up after a command was killed")
 
     def inspect(self) -> dict[str, Any]:
         """Raw daemon JSON. Typed as Any because that is what it is: the shape belongs to

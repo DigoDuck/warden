@@ -1,4 +1,4 @@
-.PHONY: db-up db-down migrate revision test lint fmt demo-fake demo worker
+.PHONY: db-up db-down migrate revision test lint fmt sandbox-image demo-fake demo worker
 
 # --directory avoids "cd backend &&", which breaks when the Windows make picks
 # cmd.exe instead of sh. Each recipe stays a single command.
@@ -16,7 +16,12 @@ migrate:
 revision:
 	$(UV) alembic revision --autogenerate -m "$(m)"
 
-test:
+# Tools run inside this image (warden/sandbox/docker.py), and it has no network to pull
+# from, so it has to exist and be current before anything that exercises a sandbox runs.
+sandbox-image:
+	docker build -t warden-sandbox:dev sandbox-images/python
+
+test: sandbox-image
 	$(UV) pytest
 
 lint:
@@ -29,13 +34,13 @@ fmt:
 	$(UV) ruff check --fix
 
 # Replays a script: no API key, no network, no cost.
-demo-fake:
+demo-fake: sandbox-image
 	$(UV) python -m warden.demo --provider fake
 
 # Calls the real API. Needs ANTHROPIC_API_KEY in .env, and spends money.
-demo:
+demo: sandbox-image
 	$(UV) python -m warden.demo --provider anthropic
 
 # Claims queued tasks and runs them until stopped. Several may run at once.
-worker:
+worker: sandbox-image
 	$(UV) python -m warden.core.worker
