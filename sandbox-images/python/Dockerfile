@@ -17,10 +17,15 @@ RUN apt-get update \
 # Covers the allowlisted commands in policies/default.yaml (pytest, ruff, mypy) and the
 # dependencies of examples/target-repo (fastapi, httpx, pydantic), so the demo target
 # repository's own test suite can run inside the sandbox with no network.
+#
+# Pinned, not floating: an unpinned `pip install` here makes `make sandbox-image` and the CI
+# build non-reproducible, since a new pytest/ruff release upstream can turn a green branch
+# red with no commit of ours to point at. Versions below are what was actually verified
+# working (`pip freeze` inside the built image); bump them deliberately, not by surprise.
 RUN pip install --no-cache-dir \
-    pytest \
-    ruff \
-    mypy \
-    fastapi \
-    httpx \
-    pydantic
+    pytest==9.1.1 \
+    ruff==0.16.8 \
+    mypy==2.3.1 \
+    fastapi==0.141.1 \
+    httpx==0.28.1 \
+    pydantic==2.13.5
