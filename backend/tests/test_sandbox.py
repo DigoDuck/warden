@@ -17,6 +17,7 @@ from warden.sandbox.docker import (
     SANDBOX_UID,
     CommandTimeout,
     Sandbox,
+    SandboxError,
     SandboxProfile,
 )
 
@@ -169,19 +170,50 @@ async def test_resource_limits_are_configured(sandbox: Sandbox) -> None:
     assert host_config["NetworkMode"] == "none"
 
 
-async def test_a_command_past_its_deadline_is_killed(
+async def test_a_command_past_its_deadline_is_killed_and_the_sandbox_recovers(
     docker_available: None, workspace: pathlib.Path
 ) -> None:
-    """Abandoning the wait would leave the command running; the container is killed instead."""
+    """A killed container used to stay dead, which would end the whole task the first time a
+    command hung. It is brought back up instead, so both things have to be proven: the
+    command really died rather than running on abandoned, and the sandbox still works
+    afterwards with the workspace intact.
+    """
     box = await Sandbox.create(SandboxProfile(), workspace)
     try:
         with pytest.raises(CommandTimeout):
-            await box.exec(["sleep", "30"], kill_after=2)
+            # If the sleep were merely abandoned rather than killed, this file would show up
+            # once the 30s finally elapsed. The check below runs long before that.
+            await box.exec(["sh", "-c", "sleep 30 && echo survived > survived.txt"], kill_after=2)
 
-        # Killed, not merely abandoned.
-        assert box.inspect()["State"]["Running"] is False
+        marker = await box.exec(["sh", "-c", "test -f survived.txt && echo YES || echo NO"])
+        assert marker.output.strip() == "NO"
+
+        # The next call works: the container came back up, not just stayed a corpse.
+        result = await box.exec(["cat", "src/app.py"])
+        assert result.exit_code == 0
+        assert result.output.strip() == "print('hello')"
     finally:
         await box.destroy()
+
+
+async def test_a_missing_image_does_not_leak_the_volume(
+    docker_available: None, workspace: pathlib.Path
+) -> None:
+    """Regression test for a real bug: `containers.run` used to sit outside the cleanup
+    try-block, so a volume this call had just created was never removed when it failed. A
+    nonexistent image is the simplest way to make that call fail without touching anything
+    else about the create path.
+    """
+    import docker as docker_sdk
+
+    client = docker_sdk.from_env()
+    before = len(client.volumes.list(filters={"label": "warden.sandbox=1"}))
+
+    profile = SandboxProfile(image="warden-sandbox-does-not-exist:none")
+    with pytest.raises(SandboxError, match="make sandbox-image"):
+        await Sandbox.create(profile, workspace)
+
+    assert len(client.volumes.list(filters={"label": "warden.sandbox=1"})) == before
 
 
 async def test_destroy_removes_the_container(
