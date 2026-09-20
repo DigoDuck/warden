@@ -75,7 +75,14 @@ Nunca commitar `.env`. Chaves e tokens vivem só no ambiente; o broker os injeta
 ## Fluxo de trabalho
 
 - Mudança não trivial: **plan mode antes de código**. Plano aprovado, então implementação.
-- Um PR por vez, escopo de um item da checklist da semana.
+- Cada PR com escopo de um item da checklist da semana. PRs em paralelo só quando não tocam os
+  mesmos arquivos e há no máximo uma migração Alembic por onda (duas criariam dois heads).
+- Em onda paralela: um worktree por trilha em `.worktrees/`, um `WARDEN_TEST_DB` por trilha, e só
+  uma trilha roda os testes `sandbox` localmente, porque eles contam containers e volumes globais.
+  Depois dos merges, conferir o CI da `main` combinada: cada PR só foi testado sozinho.
+- **Teste de falha tem que causar a falha, não simulá-la.** Matar o processo, não levantar exceção;
+  contar container, não confiar no `finally`. Os defeitos mais sérios deste repo foram achados
+  olhando estado real, nunca por teste vermelho.
 - **Verificação antes de dizer "pronto":** rodar o comando e colar a saída. "Pronto" é verificável
   por comando ou clique, nunca por sensação. Teste que não rodou não conta como passando.
 - Se algo necessário estiver inacessível (repo, segredo, API, connector), dizer exatamente o que
