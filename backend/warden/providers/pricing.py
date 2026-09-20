@@ -37,6 +37,10 @@ PRICES: dict[str, ModelPrice] = {
     "claude-opus-5": ModelPrice(Decimal("5.00"), Decimal("25.00")),
     "claude-sonnet-5": ModelPrice(Decimal("2.00"), Decimal("10.00")),
     "claude-haiku-4-5": ModelPrice(Decimal("1.00"), Decimal("5.00")),
+    # The FakeProvider's model. Priced explicitly at zero rather than special-cased inside
+    # cost_usd, so a scripted run goes down the same arithmetic as a real one and an
+    # unpriced model still raises.
+    "fake-model": ModelPrice(Decimal("0"), Decimal("0")),
 }
 
 
