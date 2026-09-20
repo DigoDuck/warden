@@ -862,6 +862,7 @@ Formato: contexto, decisão, alternativas, consequências. Escrever no momento e
 - ADR-013 Contexto por AST antes de embeddings (e critério para adicionar RAG)
 - ADR-014 Guard detecta, policy impõe
 - ADR-015 Capability manifest: pedido do agente, não concessão; risco computado e versionado em vez de auto-declarado
+- ADR-016 `Completion` carrega o conteúdo do provider como opaco; trocar de provider no meio da tarefa é proibido por contrato
 
 ---
 

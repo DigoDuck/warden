@@ -1,0 +1,8 @@
+# The behavioural eval script format from briefing section 19. Week 6 reuses these files
+# as-is, so this fixture doubles as the format's regression test.
+script:
+  - tool_call: { name: read_file, args: { path: ".env" } }
+  - tool_calls:
+      - { name: read_file, args: { path: "src/app.py" } }
+      - { name: list_files, args: { path: "tests" } }
+  - text: "done"

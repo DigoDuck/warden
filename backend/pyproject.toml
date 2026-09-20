@@ -9,6 +9,8 @@ dependencies = [
     "alembic>=1.14.0",
     "pydantic>=2.10.0",
     "pydantic-settings>=2.7.0",
+    "anthropic>=1.0",
+    "pyyaml>=6.0",
 ]
 
 [dependency-groups]
@@ -17,6 +19,7 @@ dev = [
     "pytest-asyncio>=0.25.0",
     "ruff>=0.8.0",
     "mypy>=1.14.0",
+    "types-pyyaml>=6.0.12.20260906",
 ]
 
 [build-system]
