@@ -94,6 +94,31 @@ async def test_append_rejects_a_float_postgres_cannot_round_trip(session: AsyncS
         )
 
 
+async def test_append_rejects_negative_zero(session: AsyncSession) -> None:
+    """Found in final review by probing Postgres, not by either earlier pass.
+
+    `json.dumps(-0.0)` is `-0.0`, but `'-0.0'::jsonb` comes back as `0.0`. Without this
+    guard the row would hash one string on the way in and another on the way out, and
+    verify() would raise a tamper alert on a row nobody touched.
+    """
+    with pytest.raises(ValueError, match="negative zero"):
+        await audit.append(
+            session, actor_type="system", actor_id="t", action="x", details={"delta": -0.0}
+        )
+
+
+async def test_positive_zero_and_ordinary_floats_are_accepted(session: AsyncSession) -> None:
+    """The guard must not turn into a ban on floats."""
+    await audit.append(
+        session,
+        actor_type="system",
+        actor_id="t",
+        action="x",
+        details={"zero": 0.0, "cost_usd": 0.0421, "ratio": 1.5, "nested": [0.1, {"v": 2.25}]},
+    )
+    assert (await audit.verify(session)).ok
+
+
 async def test_append_rejects_a_non_finite_float(session: AsyncSession) -> None:
     with pytest.raises(ValueError, match="non-finite"):
         await audit.append(

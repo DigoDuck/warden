@@ -10,6 +10,7 @@ full list of what a hash chain does and does not protect against.
 
 import hashlib
 import json
+import math
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -98,6 +99,11 @@ def _reject_non_round_tripping_floats(value: Any) -> None:
             raise ValueError(f"details contains a non-finite float: {value!r}") from exc
         if "e" in rendered.lower():
             raise ValueError(f"details contains a float Postgres cannot round-trip: {value!r}")
+        if value == 0 and math.copysign(1.0, value) < 0:
+            # Negative zero: Python renders it as `-0.0`, but Postgres `numeric` has no
+            # signed zero and hands back `0.0`. Same failure as the exponent case above, a
+            # false tamper alert on a row nobody touched, reached by a different road.
+            raise ValueError("details contains negative zero, which Postgres stores as 0.0")
     elif isinstance(value, dict):
         for item in value.values():
             _reject_non_round_tripping_floats(item)

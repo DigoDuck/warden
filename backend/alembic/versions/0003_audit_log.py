@@ -22,9 +22,11 @@ depends_on: str | Sequence[str] | None = None
 # database on the cluster (dev, plus one test database per checkout, sometimes concurrently
 # during CI). `IF NOT EXISTS` alone still races: two databases can both see "not there yet"
 # and both issue CREATE ROLE, and the loser fails with "role already exists" instead of
-# quietly doing nothing. The DO block therefore checks pg_roles *and* catches the
-# duplicate_object error the losing CREATE ROLE raises, so either path ends with the role
-# existing and the migration succeeding.
+# quietly doing nothing. The DO block therefore checks pg_roles *and* catches the error the
+# losing CREATE ROLE raises, so either path ends with the role existing and the migration
+# succeeding. Both error codes are caught on purpose: a loser that arrives after the winner
+# committed gets duplicate_object, but two truly simultaneous inserts collide on the unique
+# index of pg_authid and surface as unique_violation instead.
 _CREATE_APP_ROLE = """
 DO $$
 BEGIN
@@ -32,7 +34,7 @@ BEGIN
         CREATE ROLE warden_app NOLOGIN;
     END IF;
 EXCEPTION
-    WHEN duplicate_object THEN
+    WHEN duplicate_object OR unique_violation THEN
         NULL;
 END
 $$;
