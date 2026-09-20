@@ -160,6 +160,18 @@ async def test_reading_and_writing_through_an_in_tree_symlink_is_refused(sandbox
     assert await read_file(sandbox, ReadFileArgs(path="top.txt")) == "SECRET=nope\n"
 
 
+async def test_writing_to_a_directory_path_is_a_plain_error_not_a_traceback(
+    sandbox: Sandbox,
+) -> None:
+    """Reproduced with path "", "." and an existing directory: all three used to hand the
+    model `os.replace()`'s raw Python traceback (IsADirectoryError) as the tool's result.
+    """
+    for path in ("", ".", "src"):
+        with pytest.raises(ToolError, match="directory") as excinfo:
+            await write_file(sandbox, WriteFileArgs(path=path, content="nope"))
+        assert "Traceback" not in str(excinfo.value)
+
+
 async def test_content_over_the_limit_is_a_tool_error(sandbox: Sandbox) -> None:
     with pytest.raises(ToolError, match="limit"):
         await write_file(sandbox, WriteFileArgs(path="too_big.txt", content="x" * 1_000_001))

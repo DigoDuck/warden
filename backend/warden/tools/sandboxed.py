@@ -49,7 +49,12 @@ MAX_PATCH_BYTES = 1_000_000
 MAX_COMMAND_OUTPUT = 20_000
 RUN_COMMAND_DEFAULT_TIMEOUT = 60.0
 # pytest gets more room than an arbitrary command: a real suite can legitimately take longer
-# than the one-minute default without being stuck.
+# than the one-minute default without being stuck. Fixed rather than model-chosen, unlike
+# `run_command`'s `timeout_seconds`: `run_command` covers arbitrary work whose legitimate
+# length the control plane cannot guess, so the model is trusted to say how long is
+# reasonable; `run_tests` is a single, known command run for the evidence its exit code and
+# output become (briefing section 15), so there is no case for letting the model widen its
+# own deadline instead.
 RUN_TESTS_TIMEOUT = 120.0
 # Outside the workspace, so a staged or refused upload can never be mistaken for a file the
 # agent's task actually produced.
@@ -145,6 +150,13 @@ _WRITE_FILE = (
     _CONTAIN
     + f"""
 staged = os.path.join({MOUNT_ROOT!r}, sys.argv[2])
+if os.path.isdir(target):
+    # Covers path="", "." (both resolve to the workspace root) and any existing directory:
+    # os.replace() onto one raises IsADirectoryError, whose traceback would otherwise reach
+    # the model verbatim as the tool's result. Caught here, once, rather than pattern-matched
+    # out of a probe's stderr afterwards.
+    print("__IS_A_DIRECTORY__", file=sys.stderr)
+    sys.exit(5)
 os.makedirs(os.path.dirname(target), exist_ok=True)
 os.replace(staged, target)
 """
@@ -284,7 +296,9 @@ class RunTestsArgs(BaseModel):
 
 
 async def _run_probe(sandbox: Sandbox, script: str, argument: str, *, what: str) -> str:
-    result = await sandbox.exec(["python", "-c", script, argument], kill_after=30)
+    result = await _exec_or_timeout_error(
+        sandbox, ["python", "-c", script, argument], kill_after=30
+    )
     if result.exit_code == 3:
         raise ToolError(f"path {argument!r} resolves outside the workspace and was refused")
     if result.exit_code == 4:
@@ -342,15 +356,19 @@ async def write_file(sandbox: Sandbox, args: WriteFileArgs) -> str:
     staged = f"{STAGING_DIR}/{uuid.uuid4().hex}"
     await sandbox.put_file(staged, content)
     try:
-        result = await sandbox.exec(["python", "-c", _WRITE_FILE, args.path, staged], kill_after=30)
+        result = await _exec_or_timeout_error(
+            sandbox, ["python", "-c", _WRITE_FILE, args.path, staged], kill_after=30
+        )
     finally:
         # Whatever happened above, nothing should be left under .warden/: a refusal leaves
         # the staged file in place exactly as much as a success would, since success moves
         # it out with os.replace and a refusal never reaches that line.
-        await sandbox.exec(["rm", "-f", f"{MOUNT_ROOT}/{staged}"], kill_after=30)
+        await _exec_or_timeout_error(sandbox, ["rm", "-f", f"{MOUNT_ROOT}/{staged}"], kill_after=30)
 
     if result.exit_code == 3:
         raise ToolError(f"path {args.path!r} resolves outside the workspace and was refused")
+    if result.exit_code == 5:
+        raise ToolError(f"{args.path!r} addresses a directory in the workspace, not a file")
     if result.exit_code != 0:
         raise ToolError(f"write_file failed: {result.output.strip()[:300]}")
     return f"wrote {args.path}"
@@ -381,12 +399,13 @@ async def apply_patch_paths(sandbox: Sandbox, args: ApplyPatchArgs) -> list[str]
     """
     staged = await _stage_patch(sandbox, args.diff)
     try:
-        result = await sandbox.exec(
+        result = await _exec_or_timeout_error(
+            sandbox,
             ["git", "-C", WORKSPACE, "apply", "--numstat", "-z", f"{MOUNT_ROOT}/{staged}"],
             kill_after=30,
         )
     finally:
-        await sandbox.exec(["rm", "-f", f"{MOUNT_ROOT}/{staged}"], kill_after=30)
+        await _exec_or_timeout_error(sandbox, ["rm", "-f", f"{MOUNT_ROOT}/{staged}"], kill_after=30)
 
     if result.exit_code != 0:
         raise ToolError(f"could not read the patch: {result.output.strip()[:300]}")
@@ -422,19 +441,21 @@ async def apply_patch(sandbox: Sandbox, args: ApplyPatchArgs) -> str:
 
     staged = await _stage_patch(sandbox, args.diff)
     try:
-        check = await sandbox.exec(
-            ["git", "-C", WORKSPACE, "apply", "--check", f"{MOUNT_ROOT}/{staged}"], kill_after=30
+        check = await _exec_or_timeout_error(
+            sandbox,
+            ["git", "-C", WORKSPACE, "apply", "--check", f"{MOUNT_ROOT}/{staged}"],
+            kill_after=30,
         )
         if check.exit_code != 0:
             raise ToolError(f"patch does not apply: {check.output.strip()[:300]}")
 
-        result = await sandbox.exec(
-            ["git", "-C", WORKSPACE, "apply", f"{MOUNT_ROOT}/{staged}"], kill_after=30
+        result = await _exec_or_timeout_error(
+            sandbox, ["git", "-C", WORKSPACE, "apply", f"{MOUNT_ROOT}/{staged}"], kill_after=30
         )
         if result.exit_code != 0:
             raise ToolError(f"apply_patch failed: {result.output.strip()[:300]}")
     finally:
-        await sandbox.exec(["rm", "-f", f"{MOUNT_ROOT}/{staged}"], kill_after=30)
+        await _exec_or_timeout_error(sandbox, ["rm", "-f", f"{MOUNT_ROOT}/{staged}"], kill_after=30)
 
     return f"applied patch ({len(args.diff.encode('utf-8'))} bytes)"
 
