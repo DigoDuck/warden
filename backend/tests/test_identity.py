@@ -10,6 +10,8 @@ import base64
 import hashlib
 import hmac
 import json
+import os
+import stat
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -19,10 +21,11 @@ import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from sqlalchemy import select, text
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from warden import audit, identity
 from warden.config import Settings
+from warden.identity import generate_keys
 from warden.identity.jwt import ALGORITHM, AUDIENCE, ISSUER, KeyPair, _kid_for
 from warden.models import AuditLog, IssuedToken, Task, User
 
@@ -210,6 +213,103 @@ async def test_a_revoked_token_is_refused(
         await identity.verify(session, keys, token)
 
 
+async def test_a_revocation_from_another_session_is_seen_immediately(
+    session_factory: async_sessionmaker[AsyncSession], keys: KeyPair
+) -> None:
+    """The entire point of a stateful, revocable `jti` (ADR-005) is that revoking it reaches
+    every session checking it, not just the one that issued it. Uses `session_factory`
+    directly, not the `session` fixture (which always rolls back), because the bug only shows
+    up across two genuinely separate, *committed* connections: the production session factory
+    runs with `expire_on_commit=False` (see warden/db.py), so a session that already has this
+    row warm in its identity map keeps returning that cached copy after its own commit, unless
+    verify() forces a re-read with `populate_existing=True`.
+
+    `pinned_row` matters: SQLAlchemy's identity map holds only a *weak* reference, so without
+    something else keeping the row alive it would be garbage-collected the moment verify()'s
+    own local `row` variable goes out of scope, and the second verify() call below would hit
+    Postgres for a genuinely fresh SELECT regardless of populate_existing, silently passing
+    for the wrong reason. Pinning it is what makes this test actually exercise the cache.
+    """
+    async with session_factory() as session_a:
+        user = User(email=f"{uuid.uuid4()}@warden.test", password_hash="x", role="submitter")
+        session_a.add(user)
+        await session_a.flush()
+        task = Task(user_id=user.id, spec="cross-session revoke", idempotency_key=str(uuid.uuid4()))
+        session_a.add(task)
+        await session_a.flush()
+
+        token = await identity.issue_agent_token(
+            session_a, keys, task_id=task.id, scopes=["repo:read"]
+        )
+        claims = await identity.verify(session_a, keys, token)
+        pinned_row = await session_a.get(IssuedToken, claims.jti)
+        assert pinned_row is not None
+        await session_a.commit()
+
+        async with session_factory() as session_b:
+            assert await identity.revoke(session_b, claims.jti) is True
+            await session_b.commit()
+
+        # Sanity check on the premise above: session_a's own copy is still stale here.
+        assert pinned_row.revoked_at is None
+
+        with pytest.raises(identity.InvalidToken):
+            await identity.verify(session_a, keys, token)
+
+        await session_a.rollback()
+
+
+# --- claims are sourced from the row, not the token's own payload ---------------------------
+
+
+async def test_rescoping_a_resigned_token_does_not_grant_new_scopes(
+    session: AsyncSession, keys: KeyPair, task_id: uuid.UUID
+) -> None:
+    """`sub`/`scopes` come from the `issued_tokens` row (see the `Claims` docstring), the same
+    way `task_id` already did. Simulates exactly the scenario the unknown-jti check exists for:
+    a leaked signing key lets an attacker take a live, known `jti` and re-sign it with scopes
+    and a subject it was never issued for. verify() must answer from the row it looked up, not
+    from whatever the forged payload claims.
+    """
+    token = await identity.issue_agent_token(session, keys, task_id=task_id, scopes=["repo:read"])
+    claims = await identity.verify(session, keys, token)
+
+    payload = jwt.decode(
+        token, keys.public_key, algorithms=[ALGORITHM], audience=AUDIENCE, issuer=ISSUER
+    )
+    payload["scopes"] = ["repo:read", "repo:write", "admin"]
+    payload["sub"] = f"agent:task:{uuid.uuid4()}"
+    forged = _sign(payload, keys)
+
+    reforged = await identity.verify(session, keys, forged, required_scope="repo:read")
+    assert reforged.scopes == ("repo:read",)
+    assert reforged.sub == claims.sub
+
+    with pytest.raises(identity.InsufficientScope):
+        await identity.verify(session, keys, forged, required_scope="admin")
+
+
+async def test_string_exp_and_iat_are_refused_not_a_typeerror(
+    session: AsyncSession, keys: KeyPair, task_id: uuid.UUID
+) -> None:
+    """PyJWT validates `exp`/`iat` by calling `int()` on them, so a numeric *string* survives
+    `decode()` unchanged and only breaks later, in `datetime.fromtimestamp()`. A real, known
+    jti is required to reach that code at all: an unknown jti is refused earlier. Before the
+    fix, the TypeError escaped verify()'s documented InvalidToken/InsufficientScope contract,
+    which a caller doing `except InvalidToken: return 401` would see as an unhandled 500.
+    """
+    token = await identity.issue_agent_token(session, keys, task_id=task_id, scopes=["repo:read"])
+    payload = jwt.decode(
+        token, keys.public_key, algorithms=[ALGORITHM], audience=AUDIENCE, issuer=ISSUER
+    )
+    payload["iat"] = str(payload["iat"])
+    payload["exp"] = str(payload["exp"])
+    malformed = _sign(payload, keys)
+
+    with pytest.raises(identity.InvalidToken):
+        await identity.verify(session, keys, malformed)
+
+
 async def test_an_unknown_jti_is_refused(session: AsyncSession, keys: KeyPair) -> None:
     """Well-formed and correctly signed, but its `jti` has no row in `issued_tokens`: exactly
     what a leaked signing key would produce. `verify()` must fail closed here, not trust the
@@ -306,6 +406,18 @@ async def test_a_non_string_scope_is_rejected(
         await identity.issue_agent_token(session, keys, task_id=task_id, scopes=[123])  # type: ignore[list-item]
 
 
+async def test_a_bare_string_scope_is_rejected(
+    session: AsyncSession, keys: KeyPair, task_id: uuid.UUID
+) -> None:
+    """The likelier real mistake than a non-string element: a caller forgets the list
+    brackets entirely. `str` satisfies `Sequence[str]`, so without an explicit check this
+    would silently explode into one-character scopes instead of raising, and those characters
+    would land in `issued_tokens` and the append-only audit log.
+    """
+    with pytest.raises(ValueError, match="single string"):
+        await identity.issue_agent_token(session, keys, task_id=task_id, scopes="repo:read")
+
+
 # --- TTL caps ------------------------------------------------------------------------------
 
 
@@ -384,3 +496,32 @@ def test_load_keys_with_a_missing_file_mentions_make_keys(tmp_path: Path) -> Non
     settings = Settings(jwt_private_key_path=str(tmp_path / "does-not-exist.pem"))
     with pytest.raises(FileNotFoundError, match="make keys"):
         identity.load_keys(settings)
+
+
+# --- key generation: permission and the atomic refuse-to-overwrite guarantee ----------------
+
+
+def test_generate_keys_writes_atomically_with_a_restrictive_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reproduces the finding: without an explicit mode, the key would inherit whatever the
+    process umask is (0o644 on a typical Linux deploy host, world-readable), and the previous
+    exists()-then-write() was a TOCTOU race on the "refuse to overwrite" guarantee. `os.open`
+    with `O_EXCL` folds the check and the create into one atomic syscall and sets the mode
+    itself, independent of umask. ADR-005: file permission is the only protection this key has.
+    """
+    key_path = tmp_path / "nested" / "jwt-private.pem"
+    monkeypatch.setattr(
+        generate_keys, "get_settings", lambda: Settings(jwt_private_key_path=str(key_path))
+    )
+
+    assert generate_keys.main() == 0
+    assert key_path.is_file()
+    if os.name == "posix":
+        # Mode bits are not meaningful on Windows (ADR-005); this is the check that matters
+        # for the actual VPS deploy target.
+        assert stat.S_IMODE(key_path.stat().st_mode) == 0o600
+
+    first_contents = key_path.read_bytes()
+    assert generate_keys.main() == 1
+    assert key_path.read_bytes() == first_contents

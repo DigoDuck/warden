@@ -80,9 +80,12 @@ class KeyPair:
 class Claims:
     """What `verify()` hands back: never the raw JWT payload dict.
 
-    `task_id` comes from the `issued_tokens` row, not from re-parsing `sub`: the row is the
-    authoritative record of what a `jti` was issued for, and reparsing a string the token
-    itself supplied would trust the token for something the database lookup already answers.
+    `task_id`, `sub` and `scopes` all come from the `issued_tokens` row, not from re-parsing
+    the payload: the row is the authoritative record of what a `jti` was issued for, and
+    trusting the token for any of these would let a leaked signing key re-sign a live `jti`
+    with escalated scopes or a different subject. `iat`/`exp` are the exception: they describe
+    the token itself (when *this* signature says it was minted and expires), not a fact the
+    row could answer differently.
     """
 
     sub: str
@@ -132,6 +135,12 @@ def load_keys(settings: Settings | None = None) -> KeyPair:
 
 
 def _validate_scopes(scopes: Sequence[str]) -> tuple[str, ...]:
+    # str satisfies Sequence[str] (mypy accepts it, and tuple() below would iterate it one
+    # character at a time), so it needs an explicit check: a caller that forgets the list
+    # brackets is the likeliest real mistake, and each resulting one-char "scope" would end up
+    # written verbatim into `issued_tokens` and the append-only audit log.
+    if isinstance(scopes, str):
+        raise ValueError("scopes must be a sequence of strings, not a single string")
     cleaned = tuple(scopes)
     if not cleaned:
         raise ValueError("scopes must not be empty")
@@ -292,7 +301,12 @@ async def verify(
     except (ValueError, TypeError, AttributeError) as exc:
         raise InvalidToken("token jti is not a valid uuid") from exc
 
-    row = await session.get(IssuedToken, jti)
+    # populate_existing=True, same reasoning as audit/log.py::verify(): without it, a session
+    # that already has this row warm in its identity map (it issued the token, or verified it
+    # earlier in this same session) gets back that cached Python object instead of what the
+    # SELECT just fetched, so a revoke() committed on another connection would never be seen
+    # here, defeating the entire point of a revocable, stateful `jti` (ADR-005).
+    row = await session.get(IssuedToken, jti, populate_existing=True)
     # A signature that checks out but a jti this control plane has no record of issuing means
     # either the signing key leaked, or a bug minted a token outside this module. Either way
     # trusting the signature alone would be wrong: fail closed, the same as a revoked token.
@@ -301,15 +315,22 @@ async def verify(
     if row.revoked_at is not None:
         raise InvalidToken("token has been revoked")
 
-    claims = Claims(
-        sub=payload["sub"],
-        jti=jti,
-        typ=payload.get("typ", ""),
-        scopes=tuple(payload.get("scopes", [])),
-        task_id=row.task_id,
-        iat=datetime.fromtimestamp(payload["iat"], tz=UTC),
-        exp=datetime.fromtimestamp(payload["exp"], tz=UTC),
-    )
+    try:
+        claims = Claims(
+            # sub/scopes: see the Claims docstring, same rationale as task_id already had.
+            sub=row.subject,
+            jti=jti,
+            typ=payload.get("typ", ""),
+            scopes=tuple(row.scopes),
+            task_id=row.task_id,
+            iat=datetime.fromtimestamp(payload["iat"], tz=UTC),
+            exp=datetime.fromtimestamp(payload["exp"], tz=UTC),
+        )
+    except (TypeError, ValueError, OverflowError, OSError) as exc:
+        # PyJWT validates exp/iat by calling int() on them, so a numeric *string* passes
+        # decode() and only breaks here, in fromtimestamp(). Uncaught, this let a TypeError
+        # escape verify()'s documented InvalidToken/InsufficientScope contract as a 500.
+        raise InvalidToken("token claims are malformed") from exc
 
     if required_scope is not None and required_scope not in claims.scopes:
         raise InsufficientScope(f"token lacks required scope {required_scope!r}")
