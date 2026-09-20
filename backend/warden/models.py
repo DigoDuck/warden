@@ -136,6 +136,27 @@ class ToolCall(Base):
     error: Mapped[str | None] = mapped_column(Text, default=None)
 
 
+class PolicyDecision(Base):
+    """Why one tool call was allowed, refused or escalated.
+
+    One row per decided tool call. `matched_rules` keeps every rule that matched, not just
+    the deciding one, and `policy_hash` pins which version of the policy produced it: an
+    audit months later has to answer "under which rules was this allowed".
+    """
+
+    __tablename__ = "policy_decisions"
+
+    id: Mapped[uuid.UUID] = _pk()
+    tool_call_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("tool_calls.id", ondelete="CASCADE"), index=True
+    )
+    effect: Mapped[str] = mapped_column(String(32))
+    matched_rules: Mapped[list[str]] = mapped_column(JSONB, default=list)
+    reason: Mapped[str] = mapped_column(Text)
+    policy_hash: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class ModelCall(Base):
     __tablename__ = "model_calls"
 

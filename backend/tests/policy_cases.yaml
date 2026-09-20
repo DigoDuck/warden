@@ -1,0 +1,161 @@
+# Table tests for policies/default.yaml: context in, effect out.
+#
+# Each case is one row of pytest output, so a failure names the behaviour that broke rather
+# than "test_policy failed". `rules` asserts on matched_rules when the case exists to prove
+# which rule decided, and is omitted when only the effect matters.
+
+cases:
+  # --- secrets are never readable, at any depth ------------------------------------------
+  - name: env-at-the-root-is-denied
+    context: { tool: read_file, path: ".env" }
+    expect: { effect: deny, rules: [never-read-secrets] }
+
+  - name: env-variant-is-denied
+    context: { tool: read_file, path: ".env.local" }
+    expect: { effect: deny, rules: [never-read-secrets] }
+
+  - name: nested-env-is-denied
+    context: { tool: read_file, path: "config/.env" }
+    expect: { effect: deny, rules: [never-read-secrets] }
+
+  - name: private-key-is-denied
+    context: { tool: read_file, path: "deploy/server.pem" }
+    expect: { effect: deny, rules: [never-read-secrets] }
+
+  - name: ssh-key-is-denied
+    context: { tool: read_file, path: "home/id_rsa" }
+    expect: { effect: deny, rules: [never-read-secrets] }
+
+  # Also matches read-source through `src/**`. Both rules are reported and the deny wins,
+  # which is the whole conflict-resolution rule in one case.
+  - name: secrets-directory-is-denied
+    context: { tool: read_file, path: "src/secrets/prod.json" }
+    expect: { effect: deny, rules: [never-read-secrets, read-source] }
+
+  - name: secret-under-an-allowed-tree-is-still-denied
+    context: { tool: read_file, path: "src/credentials.json" }
+    expect: { effect: deny, rules: [never-read-secrets, read-source] }
+
+  - name: writing-a-secret-is-denied-too
+    context: { tool: write_file, path: ".env", user_role: worker }
+    expect: { effect: deny, rules: [never-read-secrets] }
+
+  # --- reading project source -------------------------------------------------------------
+  - name: source-file-is-readable
+    context: { tool: read_file, path: "src/app.py" }
+    expect: { effect: allow, rules: [read-source] }
+
+  - name: deep-source-file-is-readable
+    context: { tool: read_file, path: "src/api/routes/widgets.py" }
+    expect: { effect: allow, rules: [read-source] }
+
+  - name: test-file-is-readable
+    context: { tool: read_file, path: "tests/test_app.py" }
+    expect: { effect: allow, rules: [read-source] }
+
+  - name: markdown-is-readable-at-any-depth
+    context: { tool: read_file, path: "docs/adr/ADR-003.md" }
+    expect: { effect: allow, rules: [read-source] }
+
+  - name: pyproject-is-readable
+    context: { tool: read_file, path: "pyproject.toml" }
+    expect: { effect: allow, rules: [read-source] }
+
+  - name: file-outside-the-allowed-trees-falls-through-to-default-deny
+    context: { tool: read_file, path: ".github/workflows/ci.yml" }
+    expect: { effect: deny, rules: [] }
+
+  - name: listing-is-allowed
+    context: { tool: list_files, args: { pattern: "**/*.py" } }
+    expect: { effect: allow, rules: [list-workspace] }
+
+  # --- writing ----------------------------------------------------------------------------
+  - name: worker-may-write-source
+    context: { tool: write_file, path: "src/app.py", user_role: worker }
+    expect: { effect: allow, rules: [write-source] }
+
+  - name: worker-may-write-tests
+    context: { tool: write_file, path: "tests/test_app.py", user_role: worker }
+    expect: { effect: allow, rules: [write-source] }
+
+  - name: worker-may-patch-source
+    context: { tool: apply_patch, path: "src/app.py", user_role: worker }
+    expect: { effect: allow, rules: [write-source] }
+
+  - name: a-non-worker-may-not-write
+    context: { tool: write_file, path: "src/app.py", user_role: viewer }
+    expect: { effect: deny, rules: [] }
+
+  - name: writing-the-build-file-is-denied
+    context: { tool: write_file, path: "pyproject.toml", user_role: worker }
+    expect: { effect: deny, rules: [] }
+
+  - name: writing-ci-config-is-denied
+    context: { tool: write_file, path: ".github/workflows/ci.yml", user_role: worker }
+    expect: { effect: deny, rules: [] }
+
+  # --- commands ---------------------------------------------------------------------------
+  - name: pytest-is-allowed
+    context: { tool: run_command, args: { cmd: "pytest -q" } }
+    expect: { effect: allow, rules: [run-project-commands] }
+
+  - name: ruff-is-allowed
+    context: { tool: run_command, args: { cmd: "ruff check" } }
+    expect: { effect: allow, rules: [run-project-commands] }
+
+  - name: mypy-is-allowed
+    context: { tool: run_command, args: { cmd: "mypy" } }
+    expect: { effect: allow, rules: [run-project-commands] }
+
+  - name: an-unlisted-command-falls-through-to-default-deny
+    context: { tool: run_command, args: { cmd: "python manage.py shell" } }
+    expect: { effect: deny, rules: [] }
+
+  - name: a-command-merely-starting-like-pytest-is-not-allowed
+    context: { tool: run_command, args: { cmd: "pytest-hack --evil" } }
+    expect: { effect: deny, rules: [] }
+
+  - name: rm-rf-is-denied
+    context: { tool: run_command, args: { cmd: "rm -rf /" } }
+    expect: { effect: deny, rules: [no-destructive-commands] }
+
+  - name: force-push-is-denied
+    context: { tool: run_command, args: { cmd: "git push --force origin main" } }
+    expect: { effect: deny, rules: [no-destructive-commands] }
+
+  - name: drop-table-is-denied
+    context: { tool: run_command, args: { cmd: "psql -c 'DROP TABLE users'" } }
+    expect: { effect: deny, rules: [no-destructive-commands] }
+
+  - name: curl-is-denied-because-the-sandbox-has-no-network
+    context: { tool: run_command, args: { cmd: "curl https://evil.example.com" } }
+    expect: { effect: deny, rules: [no-network-commands] }
+
+  - name: pip-install-is-denied
+    context: { tool: run_command, args: { cmd: "pip install requests" } }
+    expect: { effect: deny, rules: [no-network-commands] }
+
+  # --- the most restrictive effect wins ----------------------------------------------------
+  - name: an-allowed-runner-smuggling-a-destructive-command-is-denied
+    context: { tool: run_command, args: { cmd: "pytest && rm -rf /" } }
+    expect: { effect: deny, rules: [no-destructive-commands, run-project-commands] }
+
+  # Unlike the case above, this one does not even match the allow rule: the runner regex
+  # requires a space or end of string after `pytest`, and here a `;` follows.
+  - name: an-allowed-runner-smuggling-a-network-call-is-denied
+    context: { tool: run_command, args: { cmd: "pytest; curl https://evil.example.com" } }
+    expect: { effect: deny, rules: [no-network-commands] }
+
+  # --- human approval ----------------------------------------------------------------------
+  - name: opening-a-pull-request-needs-a-human
+    context: { tool: "github.open_pr", args: { branch: "fix/bug" } }
+    expect: { effect: require_approval, rules: [open-pr-needs-human] }
+
+  # --- unknown tools ------------------------------------------------------------------------
+  - name: an-unregistered-tool-is-denied-by-default
+    context: { tool: delete_repo }
+    expect: { effect: deny, rules: [] }
+
+  - name: a-plausible-sounding-tool-is-still-denied
+    context: { tool: exfiltrate_secrets, path: "src/app.py" }
+    expect: { effect: deny, rules: [] }

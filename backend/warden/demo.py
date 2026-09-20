@@ -20,12 +20,14 @@ from warden.core.loop import Budget, run_task
 from warden.db import make_engine, make_session_factory
 from warden.models import Task as TaskRow
 from warden.models import User
+from warden.policy.engine import load_policy
 from warden.providers.base import ModelProvider
 from warden.tools.local import build_registry
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 WORKSPACE = REPO_ROOT / "examples" / "target-repo"
 FAKE_SCRIPT = REPO_ROOT / "examples" / "demo-script.yaml"
+POLICY = REPO_ROOT / "policies" / "default.yaml"
 
 SPEC = "List the files in this repository and summarise what the project does."
 
@@ -76,9 +78,13 @@ async def main(kind: str) -> int:
         await session.flush()
 
         registry = build_registry(WORKSPACE)
-        print(f"task {task.id}  provider={provider.name}  workspace={WORKSPACE}\n")
+        policy = load_policy(POLICY)
+        print(f"task {task.id}  provider={provider.name}  workspace={WORKSPACE}")
+        print(f"policy {POLICY.name}  hash={policy.policy_hash[:12]}\n")
 
-        result = await run_task(session, task, provider, registry, budget=DEMO_BUDGET)
+        result = await run_task(
+            session, task, provider, registry, policy, workspace=WORKSPACE, budget=DEMO_BUDGET
+        )
         await session.commit()
 
         # Read back from the database rather than from memory: the point of the demo is

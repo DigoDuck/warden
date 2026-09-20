@@ -15,7 +15,8 @@ from uuid import UUID
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from warden.models import ModelCall, TaskEvent, ToolCall
+from warden.models import ModelCall, PolicyDecision, TaskEvent, ToolCall
+from warden.policy.engine import Decision
 from warden.providers.base import Completion
 from warden.providers.base import ToolCall as ProviderToolCall
 from warden.providers.pricing import cost_usd
@@ -26,6 +27,7 @@ TASK_CREATED = "task.created"
 ITERATION_STARTED = "iteration.started"
 MODEL_CALLED = "model.called"
 TOOL_REQUESTED = "tool.requested"
+POLICY_DECIDED = "policy.decided"
 TOOL_EXECUTED = "tool.executed"
 TASK_FINISHED = "task.finished"
 
@@ -135,6 +137,27 @@ async def record_tool_call(
             result_summary=result_summary,
             error=error,
             duration_ms=duration_ms,
+        )
+    )
+    await session.flush()
+    return row
+
+
+async def record_policy_decision(
+    session: AsyncSession, tool_call_id: UUID, decision: Decision
+) -> PolicyDecision:
+    """Persist why a tool call was allowed, refused or escalated.
+
+    Kept next to the tool call rather than only in the event log, because this is the row an
+    auditor filters on months later: which rules matched, and under which policy hash.
+    """
+    session.add(
+        row := PolicyDecision(
+            tool_call_id=tool_call_id,
+            effect=decision.effect.value,
+            matched_rules=decision.matched_rules,
+            reason=decision.reason,
+            policy_hash=decision.policy_hash,
         )
     )
     await session.flush()

@@ -1,15 +1,15 @@
-"""The minimal agent loop: generate, run tools, record events, finish.
+"""The agent loop: decide, execute, record, finish.
 
-This is week 1's version of briefing section 16, cut to what has something to stand on.
-Absent on purpose, arriving in week 2: the policy engine deciding every tool call, the
-Docker sandbox executing them, the queue claim with a lease, cooperative cancellation,
-checkpointing and resume. The shape here is the shape that grows into that, so the seams
-are where they will still be.
+Every tool call passes the policy engine first. The model proposes, the control plane
+decides, and the decision is deterministic, taken without reading model output as
+instruction, and recorded with the hash of the policy that produced it.
 
-The model proposes; here, for now, only the tool's own contract disposes. That is the piece
-week 2 replaces with a decision the control plane makes.
+This is week 2's version of briefing section 16. Still absent, arriving with the rest of the
+week: the Docker sandbox executing the calls, the queue claim with a lease, cooperative
+cancellation, checkpointing and resume.
 """
 
+import pathlib
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -20,7 +20,8 @@ from uuid import UUID
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from warden.core import events
-from warden.models import Task
+from warden.models import Task, User
+from warden.policy.engine import Decision, Effect, Policy, PolicyContext, UserRef
 from warden.providers.base import (
     AssistantMessage,
     Message,
@@ -31,6 +32,7 @@ from warden.providers.base import (
     ToolSchema,
     UserMessage,
 )
+from warden.tools.local import normalize_path
 from warden.tools.registry import ToolError, ToolRegistry
 
 FINISH_TOOL = "finish"
@@ -39,7 +41,10 @@ SYSTEM_PROMPT = """You are a software agent working on a repository through tool
 
 Read what you need with the tools available, then call `finish` with a summary of what you
 found. Call `finish` exactly once, as your last action. Do not guess at file contents you
-have not read."""
+have not read.
+
+Some actions are refused by policy. A refusal is final: do not retry the same call, work
+around it or report that you could not complete that part."""
 
 
 @dataclass(frozen=True)
@@ -59,6 +64,24 @@ class RunResult:
     reason: str | None = None
 
 
+def _refusal_message(decision: Decision) -> str:
+    """What the model is told when the control plane says no.
+
+    It names the rules that matched, because a refusal the model cannot understand is a
+    refusal it retries verbatim, burning iterations and money.
+    """
+    rules = ", ".join(decision.matched_rules) or "none"
+    if decision.effect is Effect.REQUIRE_APPROVAL:
+        return (
+            f"This action requires human approval and cannot run yet: {decision.reason}. "
+            f"Matched rules: {rules}."
+        )
+    return (
+        f"Refused by policy: {decision.reason}. Matched rules: {rules}. "
+        f"Do not retry this call; take a different approach."
+    )
+
+
 def _finish_schema() -> dict[str, object]:
     return {
         "type": "object",
@@ -74,11 +97,16 @@ async def run_task(
     task: Task,
     provider: ModelProvider,
     registry: ToolRegistry,
+    policy: Policy,
     *,
+    workspace: pathlib.Path,
     budget: Budget | None = None,
 ) -> RunResult:
     budget = budget or Budget()
     spent = Decimal("0")
+
+    user = await session.get(User, task.user_id)
+    user_ref = UserRef(id=task.user_id, role=user.role if user else "worker")
 
     tool_schemas = list(registry.schemas())
     # `finish` is described to the model but never dispatched to the registry: section 15
@@ -94,7 +122,12 @@ async def run_task(
     messages: list[Message] = [UserMessage(text=task.spec)]
     task.status = "RUNNING"
     task.started_at = datetime.now(UTC)
-    await events.append_event(session, task.id, events.TASK_CREATED, {"spec": task.spec})
+    await events.append_event(
+        session,
+        task.id,
+        events.TASK_CREATED,
+        {"spec": task.spec, "policy_hash": policy.policy_hash[:12]},
+    )
 
     for iteration in range(1, budget.max_iterations + 1):
         await events.append_event(session, task.id, events.ITERATION_STARTED, {"n": iteration})
@@ -152,8 +185,8 @@ async def run_task(
             continue
 
         if completion.stop_reason == "end_turn":
-            # The model stopped talking without calling `finish`. The summary is whatever
-            # it said, and the task is done rather than stuck.
+            # The model stopped talking without calling `finish`. The summary is whatever it
+            # said, and the task is done rather than stuck.
             return await _finish(
                 session, task, "SUCCEEDED", iteration, spent, summary=completion.text
             )
@@ -162,13 +195,23 @@ async def run_task(
             (call for call in completion.tool_calls if call.name == FINISH_TOOL), None
         )
         if finish_call is not None:
+            # Handled by core rather than dispatched, so it carries no policy decision.
             await events.record_tool_call(
                 session, task.id, iteration, finish_call, decision="allow"
             )
             summary = str(finish_call.arguments.get("summary", "")) or completion.text
             return await _finish(session, task, "SUCCEEDED", iteration, spent, summary=summary)
 
-        results = await _run_tools(session, task.id, iteration, completion.tool_calls, registry)
+        results = await _run_tools(
+            session,
+            task.id,
+            iteration,
+            completion.tool_calls,
+            registry,
+            policy,
+            user_ref,
+            workspace,
+        )
         messages.append(ToolResultsMessage(results=results))
 
     return await _finish(
@@ -181,49 +224,110 @@ async def run_task(
     )
 
 
+def _build_context(
+    call: ToolCall,
+    registry: ToolRegistry,
+    user: UserRef,
+    workspace: pathlib.Path,
+    task_id: UUID,
+) -> PolicyContext:
+    """Normalise the path once, here, so policy and tool judge the same string.
+
+    The two layers still do different work, and that is intentional. The policy rules on the
+    normalised path; the tool resolves it again when it opens the file. A symlink inside the
+    workspace pointing outside reaches the policy as an innocent `src/app.py` and is stopped
+    by the tool. Neither layer alone covers both cases.
+    """
+    path_arg = registry.path_arg(call.name)
+    normalised: str | None = None
+    if path_arg is not None:
+        raw = call.arguments.get(path_arg)
+        if isinstance(raw, str):
+            try:
+                normalised = normalize_path(workspace, raw)
+            except ToolError:
+                # Escapes the workspace. Leaving the path unset means no allow rule can
+                # match it and the default deny applies; the tool would refuse it anyway.
+                normalised = None
+    return PolicyContext(
+        tool=call.name, args=call.arguments, path=normalised, user=user, task_id=task_id
+    )
+
+
 async def _run_tools(
     session: AsyncSession,
     task_id: UUID,
     iteration: int,
     calls: Sequence[ToolCall],
     registry: ToolRegistry,
+    policy: Policy,
+    user: UserRef,
+    workspace: pathlib.Path,
 ) -> list[ToolResult]:
-    """Execute every tool the model asked for, and answer all of them.
+    """Decide on every call, execute the allowed ones, and answer all of them.
 
-    A failed tool still gets a result with `is_error`. Dropping it would leave a `tool_use`
-    block unanswered, which the API rejects, and it would hide the failure from the model.
+    A refused tool still gets a result with `is_error`. Dropping it would leave a `tool_use`
+    block unanswered, which the API rejects, and it would hide the refusal from the model.
     """
     results: list[ToolResult] = []
     for call in calls:
         await events.append_event(
             session, task_id, events.TOOL_REQUESTED, {"tool": call.name, "id": call.id}
         )
+
+        decision = policy.evaluate(_build_context(call, registry, user, workspace, task_id))
+        await events.append_event(
+            session,
+            task_id,
+            events.POLICY_DECIDED,
+            {
+                "tool": call.name,
+                "id": call.id,
+                "effect": decision.effect.value,
+                "matched_rules": decision.matched_rules,
+                "policy_hash": decision.policy_hash[:12],
+            },
+        )
+
         started = time.monotonic()
-        try:
-            output = await registry.execute(call.name, call.arguments)
-            error = None
-        except ToolError as exc:
-            # Refusals and bad arguments are normal in an agent loop: the model sees the
-            # message and gets to correct itself on the next turn.
-            output = str(exc)
-            error = str(exc)
+        if decision.effect is Effect.ALLOW:
+            try:
+                output = await registry.execute(call.name, call.arguments)
+                error = None
+            except ToolError as exc:
+                # Bad arguments and tool-level refusals are normal in an agent loop: the
+                # model sees the message and corrects itself on the next turn.
+                output = str(exc)
+                error = str(exc)
+        else:
+            # The tool never runs. require_approval degrades to a refusal until week 3
+            # builds the approval machinery, which errs on the restrictive side.
+            output = _refusal_message(decision)
+            error = output
 
         duration_ms = int((time.monotonic() - started) * 1000)
-        await events.record_tool_call(
+        row = await events.record_tool_call(
             session,
             task_id,
             iteration,
             call,
-            decision="allow",
+            decision=decision.effect.value,
             result_summary=output[:500],
             error=error,
             duration_ms=duration_ms,
         )
+        await events.record_policy_decision(session, row.id, decision)
         await events.append_event(
             session,
             task_id,
             events.TOOL_EXECUTED,
-            {"tool": call.name, "id": call.id, "ok": error is None, "duration_ms": duration_ms},
+            {
+                "tool": call.name,
+                "id": call.id,
+                "ok": error is None,
+                "effect": decision.effect.value,
+                "duration_ms": duration_ms,
+            },
         )
         results.append(ToolResult(tool_call_id=call.id, content=output, is_error=error is not None))
     return results
