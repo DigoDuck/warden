@@ -1,4 +1,4 @@
-"""schema inicial: users, tasks, task_events, tool_calls, model_calls
+"""initial schema: users, tasks, task_events, tool_calls, model_calls
 
 Revision ID: 0001_initial
 Revises:

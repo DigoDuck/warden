@@ -39,8 +39,9 @@ warn_redundant_casts = true
 warn_unused_ignores = true
 files = ["warden", "tests"]
 
-# strict so em policy/ e core/ (briefing, secao 43 item 1). "strict = true" nao e
-# aceito em secao por modulo, entao vai expandido nas flags que ele liga.
+# strict only in policy/ and core/ (briefing, section 43 item 1). "strict = true"
+# is not accepted in a per-module section, so it is expanded into the flags it
+# turns on.
 [[tool.mypy.overrides]]
 module = ["warden.policy.*", "warden.core.*"]
 disallow_untyped_defs = true
@@ -55,9 +56,10 @@ strict_equality = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-# Fixture e teste precisam da MESMA loop: o engine e criado uma vez por sessao, e uma
-# conexao asyncpg aberta numa loop nao pode ser usada em outra. Deixar o default
-# ("function" para teste, "session" para fixture) da "Event loop is closed" no segundo teste.
+# Fixtures and tests need the SAME loop: the engine is created once per session,
+# and an asyncpg connection opened in one loop cannot be used in another. Leaving
+# the defaults ("function" for tests, "session" for fixtures) raises "Event loop
+# is closed" on the second test.
 asyncio_default_fixture_loop_scope = "session"
 asyncio_default_test_loop_scope = "session"
 testpaths = ["tests"]

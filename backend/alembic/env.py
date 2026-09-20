@@ -11,7 +11,8 @@ from warden.models import Base
 
 config = context.config
 
-# Precedencia: URL ja injetada no config (usada pelos testes) ganha do ambiente.
+# Precedence: a URL already injected into the config (used by the tests) wins
+# over the environment.
 config.set_main_option(
     "sqlalchemy.url",
     config.get_main_option("sqlalchemy.url") or get_settings().database_url,

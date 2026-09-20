@@ -8,8 +8,8 @@ from sqlalchemy.ext.asyncio import (
 
 
 def make_engine(url: str) -> AsyncEngine:
-    # pool_pre_ping: o Postgres do Compose reinicia sem avisar a aplicacao; sem isso a
-    # primeira query depois do restart estoura com conexao morta.
+    # pool_pre_ping: the Compose Postgres restarts without telling the application.
+    # Without it, the first query after a restart fails on a dead connection.
     return create_async_engine(url, pool_pre_ping=True)
 
 
@@ -18,11 +18,11 @@ def make_session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSession
 
 
 def with_database(url: str, database: str) -> str:
-    """Mesma URL apontando para outro database. Usado pelo banco de teste.
+    """Return the same URL pointing at another database. Used by the test database.
 
-    render_as_string(hide_password=False) e obrigatorio: `str(URL)` do SQLAlchemy troca a
-    senha por "***" em silencio (protecao contra vazar credencial em log). Usar str() aqui
-    devolve uma URL com a senha literal "***" e o erro que chega e
-    "password authentication failed", que aponta para o lugar errado.
+    render_as_string(hide_password=False) is mandatory here: SQLAlchemy's `str(URL)`
+    silently replaces the password with "***" to keep credentials out of logs. Using
+    str() would yield a URL whose password is literally "***", and the error that
+    surfaces is "password authentication failed", which points at the wrong place.
     """
     return make_url(url).set(database=database).render_as_string(hide_password=False)

@@ -17,16 +17,16 @@ TEST_DB = "warden_test"
 
 @pytest.fixture(scope="session")
 async def session_factory() -> AsyncIterator[async_sessionmaker[AsyncSession]]:
-    """Cria o banco de teste do zero e aplica as migracoes uma vez por sessao.
+    """Create the test database from scratch and migrate it once per session.
 
-    Roda a migracao de verdade em vez de `metadata.create_all`: o que e testado aqui e o
-    schema que vai para producao, nao um schema paralelo gerado pelos modelos.
+    This runs the real migration instead of `metadata.create_all`, so what the tests
+    exercise is the schema that ships, not a parallel one generated from the models.
     """
     base_url = get_settings().database_url
     test_url = with_database(base_url, TEST_DB)
 
-    # CREATE/DROP DATABASE nao rodam dentro de transacao, dai o AUTOCOMMIT. FORCE derruba
-    # conexao pendurada de uma execucao anterior que tenha morrido no meio.
+    # CREATE/DROP DATABASE cannot run inside a transaction, hence AUTOCOMMIT. FORCE
+    # kills connections left behind by an earlier run that died halfway through.
     admin = create_async_engine(with_database(base_url, "postgres"), isolation_level="AUTOCOMMIT")
     async with admin.connect() as conn:
         await conn.execute(text(f'DROP DATABASE IF EXISTS "{TEST_DB}" WITH (FORCE)'))
@@ -36,8 +36,8 @@ async def session_factory() -> AsyncIterator[async_sessionmaker[AsyncSession]]:
     cfg = Config(str(BACKEND / "alembic.ini"))
     cfg.set_main_option("script_location", str(BACKEND / "alembic"))
     cfg.set_main_option("sqlalchemy.url", test_url)
-    # O env.py do alembic chama asyncio.run, que estoura se ja houver loop rodando.
-    # to_thread entrega a ele uma thread com loop proprio.
+    # Alembic's env.py calls asyncio.run, which raises inside an already running loop.
+    # to_thread hands it a thread with a loop of its own.
     await asyncio.to_thread(command.upgrade, cfg, "head")
 
     engine = make_engine(test_url)
@@ -49,10 +49,10 @@ async def session_factory() -> AsyncIterator[async_sessionmaker[AsyncSession]]:
 async def session(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> AsyncIterator[AsyncSession]:
-    """Sessao por teste, sempre desfeita no fim.
+    """One session per test, always rolled back.
 
-    Os testes usam `flush()` e nunca `commit()`: a constraint dispara igual e o rollback
-    deixa o banco limpo para o proximo teste, sem TRUNCATE entre eles.
+    Tests use `flush()` and never `commit()`: the constraint fires just the same, and
+    the rollback leaves a clean database for the next test without TRUNCATE in between.
     """
     async with session_factory() as s:
         yield s

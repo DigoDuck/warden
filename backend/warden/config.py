@@ -4,17 +4,17 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    """Configuracao vinda do ambiente. Segredo nenhum mora em arquivo versionado."""
+    """Configuration read from the environment. No secret lives in a tracked file."""
 
-    # Os comandos rodam de backend/, mas o .env fica na raiz do repo.
+    # Commands run from backend/, but the .env file sits at the repository root.
     model_config = SettingsConfigDict(
         env_file=(".env", "../.env"),
         env_file_encoding="utf-8",
         extra="ignore",
     )
 
-    # 5434: porta padrao publicada pelo docker-compose (WARDEN_DB_PORT). Ver o
-    # comentario la sobre por que nao e 5432.
+    # 5434 is the default port docker-compose publishes (WARDEN_DB_PORT). See the
+    # comment there for why it is not 5432.
     database_url: str = "postgresql+asyncpg://warden:warden@localhost:5434/warden"
 
 

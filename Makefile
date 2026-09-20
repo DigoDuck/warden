@@ -1,7 +1,7 @@
 .PHONY: db-up db-down migrate revision test lint fmt
 
-# --directory evita "cd backend &&", que quebra quando o make do Windows escolhe
-# cmd.exe em vez de sh. Cada receita vira um comando so.
+# --directory avoids "cd backend &&", which breaks when the Windows make picks
+# cmd.exe instead of sh. Each recipe stays a single command.
 UV := uv run --directory backend
 
 db-up:

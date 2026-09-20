@@ -1,7 +1,7 @@
-"""A convencao do projeto e constraint no banco antes de regra em codigo.
+"""This repository puts guarantees in the database before rules in application code.
 
-Constraint sem teste e so uma intencao: estes testes existem para que ela falhe de forma
-visivel se alguem mexer na migracao.
+A constraint without a test is only an intention: these tests exist so that one fails
+visibly if someone changes the migration.
 """
 
 import uuid
@@ -26,7 +26,7 @@ EXPECTED_TABLES = {
 async def _a_user(session: AsyncSession) -> User:
     user = User(
         email=f"{uuid.uuid4()}@warden.test",
-        password_hash="nao-e-um-hash-de-verdade",
+        password_hash="not-a-real-hash",
         role="submitter",
     )
     session.add(user)
@@ -42,20 +42,20 @@ async def test_migration_creates_expected_tables(session: AsyncSession) -> None:
 
 
 async def test_idempotency_key_rejects_duplicate(session: AsyncSession) -> None:
-    """Dois POST /tasks com o mesmo Idempotency-Key nao podem virar duas tarefas."""
+    """Two POST /tasks with the same Idempotency-Key must not become two runs."""
     user = await _a_user(session)
-    session.add(Task(idempotency_key="mesma-chave", user_id=user.id, spec="ler o repo"))
+    session.add(Task(idempotency_key="same-key", user_id=user.id, spec="read the repo"))
     await session.flush()
 
-    session.add(Task(idempotency_key="mesma-chave", user_id=user.id, spec="ler de novo"))
+    session.add(Task(idempotency_key="same-key", user_id=user.id, spec="read it again"))
     with pytest.raises(IntegrityError):
         await session.flush()
 
 
 async def test_task_event_seq_is_unique_per_task(session: AsyncSession) -> None:
-    """Dois workers nunca gravam o mesmo passo. E o que torna o resume seguro."""
+    """Two workers never write the same step. This is what makes resume safe."""
     user = await _a_user(session)
-    task = Task(idempotency_key=str(uuid.uuid4()), user_id=user.id, spec="qualquer")
+    task = Task(idempotency_key=str(uuid.uuid4()), user_id=user.id, spec="anything")
     session.add(task)
     await session.flush()
 
@@ -68,14 +68,14 @@ async def test_task_event_seq_is_unique_per_task(session: AsyncSession) -> None:
 
 
 async def test_status_check_rejects_unknown_state(session: AsyncSession) -> None:
-    """O core/ da semana 2 nao vai conseguir inventar um estado fora da maquina."""
+    """Week 2's core/ will not be able to invent a state outside the machine."""
     user = await _a_user(session)
     session.add(
         Task(
             idempotency_key=str(uuid.uuid4()),
             user_id=user.id,
-            spec="qualquer",
-            status="QUASE_PRONTO",
+            spec="anything",
+            status="ALMOST_DONE",
         )
     )
     with pytest.raises(IntegrityError):
