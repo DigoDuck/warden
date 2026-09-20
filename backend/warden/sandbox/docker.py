@@ -197,6 +197,21 @@ def discard_workspace_volume(task_id: str, *, client: docker.DockerClient | None
         client.volumes.get(workspace_volume_name(task_id)).remove(force=True)
 
 
+def _remove_orphan_container(client: docker.DockerClient, task_id: str) -> None:
+    """Force-remove whatever container still carries this task's `warden.task` label.
+
+    A worker whose process is killed outright never runs `Sandbox.destroy()`, so its
+    container can outlive it, possibly still mid-command against the workspace volume a new
+    sandbox is about to attach to. The lease holder claiming the task now is the only
+    legitimate owner (fencing in `core/loop.py` stops the old worker from writing anything
+    else regardless), so whatever is still labelled for this task belongs to nobody that
+    matters any more, and the safe thing is to remove it before the new container starts.
+    """
+    for stray in client.containers.list(all=True, filters={"label": f"warden.task={task_id}"}):
+        with contextlib.suppress(NotFound, docker.errors.APIError):
+            stray.remove(force=True)
+
+
 @dataclass
 class ExecResult:
     exit_code: int
@@ -257,6 +272,9 @@ class Sandbox:
         task_id: str | None,
         exclude: Callable[[str], bool] | None = None,
     ) -> "Sandbox":
+        if task_id is not None:
+            _remove_orphan_container(client, task_id)
+
         volume, is_new = _workspace_volume(client, task_id)
 
         def discard_new_volume() -> None:
@@ -299,7 +317,13 @@ class Sandbox:
                 # The workspace volume above is the only mount. No bind mount from the host,
                 # and in particular never the Docker socket: mounting it would hand the
                 # agent root on the host.
-                labels={"warden.sandbox": "1", "warden.profile": profile.name},
+                # `warden.task`, when there is one, is what `_remove_orphan_container` looks
+                # for later, the same label the workspace volume already carries.
+                labels={
+                    "warden.sandbox": "1",
+                    "warden.profile": profile.name,
+                    **({"warden.task": task_id} if task_id is not None else {}),
+                },
             )
             # The mount exists only once the container is running, so the copy happens after.
             # An existing task volume already holds the workspace, including whatever the
