@@ -69,6 +69,13 @@ rules:
       tool: run_command
       args.cmd: "^(pytest|ruff|mypy|npm (test|run lint))( |$)"
 
+  - id: run-tests
+    effect: allow
+    reason: "running the test suite is the same evidence run-project-commands already trusts, just through its own tool"
+    scopes: [tests:run]
+    when:
+      tool: [run_tests]
+
   - id: no-destructive-commands
     effect: deny
     reason: "destructive or history-rewriting command"

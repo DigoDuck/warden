@@ -107,6 +107,14 @@ cases:
     context: { tool: run_command, args: { cmd: "mypy" } }
     expect: { effect: allow, rules: [run-project-commands] }
 
+  - name: run-tests-is-allowed
+    context: { tool: run_tests, args: {} }
+    expect: { effect: allow, rules: [run-tests] }
+
+  - name: run-tests-scoped-to-a-path-is-allowed
+    context: { tool: run_tests, args: { path: "tests/test_app.py" } }
+    expect: { effect: allow, rules: [run-tests] }
+
   - name: an-unlisted-command-falls-through-to-default-deny
     context: { tool: run_command, args: { cmd: "python manage.py shell" } }
     expect: { effect: deny, rules: [] }
