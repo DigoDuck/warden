@@ -103,6 +103,7 @@ Claude implementa, Diogo revisa o diff. Consequência aceita conscientemente: o 
 ## Git
 
 - Mensagens de commit em **inglês**, imperativas (`Add policy matcher for glob paths`).
+- **Título e corpo de PR, e descrição de issue, em inglês** também. Só `docs/` e a UI ficam em português.
 - **Nunca** adicionar trailer de coautoria, assinatura ou selo de IA em commits, PRs ou issues.
 - Branches: `feat/<slug>`, `fix/<slug>`, `docs/<slug>`, `chore/<slug>`.
 - Branch base: `main`. Um PR por item da checklist.

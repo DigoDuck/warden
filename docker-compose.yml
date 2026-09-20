@@ -1,0 +1,26 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: warden
+      POSTGRES_PASSWORD: warden
+      POSTGRES_DB: warden
+    ports:
+      # The host port is configurable because 5432 is rarely free: a developer box
+      # often runs a native PostgreSQL, and other Compose projects take the
+      # neighbouring ports. The clash does not fail at bind time, it fails with
+      # "connection closed" on the first query, which is far more expensive to
+      # diagnose. Inside the container the port is still 5432.
+      - "${WARDEN_DB_PORT:-5434}:5432"
+    volumes:
+      - warden-db:/var/lib/postgresql/data
+    healthcheck:
+      # migrate runs right after db-up. Without a healthcheck the first alembic run
+      # catches Postgres still initialising and fails with "connection refused".
+      test: ["CMD-SHELL", "pg_isready -U warden -d warden"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  warden-db:

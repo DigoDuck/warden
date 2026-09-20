@@ -961,7 +961,7 @@ README com arquitetura, threat model, tabela de métricas reais, screenshots, GI
 
 1. `pyproject.toml` com ruff, mypy strict em `policy/` e `core/`, pytest-asyncio.
 2. `docker-compose.yml`: postgres, api, worker, jaeger, frontend.
-3. Alembic com migração inicial: users, tasks, task_events, tool_calls, model_calls, audit_log.
+3. Alembic com migração inicial: users, tasks, task_events, tool_calls, model_calls. (`audit_log` fica para a semana 3, junto do `REVOKE UPDATE/DELETE` e do `verify()` da hash chain: tabela com imutabilidade prometida e nenhum código que escreva nela é promessa não testada.)
 4. Role de banco `warden_app` sem UPDATE/DELETE em `audit_log`; migração cria.
 5. `providers/base.py` (Protocol, `Completion`, `ToolCall`, `Usage`) + `providers/fake.py` (roteiro por YAML) + `providers/anthropic.py`.
 6. Tabela de preços por modelo em `providers/pricing.py`; custo calculado por chamada.
