@@ -66,6 +66,44 @@ vazou, ou se algum bug em outro lugar do sistema passou a assinar token por fora
 Em qualquer um dos dois casos, confiar na assinatura sozinha seria o erro: a política aqui é
 fail closed, não "assinatura bateu, deixa passar".
 
+### O token tem que dizer exatamente o que foi emitido
+
+Recusar `jti` desconhecido não basta contra a chave vazada, e a primeira versão parava aí. Quem
+tem a chave não precisa inventar um `jti`: pega um **vivo** e re-assina com o que quiser. Foi
+provado na revisão com um token de `['repo:read']` re-assinado com `admin`, e
+`verify(required_scope='admin')` aceitou, porque os scopes saíam do payload.
+
+A linha de `issued_tokens` é o registro do que foi emitido, então é ela que responde: `sub`,
+`scopes`, `exp` e `typ` do payload são comparados com a linha, e qualquer divergência é
+`InvalidToken`. Duas decisões dentro disso:
+
+- **Recusar, não "corrigir".** A alternativa era aceitar o token forjado e devolver os claims
+  da linha. Funciona, e transforma uma chave vazada num token que continua funcionando com as
+  permissões originais, sem ninguém notar. Divergência entre token e linha só acontece por
+  falsificação, então é tratada como o incidente que é.
+- **`exp` e `typ` entram na comparação.** O PyJWT só conhece o `exp` que o próprio token
+  afirma, e um token re-assinado afirma o que quiser: sem comparar, um `jti` de 15 minutos
+  virava um de um ano. `typ` não tem coluna; a linha responde por ele pelo `subject` que este
+  módulo mesmo gravou (`agent:task:<id>` ou `user:<id>`).
+
+O que continua fora do alcance disto: com a chave vazada e um `jti` vivo, o atacante ainda pode
+re-assinar o token **idêntico**, o que não lhe dá nada além do que o token original já dava,
+por no máximo 15 minutos, e `revoke_all_for_task` corta.
+
+### Revogar é um UPDATE com guarda, não ler e depois escrever
+
+`revoke()` faz `UPDATE ... WHERE revoked_at IS NULL RETURNING`, e só audita as linhas que o
+banco devolveu. A versão de ler a linha e conferir `revoked_at` em Python errava de dois jeitos,
+os dois achados na revisão causando a situação de verdade: uma session que já tinha a linha em
+memória via a própria cópia velha (a mesma armadilha do identity map que `verify()` documenta),
+e duas sessions revogando ao mesmo tempo viam `NULL` as duas. Nos dois casos a mesma revogação
+era auditada duas vezes, num log que não se corrige depois, e o primeiro `revoked_at` era
+sobrescrito. É a regra do projeto aplicada: quando o banco pode garantir, a garantia mora nele.
+
+O primeiro teste dessa corrida disparava dois `revoke` com `gather` e passava também no código
+errado, porque os dois simplesmente rodavam em sequência. O teste atual força o cruzamento: A
+revoga e segura a transação aberta, B começa enquanto A não commitou.
+
 ### O ataque de confusão de algoritmo, e por que a lista de algoritmos é fixa
 
 `jwt.decode(..., algorithms=["RS256"])`, nunca lendo o campo `alg` do header do próprio token

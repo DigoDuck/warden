@@ -25,6 +25,16 @@ def main() -> int:
     # 0o700: only the owner needs to reach into this directory at all.
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
 
+    # Generated before the file exists: keygen is the slow, interruptible part, and an empty
+    # PEM left behind by a Ctrl-C would make every later `make keys` refuse to overwrite it
+    # while `load_keys()` fails on it.
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=KEY_SIZE)
+    pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+
     # ADR-005 says file permission is the only protection this key has (no HSM/KMS in the
     # MVP), so it has to be set here, not inherited from whatever the process umask happens to
     # be. O_EXCL also makes "does it already exist" and "create it" one atomic syscall instead
@@ -37,12 +47,6 @@ def main() -> int:
         print(f"refusing to overwrite existing key at {path}", file=sys.stderr)
         return 1
 
-    private_key = rsa.generate_private_key(public_exponent=65537, key_size=KEY_SIZE)
-    pem = private_key.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=serialization.NoEncryption(),
-    )
     with os.fdopen(fd, "wb") as f:
         f.write(pem)
     print(f"wrote {path}")

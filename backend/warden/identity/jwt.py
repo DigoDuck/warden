@@ -19,7 +19,7 @@ from pathlib import Path
 import jwt
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
-from sqlalchemy import select
+from sqlalchemy import ColumnElement, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from warden import audit
@@ -80,12 +80,11 @@ class KeyPair:
 class Claims:
     """What `verify()` hands back: never the raw JWT payload dict.
 
-    `task_id`, `sub` and `scopes` all come from the `issued_tokens` row, not from re-parsing
-    the payload: the row is the authoritative record of what a `jti` was issued for, and
-    trusting the token for any of these would let a leaked signing key re-sign a live `jti`
-    with escalated scopes or a different subject. `iat`/`exp` are the exception: they describe
-    the token itself (when *this* signature says it was minted and expires), not a fact the
-    row could answer differently.
+    Everything that authorises comes from the `issued_tokens` row, not from re-parsing the
+    payload: the row is the authoritative record of what a `jti` was issued for. `verify()`
+    also refuses a token whose payload disagrees with its row, so by the time a `Claims`
+    exists the two are known to say the same thing. `iat` is the one field read from the
+    token alone: it grants nothing, and the row has no separate copy to compare it with.
     """
 
     sub: str
@@ -95,6 +94,14 @@ class Claims:
     task_id: uuid.UUID | None
     iat: datetime
     exp: datetime
+
+
+def _typ_of(subject: str) -> str:
+    """`agent` or `user`, read off the subject this module itself wrote (`agent:task:<id>`,
+    `user:<id>`). `issued_tokens` has no `typ` column, and the subject already says it, so
+    this is how the row answers for `typ` without trusting the token's own claim.
+    """
+    return subject.split(":", 1)[0]
 
 
 def _resolve_key_path(raw: str) -> Path:
@@ -315,21 +322,36 @@ async def verify(
     if row.revoked_at is not None:
         raise InvalidToken("token has been revoked")
 
+    # The token has to say exactly what was issued for this jti. A valid signature over a
+    # live jti with anything else in it (wider scopes, another subject, a later expiry, a
+    # different typ) was not minted by `_issue()`, which means the signing key is in someone
+    # else's hands. Answering from the row and carrying on would quietly turn that forgery
+    # into a working token with the original permissions; refusing it keeps an incident
+    # looking like one. Comparing `exp` also closes what the signature check cannot: PyJWT
+    # only knows the expiry the token claims, and a re-signed token claims whatever it likes.
+    issued = {
+        "sub": row.subject,
+        "typ": _typ_of(row.subject),
+        "scopes": list(row.scopes),
+        "exp": int(row.expires_at.timestamp()),
+    }
+    if {name: payload.get(name) for name in issued} != issued:
+        raise InvalidToken("token does not match what was issued for this jti")
+
     try:
         claims = Claims(
-            # sub/scopes: see the Claims docstring, same rationale as task_id already had.
             sub=row.subject,
             jti=jti,
-            typ=payload.get("typ", ""),
+            typ=_typ_of(row.subject),
             scopes=tuple(row.scopes),
             task_id=row.task_id,
             iat=datetime.fromtimestamp(payload["iat"], tz=UTC),
-            exp=datetime.fromtimestamp(payload["exp"], tz=UTC),
+            exp=row.expires_at,
         )
     except (TypeError, ValueError, OverflowError, OSError) as exc:
-        # PyJWT validates exp/iat by calling int() on them, so a numeric *string* passes
-        # decode() and only breaks here, in fromtimestamp(). Uncaught, this let a TypeError
-        # escape verify()'s documented InvalidToken/InsufficientScope contract as a 500.
+        # PyJWT validates iat by calling int() on it, so a numeric *string* passes decode()
+        # and only breaks here, in fromtimestamp(). Uncaught, a TypeError would escape
+        # verify()'s documented InvalidToken/InsufficientScope contract as a 500.
         raise InvalidToken("token claims are malformed") from exc
 
     if required_scope is not None and required_scope not in claims.scopes:
@@ -338,26 +360,45 @@ async def verify(
     return claims
 
 
-async def _mark_revoked(session: AsyncSession, row: IssuedToken) -> None:
-    """Shared by `revoke()` and `revoke_all_for_task()`: set `revoked_at` once and audit it.
+async def _revoke_where(session: AsyncSession, *conditions: ColumnElement[bool]) -> int:
+    """Revoke every live token matching `conditions`, and audit each one that changed.
+
+    One guarded UPDATE, not read-then-write: `revoked_at IS NULL` in the WHERE clause lets
+    the database decide who made the state change. Reading the row first and checking
+    `revoked_at` in Python gets it wrong twice over. A session that already holds the row
+    sees its own cached copy (the identity-map trap `verify()` documents), and two sessions
+    revoking at once both see NULL; either way the same revocation is audited twice, in a
+    log that cannot be corrected afterwards, and the first `revoked_at` is overwritten.
 
     Same short-transaction rule as `_issue()` applies to `audit.append()` here.
     """
-    row.revoked_at = datetime.now(UTC)
-    await audit.append(
-        session,
-        actor_type="system",
-        actor_id="identity",
-        action="token.revoked",
-        target_type="issued_token",
-        target_id=str(row.jti),
-        details={
-            "jti": str(row.jti),
-            "task_id": str(row.task_id) if row.task_id else None,
-            "subject": row.subject,
-            "scopes": row.scopes,
-        },
-    )
+    changed = (
+        await session.scalars(
+            update(IssuedToken)
+            .where(IssuedToken.revoked_at.is_(None), *conditions)
+            .values(revoked_at=datetime.now(UTC))
+            .returning(IssuedToken),
+            # RETURNING hands back rows this session may already hold; without this it would
+            # return the cached objects, still saying `revoked_at` is None.
+            execution_options={"populate_existing": True},
+        )
+    ).all()
+    for row in changed:
+        await audit.append(
+            session,
+            actor_type="system",
+            actor_id="identity",
+            action="token.revoked",
+            target_type="issued_token",
+            target_id=str(row.jti),
+            details={
+                "jti": str(row.jti),
+                "task_id": str(row.task_id) if row.task_id else None,
+                "subject": row.subject,
+                "scopes": row.scopes,
+            },
+        )
+    return len(changed)
 
 
 async def revoke(session: AsyncSession, jti: uuid.UUID) -> bool:
@@ -367,27 +408,14 @@ async def revoke(session: AsyncSession, jti: uuid.UUID) -> bool:
     the first `revoked_at`, it does not append a second "token.revoked" row for a state change
     that did not happen.
     """
-    row = await session.get(IssuedToken, jti)
-    if row is None:
-        return False
-    if row.revoked_at is None:
-        await _mark_revoked(session, row)
-        await session.flush()
-    return True
+    if await _revoke_where(session, IssuedToken.jti == jti):
+        return True
+    known = await session.scalar(select(IssuedToken.jti).where(IssuedToken.jti == jti))
+    return known is not None
 
 
 async def revoke_all_for_task(session: AsyncSession, task_id: uuid.UUID) -> int:
     """Revoke every still-live token issued for `task_id`. Used by incident containment
     (briefing §25: "revoga todos os jti da tarefa"). Returns how many rows changed.
     """
-    rows = (
-        await session.scalars(
-            select(IssuedToken).where(
-                IssuedToken.task_id == task_id, IssuedToken.revoked_at.is_(None)
-            )
-        )
-    ).all()
-    for row in rows:
-        await _mark_revoked(session, row)
-    await session.flush()
-    return len(rows)
+    return await _revoke_where(session, IssuedToken.task_id == task_id)

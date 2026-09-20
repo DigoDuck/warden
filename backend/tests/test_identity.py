@@ -6,6 +6,7 @@ reading a file: neither this suite nor CI needs a key on disk. `issued_tokens` h
 foreign key to `tasks`, so an agent token needs a real task row, `task_id` builds one.
 """
 
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -13,6 +14,7 @@ import json
 import os
 import stat
 import uuid
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -20,7 +22,7 @@ import jwt
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from warden import audit, identity
@@ -51,6 +53,22 @@ async def task_id(session: AsyncSession, user: User) -> uuid.UUID:
     session.add(row)
     await session.flush()
     return row.id
+
+
+@pytest.fixture
+async def clean_committed_rows(session: AsyncSession) -> AsyncIterator[None]:
+    """For the few tests here that commit, because what they prove only exists across two
+    real connections. Committed rows outlive the `session` fixture's rollback, and
+    test_audit.py asserts on an empty log: without this the suite passes or fails depending
+    on which file pytest happens to collect first. Same pattern as test_audit.py and
+    test_queue.py, as superuser.
+    """
+    wipe = text("TRUNCATE audit_log, issued_tokens, tasks, users RESTART IDENTITY CASCADE")
+    await session.execute(wipe)
+    await session.commit()
+    yield
+    await session.execute(wipe)
+    await session.commit()
 
 
 def _valid_claims(**overrides: object) -> dict[str, object]:
@@ -214,7 +232,9 @@ async def test_a_revoked_token_is_refused(
 
 
 async def test_a_revocation_from_another_session_is_seen_immediately(
-    session_factory: async_sessionmaker[AsyncSession], keys: KeyPair
+    session_factory: async_sessionmaker[AsyncSession],
+    keys: KeyPair,
+    clean_committed_rows: None,
 ) -> None:
     """The entire point of a stateful, revocable `jti` (ADR-005) is that revoking it reaches
     every session checking it, not just the one that issued it. Uses `session_factory`
@@ -281,12 +301,130 @@ async def test_rescoping_a_resigned_token_does_not_grant_new_scopes(
     payload["sub"] = f"agent:task:{uuid.uuid4()}"
     forged = _sign(payload, keys)
 
-    reforged = await identity.verify(session, keys, forged, required_scope="repo:read")
-    assert reforged.scopes == ("repo:read",)
-    assert reforged.sub == claims.sub
-
-    with pytest.raises(identity.InsufficientScope):
+    # Refused outright, even for the scope the jti really has. A validly signed token that
+    # disagrees with its own row was not minted here: quietly serving it with the original
+    # permissions would turn a leaked key into a working credential instead of an incident.
+    with pytest.raises(identity.InvalidToken):
+        await identity.verify(session, keys, forged, required_scope="repo:read")
+    with pytest.raises(identity.InvalidToken):
         await identity.verify(session, keys, forged, required_scope="admin")
+
+    # The genuine token is unaffected by someone else's forgery of its jti.
+    assert (await identity.verify(session, keys, token)).scopes == claims.scopes
+
+
+@pytest.mark.parametrize(
+    ("claim", "forged_value"),
+    [
+        # The signature check only knows the expiry the token claims for itself.
+        ("exp", int((datetime.now(UTC) + timedelta(days=365)).timestamp())),
+        # No column holds typ, so the row answers for it through the subject it recorded.
+        ("typ", "user"),
+    ],
+)
+async def test_a_resigned_live_jti_cannot_change_its_expiry_or_its_typ(
+    session: AsyncSession, keys: KeyPair, task_id: uuid.UUID, claim: str, forged_value: object
+) -> None:
+    token = await identity.issue_agent_token(session, keys, task_id=task_id, scopes=["repo:read"])
+    payload = jwt.decode(
+        token, keys.public_key, algorithms=[ALGORITHM], audience=AUDIENCE, issuer=ISSUER
+    )
+    payload[claim] = forged_value
+
+    with pytest.raises(identity.InvalidToken):
+        await identity.verify(session, keys, _sign(payload, keys))
+
+
+async def test_revoking_through_a_session_with_a_stale_copy_audits_the_revocation_once(
+    session_factory: async_sessionmaker[AsyncSession],
+    keys: KeyPair,
+    clean_committed_rows: None,
+) -> None:
+    """The identity-map trap again, one function below where it was first fixed. Session A
+    holds the row from before B revoked it; A revoking "again" used to see `revoked_at` as
+    None in its cached copy, append a second `token.revoked` to a log that cannot be
+    corrected, and move `revoked_at` forward. The guarded UPDATE lets the database say the
+    state change already happened.
+    """
+    async with session_factory() as session_a:
+        user = User(email=f"{uuid.uuid4()}@warden.test", password_hash="x", role="submitter")
+        session_a.add(user)
+        await session_a.flush()
+        task = Task(user_id=user.id, spec="double revoke", idempotency_key=str(uuid.uuid4()))
+        session_a.add(task)
+        await session_a.flush()
+        token = await identity.issue_agent_token(
+            session_a, keys, task_id=task.id, scopes=["repo:read"]
+        )
+        jti = (await identity.verify(session_a, keys, token)).jti
+        pinned_row = await session_a.get(IssuedToken, jti)
+        assert pinned_row is not None
+        await session_a.commit()
+
+        async with session_factory() as session_b:
+            assert await identity.revoke(session_b, jti) is True
+            await session_b.commit()
+            first = await session_b.scalar(
+                select(IssuedToken.revoked_at).where(IssuedToken.jti == jti)
+            )
+
+        assert pinned_row.revoked_at is None, "premise: A's copy is stale"
+        assert await identity.revoke(session_a, jti) is True
+        await session_a.commit()
+
+        revocations = await session_a.scalar(
+            select(func.count())
+            .select_from(AuditLog)
+            .where(AuditLog.action == "token.revoked", AuditLog.target_id == str(jti))
+        )
+        assert revocations == 1
+        kept = await session_a.scalar(select(IssuedToken.revoked_at).where(IssuedToken.jti == jti))
+        assert kept == first
+
+
+async def test_two_sessions_revoking_at_once_audit_it_once(
+    session_factory: async_sessionmaker[AsyncSession],
+    keys: KeyPair,
+    clean_committed_rows: None,
+) -> None:
+    """The race the read-then-write version also lost: both sessions see NULL.
+
+    Two revokes fired with `gather` do not prove this, they just run one after the other
+    (that version of this test passed against the unfixed code). So the overlap is forced: A
+    revokes and holds its transaction open, which holds the row lock, and B starts while A
+    is still uncommitted. B cannot see A's change yet. Read-then-write reads NULL there,
+    waits, and then revokes and audits a second time. The guarded UPDATE waits on the row
+    lock, re-checks `revoked_at IS NULL` once A commits, and changes nothing.
+    """
+    async with session_factory() as setup:
+        user = User(email=f"{uuid.uuid4()}@warden.test", password_hash="x", role="submitter")
+        setup.add(user)
+        await setup.flush()
+        task = Task(user_id=user.id, spec="revoke race", idempotency_key=str(uuid.uuid4()))
+        setup.add(task)
+        await setup.flush()
+        token = await identity.issue_agent_token(setup, keys, task_id=task.id, scopes=["repo:read"])
+        jti = (await identity.verify(setup, keys, token)).jti
+        await setup.commit()
+
+    async with session_factory() as session_a, session_factory() as session_b:
+        assert await identity.revoke(session_a, jti) is True
+        racing = asyncio.create_task(identity.revoke(session_b, jti))
+        # Long enough for B to reach the lock. If it somehow had not, B would simply see A's
+        # committed revocation and the test would pass for the boring reason, never fail.
+        await asyncio.sleep(0.5)
+        await session_a.commit()
+        assert await racing is True
+        await session_b.commit()
+
+    async with session_factory() as probe:
+        revocations = await probe.scalar(
+            select(func.count())
+            .select_from(AuditLog)
+            .where(AuditLog.action == "token.revoked", AuditLog.target_id == str(jti))
+        )
+        assert revocations == 1
+        assert (await audit.verify(probe)).ok
 
 
 async def test_string_exp_and_iat_are_refused_not_a_typeerror(
