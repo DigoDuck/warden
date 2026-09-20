@@ -25,10 +25,12 @@ from tests.fake_tools import FakeWorkspace
 from warden.core import queue
 from warden.core.events import read_events
 from warden.core.loop import Budget, RunResult
+from warden.core.replay import rebuild
 from warden.core.worker import run_claimed_task
-from warden.models import ModelCall, Task, ToolCall, User
+from warden.models import ModelCall, Task, TaskEvent, ToolCall, User
 from warden.policy.engine import Effect, Policy, Rule
 from warden.providers.base import ToolCall as ProviderToolCall
+from warden.providers.base import ToolResultsMessage
 from warden.providers.fake import FakeProvider, ScriptStep
 
 BUDGET = Budget(max_iterations=6)
@@ -246,11 +248,105 @@ async def test_a_resumed_task_leaves_one_coherent_event_log(
     # it produces no tool.executed at all.
     assert kinds.count("tool.executed") == 2
 
-    # Three requests for two executions, and that is correct rather than a leak: the
-    # control plane really did ask for the second read twice, once before the crash and
-    # once on resume. The event log records what happened, and what happened is that the
-    # first attempt never reached the tool. `tool_calls` is where "ran twice" is ruled out.
-    assert kinds.count("tool.requested") == 3
+    # One request per call, however many workers it took to run it. A `tool.requested` is
+    # the model's intent, recorded once when the turn came back; a resume picks that intent
+    # up, it does not ask again. This used to assert three and call the extra one honest
+    # bookkeeping. It was the seed of the double-crash bug below: replay builds "pending"
+    # from these events, so a second copy of a request is a second execution waiting to
+    # happen.
+    assert kinds.count("tool.requested") == 2
+
+
+async def test_two_crashes_in_a_row_still_run_each_tool_once(
+    session: AsyncSession,
+    session_factory: async_sessionmaker[AsyncSession],
+    workspace: pathlib.Path,
+) -> None:
+    """One crash is the case everyone tests. The second one is where the log gets reread
+    by code that already appended to it.
+
+    Found in review by crashing a real run twice: the resume path re-emitted
+    `tool.requested` for the calls it found pending, so after two crashes the log held the
+    same request twice, replay listed it as pending twice, and the third worker ran the tool
+    twice and answered a two-`tool_use` turn with four results, which the API rejects.
+    Unreachable while a run was one transaction, because a real crash committed nothing.
+    """
+    task = await _queued_task(session)
+    await session.commit()
+
+    await _crash_midway(session_factory, task, workspace)
+
+    # The second worker dies too, on the very tool it came back to run.
+    await queue.expire_lease_now(session, task.id)
+    await session.commit()
+    async with session_factory() as crashed:
+        claim = await queue.claim(crashed, "worker-dead-2", lease_seconds=60)
+        assert claim is not None
+        second = FakeWorkspace()
+        second.crash_after = 0
+        with pytest.raises(RuntimeError, match="worker died"):
+            await _run(crashed, claim, [_finish()], second, workspace)
+        await crashed.rollback()
+    assert second.executions == []
+
+    await queue.expire_lease_now(session, task.id)
+    await session.commit()
+    third_claim = await queue.claim(session, "worker-live", lease_seconds=60)
+    assert third_claim is not None
+
+    surviving = FakeWorkspace()
+    result = await _run(session, third_claim, [_finish("third time")], surviving, workspace)
+    assert result.status == "SUCCEEDED"
+
+    # The side effect itself: the pending read ran once, not once per crash it sat through.
+    assert surviving.executions == ["read_file"]
+
+    history = await read_events(session, task.id)
+    requested = [e.payload["id"] for e in history if e.type == "tool.requested"]
+    assert requested == ["call-a", "call-b"]
+
+    # And the conversation a fourth worker would rebuild answers each tool_use exactly once.
+    tool_results = [m for m in rebuild(history).messages if isinstance(m, ToolResultsMessage)]
+    assert [r.tool_call_id for r in tool_results[-1].results] == ["call-a", "call-b"]
+
+
+def test_replay_ignores_a_repeated_request_for_the_same_call() -> None:
+    """Belt to the loop's braces: every reader of `requested` routes through `rebuild`, so
+    it is the one place where a duplicate, from whatever future writer, cannot become a
+    second execution."""
+
+    def event(seq: int, kind: str, payload: dict[str, object]) -> TaskEvent:
+        return TaskEvent(task_id=uuid.uuid4(), seq=seq, type=kind, payload=payload)
+
+    request = {"tool": "read_file", "id": "call-a", "arguments": {"path": "src/app.py"}}
+    state = rebuild(
+        [
+            event(1, "task.created", {"spec": "x"}),
+            event(2, "iteration.started", {"n": 1}),
+            event(3, "model.called", {"cost_usd": "0", "raw_content": []}),
+            event(4, "tool.requested", request),
+            event(5, "tool.requested", request),
+        ]
+    )
+    assert [call.id for call in state.pending_tool_calls] == ["call-a"]
+
+
+def test_replay_reruns_an_iteration_that_never_got_its_model_call() -> None:
+    """`iteration.started` is committed before the provider is asked (no transaction is
+    held across a model call), so a crash inside the call leaves it alone in the log. That
+    iteration bought nothing and has to run again, not be skipped."""
+
+    def event(seq: int, kind: str, payload: dict[str, object]) -> TaskEvent:
+        return TaskEvent(task_id=uuid.uuid4(), seq=seq, type=kind, payload=payload)
+
+    state = rebuild(
+        [
+            event(1, "task.created", {"spec": "x"}),
+            event(2, "iteration.started", {"n": 1}),
+        ]
+    )
+    assert state.next_iteration == 1
+    assert not state.is_mid_iteration
 
 
 async def test_a_task_with_no_history_simply_starts(

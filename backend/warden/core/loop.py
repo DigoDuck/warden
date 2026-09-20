@@ -186,9 +186,13 @@ async def run_task(
             # The interrupted iteration is finished, not restarted: its assistant turn is
             # already in the messages and its tool_use blocks are still unanswered. Running
             # only the calls that never executed is what keeps "no tool runs twice" true.
-            # Same commit discipline as a fresh turn: every pending call is re-requested and
-            # checkpointed as one batch before any of them runs again.
-            await _request_tools(session, task.id, resume.pending_tool_calls, holder)
+            #
+            # The pending calls are NOT requested again. Their `tool.requested` events are
+            # already durable, that is how replay found them, and a second copy is a second
+            # execution waiting for the next crash: replay builds "pending" from those
+            # events. What this does need is the fence, before anything touches the
+            # sandbox: a resumed worker proves it holds the lease first.
+            await _checkpoint(session, task.id, holder)
             fresh = await _run_tools(
                 session,
                 task.id,
@@ -207,6 +211,13 @@ async def run_task(
 
     for iteration in range(first_iteration, budget.max_iterations + 1):
         await events.append_event(session, task.id, events.ITERATION_STARTED, {"n": iteration})
+        # No transaction is held across a model call. An uncommitted `task_events` row holds
+        # a key-share lock on its task through the foreign key, and `claim()` skips locked
+        # rows, so a worker hung inside a provider call that never returns would keep its
+        # task unclaimable long after the lease expired: the lease would only protect against
+        # workers that die, not against ones that hang, which is the likelier failure for a
+        # network call. Committing here leaves nothing open while the process waits.
+        await _checkpoint(session, task.id, holder)
 
         completion = await provider.generate(messages, tools=tool_schemas, system=SYSTEM_PROMPT)
         cost = await events.record_model_call(session, task.id, completion)
@@ -265,9 +276,11 @@ async def run_task(
         messages.append(AssistantMessage(raw_content=completion.raw_content))
 
         if completion.stop_reason == "pause_turn":
-            # The model paused mid-turn; resending the history continues it. No dispatched
-            # tool calls exist yet for this turn, so there is nothing to checkpoint here:
-            # this iteration's events ride along with whichever checkpoint comes next.
+            # The model paused mid-turn; resending the history continues it. The turn was
+            # paid for like any other, so it is made durable like any other: left to ride
+            # along with the next checkpoint, a crash during the following model call would
+            # buy this one again.
+            await _checkpoint(session, task.id, holder)
             continue
 
         if completion.stop_reason == "end_turn":

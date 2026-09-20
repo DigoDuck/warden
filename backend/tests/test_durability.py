@@ -7,6 +7,7 @@ touch Docker at all, though, and run in every environment: only the ones that re
 """
 
 import asyncio
+import contextlib
 import os
 import pathlib
 import subprocess
@@ -176,23 +177,15 @@ async def test_a_run_in_progress_does_not_starve_the_heartbeat(
 async def test_a_worker_that_lost_its_lease_writes_nothing_after_and_cannot_finish(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """Fencing (ADR-019). Per-step commits make an existing problem worse: a worker that
-    lost its lease keeps running, and without a fence it would interleave events with the
-    new owner and corrupt replay. B reclaims A's task once its lease has expired, cleanly
-    (the same claim any dead worker's task eventually gets once its connection is gone, the
-    scenario a real process kill produces almost immediately by closing the socket). Worker
-    A, unaware, then reaches its next checkpoint: `_finish` must raise `LeaseLost` instead of
-    committing, and nothing it flushed on the way there survives.
+    """Fencing at the level of one checkpoint (ADR-019), without Docker.
 
-    This does not route through a live, paused `run_task`/`run_claimed_task` call: a
-    coroutine merely parked on an `asyncio.Event` keeps its database connection genuinely
-    open, and Postgres correctly refuses to let `SKIP LOCKED` hand the row to B while that
-    connection could still wake up and commit (verified empirically while writing this test:
-    the still-open transaction's `task_events` insert holds an implicit row lock through the
-    foreign key, via ADR-002's `task_id` reference, that `FOR UPDATE SKIP LOCKED` respects).
-    That is correct, not a bug; it just means this test has to simulate the crash by calling
-    the checkpoint helper directly, the same way `core/loop.py` itself would once A's
-    connection really is gone.
+    Per-step commits make an existing problem worse: a worker that lost its lease keeps
+    running, and without a fence it would interleave events with the new owner and corrupt
+    replay. B reclaims A's task; A then reaches a checkpoint, here `_finish` called directly,
+    and must get `LeaseLost` instead of a commit, with nothing it flushed surviving.
+
+    This is the fast, narrow version. The same thing with a live worker, a real container
+    and a real volume is `test_a_live_worker_that_loses_its_lease_...` below.
     """
     async with session_factory() as setup:
         task = await _user_and_task(setup, lease_seconds=2)
@@ -223,6 +216,92 @@ async def test_a_worker_that_lost_its_lease_writes_nothing_after_and_cannot_fini
     assert current.claimed_by == "worker-b"
     assert current.status == "RUNNING"
     assert "task.finished" not in kinds
+
+
+async def test_a_live_worker_that_loses_its_lease_stops_without_touching_what_is_no_longer_its(
+    docker_available: None,
+    session: AsyncSession,
+    session_factory: async_sessionmaker[AsyncSession],
+    workspace: pathlib.Path,
+) -> None:
+    """The zombie, for real: worker A is alive and parked inside a model call that will not
+    return, its lease runs out, B takes the task, and then A wakes up.
+
+    Two claims are under test, and the first one used to be false. While a run held a
+    transaction open across the model call, its uncommitted `iteration.started` row kept a
+    key-share lock on the task through the foreign key, `claim()` skipped the locked row, and
+    a hung worker kept its task for as long as it stayed hung, lease or no lease. B's claim
+    succeeding below is the proof that nothing is held open any more.
+
+    The second is what `Worker.run_once` does with `LeaseLost`. It is the one branch in this
+    change whose failure destroys data: discarding the workspace volume here would leave B
+    resuming against a fresh copy of the repository while its event log tells the model that
+    the first run's edits are on disk.
+    """
+    import docker as docker_sdk
+
+    from warden.sandbox.docker import workspace_volume_name
+
+    user = User(email=f"{uuid.uuid4()}@warden.test", password_hash="x", role="worker")
+    session.add(user)
+    await session.flush()
+    task = await queue.enqueue(
+        session, user_id=user.id, spec="zombie probe", idempotency_key=str(uuid.uuid4())
+    )
+    await session.commit()
+    task_id = task.id
+
+    paused = asyncio.Event()
+    release = asyncio.Event()
+    read = ProviderToolCall(id="c1", name="read_file", arguments={"path": "src/app.py"})
+
+    def provider_factory() -> _PausingProvider:
+        script = FakeProvider([ScriptStep(tool_calls=[read]), _finish()])
+        return _PausingProvider(script, paused, release)
+
+    worker_a = Worker(session_factory, provider_factory, _allow_all(), workspace)  # type: ignore[arg-type]
+    client = docker_sdk.from_env()
+    running = asyncio.create_task(worker_a.run_once())
+    try:
+        # Generous: creating the sandbox comes first and takes seconds on Docker Desktop.
+        await asyncio.wait_for(paused.wait(), timeout=90)
+
+        await queue.expire_lease_now(session, task_id)
+        await session.commit()
+        b_claim = await queue.claim(session, "worker-b", lease_seconds=60)
+        assert b_claim is not None and b_claim.id == task_id, (
+            "a worker parked in a model call still blocks its task from being reclaimed"
+        )
+        await session.commit()
+
+        release.set()
+        result = await asyncio.wait_for(running, timeout=90)
+
+        # Stopped quietly: no exception, no result to report.
+        assert result is None
+
+        # The workspace B now depends on is still there, and A took its own container along.
+        client.volumes.get(workspace_volume_name(str(task_id)))
+        assert client.containers.list(all=True, filters={"label": f"warden.task={task_id}"}) == []
+
+        async with session_factory() as probe:
+            current = await probe.get(Task, task_id)
+            kinds = [e.type for e in await read_events(probe, task_id)]
+        assert current is not None
+        assert current.claimed_by == "worker-b"
+        assert current.status == "RUNNING"
+        # Everything A did after waking up, the model call it paid for included, stayed out
+        # of the log: its first checkpoint after the lease was gone refused to commit.
+        assert kinds == ["task.created", "iteration.started"]
+    finally:
+        release.set()
+        if not running.done():
+            running.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await running
+        for stray in client.containers.list(all=True, filters={"label": f"warden.task={task_id}"}):
+            stray.remove(force=True)
+        await asyncio.to_thread(discard_workspace_volume, str(task_id))
 
 
 async def test_a_turns_tool_requests_all_commit_before_the_first_one_executes(
@@ -343,7 +422,7 @@ async def test_a_task_survives_the_worker_process_being_killed(
     only allowlists pytest/ruff/mypy/npm); weakening it to add one would leave every other
     task subject to a looser rule it should never have. A test-only policy file, loaded via
     a small `--policy` CLI flag on the worker entry point, keeps `policies/default.yaml`
-    untouched and still lets the script call `run_command "sleep 30"` exactly as specified.
+    untouched and still lets the script call `run_command "sleep 5"` exactly as specified.
     """
     import docker as docker_sdk
 
@@ -364,7 +443,7 @@ script:
       - name: read_file
         args: { path: "src/app.py" }
       - name: run_command
-        args: { cmd: "sleep 30" }
+        args: { cmd: "sleep 5" }
   - tool_call:
       name: finish
       args: { summary: "should never get here" }
@@ -429,7 +508,7 @@ script:
         # From the test's OWN connection, which never shares a transaction with the
         # subprocess's: under Postgres's default READ COMMITTED isolation every new
         # statement re-snapshots committed data, so seeing policy.decided for the sleeping
-        # call show up here, while the subprocess is still alive and blocked in `sleep 30`,
+        # call show up here, while the subprocess is still alive and blocked in `sleep 5`,
         # IS the proof that checkpoints commit mid-run rather than at the very end.
         deadline = asyncio.get_event_loop().time() + 30
         sleeping_decided = False
