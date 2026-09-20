@@ -23,6 +23,31 @@ from warden.tools.registry import ToolError, ToolRegistry
 MAX_READ_BYTES = 64_000
 MAX_LISTED_FILES = 200
 
+# Directories that are in the workspace but are not the project: installed dependencies,
+# build caches, version control internals. Listing them is actively harmful, not merely
+# noisy. A target repo with a .venv has thousands of vendored files, so the listing hits its
+# cap on site-packages and the agent never sees src/ at all, having spent the context window
+# on someone else's code.
+IGNORED_DIRS = frozenset(
+    {
+        ".git",
+        ".venv",
+        "venv",
+        "__pycache__",
+        "node_modules",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        "dist",
+        "build",
+        ".tox",
+    }
+)
+
+
+def is_ignored(relative: pathlib.PurePosixPath) -> bool:
+    return any(part in IGNORED_DIRS for part in relative.parts)
+
 
 class ReadFileArgs(BaseModel):
     path: str = Field(description="Path to the file, relative to the workspace root")
@@ -81,7 +106,9 @@ def _list_files_sync(workspace: pathlib.Path, pattern: str) -> str:
         for path in root.glob(pattern)
         # A glob can walk out through a symlink, so every hit is re-checked against the
         # same rule read_file uses instead of being trusted because glob produced it.
-        if path.is_file() and root in path.resolve().parents
+        if path.is_file()
+        and root in path.resolve().parents
+        and not is_ignored(pathlib.PurePosixPath(path.relative_to(root).as_posix()))
     )
     if not matches:
         return f"no files match {pattern!r}"

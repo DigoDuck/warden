@@ -23,9 +23,13 @@ import docker
 from docker.errors import NotFound
 from docker.models.containers import Container
 
+from warden.tools.local import is_ignored
+
 # A uid that exists neither in the image nor on the host: if a file ever escaped, it would
 # not be owned by a real account on either side.
 SANDBOX_UID = 10001
+# How long to wait for a killed container to actually be gone.
+KILL_GRACE_SECONDS = 10
 # The volume mounts at MOUNT_ROOT and the workspace is a directory inside it. That extra
 # level is not decoration: a named volume's root always mounts owned by root with mode 755,
 # and the sandbox user cannot create files in it. The tar creates the subdirectory with the
@@ -88,7 +92,9 @@ def _workspace_tar(workspace: pathlib.Path) -> io.BytesIO:
         tar.addfile(owned_by_sandbox(workspace_dir))
 
         for path in sorted(root.rglob("*")):
-            if any(part in {".git", ".venv", "__pycache__", "node_modules"} for part in path.parts):
+            # Same exclusion list the listing tool uses, imported rather than repeated: two
+            # copies would drift, and the agent would see files the sandbox does not have.
+            if is_ignored(pathlib.PurePosixPath(path.relative_to(root).as_posix())):
                 continue
             arcname = f"workspace/{path.relative_to(root).as_posix()}"
             tar.add(path, arcname=arcname, filter=owned_by_sandbox)
@@ -207,6 +213,25 @@ class Sandbox:
         with contextlib.suppress(NotFound, docker.errors.APIError):
             self._container.kill()
 
+        # kill() only sends the signal, so the caller could otherwise get CommandTimeout
+        # while the process is briefly still alive. Under load that window is wide enough
+        # to matter, and it made the deadline test flaky in a full suite run.
+        #
+        # Polled rather than container.wait(timeout=...): that timeout is the HTTP read
+        # timeout on the daemon socket, so a busy daemon raises a connection error instead
+        # of reporting that the container is still up. Own deadline, own semantics.
+        deadline = time.monotonic() + KILL_GRACE_SECONDS
+        while time.monotonic() < deadline:
+            try:
+                self._container.reload()
+            except (NotFound, docker.errors.APIError):
+                return
+            if not self._container.attrs.get("State", {}).get("Running"):
+                return
+            time.sleep(0.05)
+        # Still up after the grace period. destroy() removes it by force, and the caller
+        # already gets CommandTimeout, so this is reported rather than raised over it.
+
     def inspect(self) -> dict[str, Any]:
         """Raw daemon JSON. Typed as Any because that is what it is: the shape belongs to
         the Docker API, not to this codebase, and pretending otherwise would mean writing a
@@ -237,13 +262,3 @@ async def run_in_sandbox(
         return await sandbox.exec(command, kill_after=kill_after)
     finally:
         await sandbox.destroy()
-
-
-def wait_until_ready(sandbox: Sandbox, *, timeout: float = 10.0) -> None:
-    """Block until the container reports running, so a race does not look like a failure."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if sandbox.inspect().get("State", {}).get("Running"):
-            return
-        time.sleep(0.1)
-    raise SandboxError(f"container {sandbox.id[:12]} did not start within {timeout}s")
