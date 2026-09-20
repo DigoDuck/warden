@@ -119,14 +119,29 @@ parser, porque a alternativa era confiar em documentação para uma decisão de 
    forma do item 5, `realpath` sob o workspace root): ela prova só que o alvo *resolvido* fica
    dentro do workspace, não que é o *mesmo arquivo* que o path pedido nomeia, então um symlink
    apontando para outro path dentro do workspace passava por ela sem ser pego. As duas defesas,
-   as duas neste branch: `apply_patch` recusa de cara qualquer diff cujo cabeçalho estendido
-   tenha `new file mode 120000` ou `new mode 120000` (`_SYMLINK_MODE_HEADER`), antes de o git
-   rodar; e `_CONTAIN`, o preâmbulo que `read_file`/`write_file` compartilham, passou a exigir
+   as duas neste branch: `apply_patch` recusa qualquer diff que o **próprio git** relate como
+   criação de symlink, lendo `git apply --summary` (`_SUMMARY_MAKES_SYMLINK`), que é só
+   leitura e portanto nunca chega a criar o link; e `_CONTAIN`, o preâmbulo que
+   `read_file`/`write_file` compartilham, passou a exigir
    que o path lexical (o que a policy julgou) seja igual ao path relativo obtido a partir do
    `realpath` resolvido, recusando quando um symlink no meio do caminho faz os dois divergirem.
    Independentes de propósito: a primeira fecha a criação pela raiz, a segunda fecha qualquer
    symlink que já exista no workspace por outro motivo (por exemplo, um repositório de exemplo
    que já tinha um).
+
+   **Correção registrada, porque a primeira versão desta defesa repetia o erro que esta ADR
+   existe para evitar.** Ela casava o texto do diff com `^new file mode 120000$`. O git lê
+   esse campo com `strtoul`, e quatro formas que ele aceita de modo idêntico escapavam do
+   regex: terminador CRLF, zero à esquerda (`0120000`), espaço no fim e tab no fim. Em todas o
+   `apply_patch` retornava sucesso, `src/link -> ../.env` passava a existir, e a policy tinha
+   gravado `allow`. Foi achado no portão de revisão, executando as quatro contra um sandbox
+   real, e não por teste: o teste que acompanhava a defesa só cobria a forma canônica. O
+   segredo não vazava por essa rota, porque o `_CONTAIN` já segurava sozinho, mas a ADR
+   afirmava duas camadas independentes quando só uma funcionava. Verificado depois contra o
+   git 2.47 da imagem: `--summary` normaliza as cinco formas para a mesma linha
+   ` create mode 120000 src/link`, e um arquivo comum que apenas se *chama* `120000` sai como
+   ` create mode 100644 src/120000`, então o casamento é ancorado na posição do modo. Os
+   testes estão em `test_symlink_shapes.py`.
 
 7. **`--numstat -z` não valida, só faz parsing.** Um patch cujo contexto não bate com o conteúdo
    real do arquivo ainda é reportado normalmente por `--numstat -z` (exit 0): ele não abre os
@@ -175,11 +190,17 @@ jeito, então é a mesma coisa que negar sempre, só com um nome mais bonito.
   da policy julgando cada path relatado. Não há probe de `realpath` próprio, porque não sobrou
   nada para ele capturar que o git já não recuse primeiro.
 - Exceção pontual ao ponto acima (item 6): criar um symlink novo é algo que o git *permite*, não
-  recusa, então `apply_patch` ganhou uma checagem própria, textual, sobre o cabeçalho do diff, em
-  vez de depender do git para isso. E `_touched_paths`/`_unquote_c_style` (item 3) e `_CONTAIN`
+  recusa, então `apply_patch` ganhou uma checagem própria. Ela pergunta ao git, via
+  `--summary`, em vez de ler o texto do diff: a versão textual foi um diferencial de parser
+  (item 6). E `_touched_paths`/`_unquote_c_style` (item 3) e `_CONTAIN`
   (item 6) foram corrigidos numa revisão de segurança sobre este mesmo branch, não na primeira
   versão: os testes que os regride estão em `test_apply_patch.py` (pareamento) e
   `test_write_tools.py` (symlink dentro do workspace).
 - Descoberta reaproveitável: qualquer ferramenta futura que precise saber "o que este diff toca"
   antes de decidir algo sobre ele deve usar `git apply --numstat -z` mais o par `rename
   from`/`rename to`, não `git diff`, porque o alvo não é um repositório real.
+- **O que esta ADR não resolve, e a ADR-018 resolve.** Tudo aqui trata de qual path a policy
+  julga. Nada disso segura um segredo contra código que o agente escreve e manda executar,
+  porque um teste pode abrir qualquer arquivo do workspace sem passar por tool nenhuma. As
+  correções de symlink e de rename continuam valendo como defesa em profundidade, mas são
+  menos decisivas do que parecem isoladas.

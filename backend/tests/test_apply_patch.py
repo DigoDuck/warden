@@ -486,7 +486,9 @@ async def test_apply_patch_refuses_to_create_a_symlink(
     assert row.decision == "allow"  # policy had no reason to refuse the textual path
     assert row.error is not None
     assert "symlink" in row.error
-    exists = await sandbox.exec(["sh", "-c", "test -e src/link && echo YES || echo NO"])
+    # -L, not -e: -e follows the link, so a dangling one would read as "nothing there" and
+    # this would stay green with the symlink created.
+    exists = await sandbox.exec(["sh", "-c", "test -L src/link && echo YES || echo NO"])
     assert exists.output.strip() == "NO"
 
 

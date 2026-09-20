@@ -417,9 +417,19 @@ async def apply_patch_paths(sandbox: Sandbox, args: ApplyPatchArgs) -> list[str]
 # the agent alias an allowed-looking name to whatever it points at, no matter what `_CONTAIN`
 # does afterwards for read_file/write_file. Refusing the diff outright, before git ever runs,
 # is cheaper and more general than trying to enumerate every tool that might later resolve
-# through the new link. All git symlinks are mode 120000 (there is no other symlink mode), so
-# a `new file mode 120000` or a mode change `new mode 120000` is unambiguously a symlink.
-_SYMLINK_MODE_HEADER = re.compile(r"^(?:new file mode|new mode) 120000$", re.MULTILINE)
+# through the new link. All git symlinks are mode 120000 (there is no other symlink mode).
+#
+# The mode is read from `git apply --summary`, never from the diff text. An earlier version
+# matched `^new file mode 120000$` against the diff, and git parses that field with strtoul:
+# a CRLF line ending, a leading zero (0120000), a trailing space and a trailing tab were all
+# accepted by git and missed by the regex, so the link got created under an `allow`. Same
+# lesson as the touched paths: whoever applies is whoever informs. Verified against the git
+# in the sandbox image that all five shapes come out as the one normalised line
+# ` create mode 120000 <path>`.
+#
+# Anchored on the mode position on purpose. A regular file that is merely *named* 120000
+# prints as ` create mode 100644 120000`, which must not match.
+_SUMMARY_MAKES_SYMLINK = re.compile(r"^\s*(?:create mode|mode change \d+ =>) 120000 ", re.MULTILINE)
 
 
 async def apply_patch(sandbox: Sandbox, args: ApplyPatchArgs) -> str:
@@ -431,16 +441,23 @@ async def apply_patch(sandbox: Sandbox, args: ApplyPatchArgs) -> str:
     empirically rather than assumed) is the actual containment here: this tool adds no
     realpath probe of its own on top of it, because there is nothing left for one to catch
     that git does not already refuse first. Creating a *new* symlink is a different problem
-    git happily allows, which is why it gets its own refusal, checked against the diff text
-    directly rather than through git, so no symlink is ever momentarily created.
+    git happily allows, which is why it gets its own refusal. `--summary` is read-only, so no
+    symlink is ever momentarily created while finding out.
     """
-    if _SYMLINK_MODE_HEADER.search(args.diff):
-        raise ToolError(
-            "apply_patch refuses a diff that creates or changes a symlink (mode 120000)"
-        )
-
     staged = await _stage_patch(sandbox, args.diff)
     try:
+        summary = await _exec_or_timeout_error(
+            sandbox,
+            ["git", "-C", WORKSPACE, "apply", "--summary", f"{MOUNT_ROOT}/{staged}"],
+            kill_after=30,
+        )
+        if summary.exit_code != 0:
+            raise ToolError(f"could not read the patch: {summary.output.strip()[:300]}")
+        if _SUMMARY_MAKES_SYMLINK.search(summary.output):
+            raise ToolError(
+                "apply_patch refuses a diff that creates or changes a symlink (mode 120000)"
+            )
+
         check = await _exec_or_timeout_error(
             sandbox,
             ["git", "-C", WORKSPACE, "apply", "--check", f"{MOUNT_ROOT}/{staged}"],
