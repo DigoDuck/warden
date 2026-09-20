@@ -28,11 +28,16 @@ from warden.db import make_engine, make_session_factory
 from warden.models import Task
 from warden.policy.engine import Policy, load_policy
 from warden.providers.base import ModelProvider
-from warden.tools.local import build_registry
+from warden.sandbox.docker import Sandbox, SandboxProfile, discard_workspace_volume
 from warden.tools.registry import ToolRegistry
+from warden.tools.sandboxed import build_registry
 
 HEARTBEAT_FRACTION = 0.4
 IDLE_POLL_SECONDS = 1.0
+
+# States a task does not come back from. Only then is its workspace thrown away: a task
+# merely between workers still needs whatever it changed before it was interrupted.
+TERMINAL_STATUSES = frozenset({"SUCCEEDED", "FAILED", "CANCELLED", "TIMED_OUT", "BUDGET_EXCEEDED"})
 
 # Resolved at import: touching the filesystem inside the async entry point would block the
 # event loop, and these never change while the process runs.
@@ -76,8 +81,8 @@ async def run_claimed_task(
     provider: ModelProvider,
     policy: Policy,
     workspace: pathlib.Path,
+    registry: ToolRegistry,
     *,
-    registry: ToolRegistry | None = None,
     budget: Budget | None = None,
 ) -> RunResult:
     """Run a task from wherever it left off.
@@ -94,7 +99,7 @@ async def run_claimed_task(
         session,
         task,
         provider,
-        registry or build_registry(workspace),
+        registry,
         policy,
         workspace=workspace,
         budget=budget,
@@ -112,6 +117,7 @@ class Worker:
         *,
         lease_seconds: int = queue.DEFAULT_LEASE_SECONDS,
         budget: Budget | None = None,
+        profile: SandboxProfile | None = None,
     ) -> None:
         self._sessions = session_factory
         self._provider_factory = provider_factory
@@ -119,6 +125,7 @@ class Worker:
         self._workspace = workspace
         self._lease_seconds = lease_seconds
         self._budget = budget
+        self._profile = profile or SandboxProfile()
         self.id = worker_id()
         self._stopping = asyncio.Event()
 
@@ -136,6 +143,9 @@ class Worker:
             task_id = task.id
 
         beat = asyncio.create_task(_beat(self._sessions, task_id, self.id, self._lease_seconds))
+        # The workspace volume is named after the task, so a sandbox created here attaches
+        # to whatever a previous worker left behind rather than starting from a fresh copy.
+        sandbox = await Sandbox.create(self._profile, self._workspace, task_id=str(task_id))
         try:
             async with self._sessions() as session:
                 claimed = await session.get(Task, task_id)
@@ -146,6 +156,7 @@ class Worker:
                     self._provider_factory(),
                     self._policy,
                     self._workspace,
+                    build_registry(sandbox),
                     budget=self._budget,
                 )
                 await session.commit()
@@ -154,6 +165,13 @@ class Worker:
             beat.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await beat
+            # The container always goes. The workspace only goes when the task is over: a
+            # task between workers still needs what it changed before it was interrupted.
+            await sandbox.destroy()
+            async with self._sessions() as session:
+                finished = await session.get(Task, task_id)
+                if finished is not None and finished.status in TERMINAL_STATUSES:
+                    await asyncio.to_thread(discard_workspace_volume, str(task_id))
 
     async def run_forever(self) -> None:
         while not self._stopping.is_set():

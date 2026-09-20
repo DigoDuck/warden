@@ -22,7 +22,8 @@ from warden.models import Task as TaskRow
 from warden.models import User
 from warden.policy.engine import load_policy
 from warden.providers.base import ModelProvider
-from warden.tools.local import build_registry
+from warden.sandbox.docker import Sandbox, SandboxProfile, discard_workspace_volume
+from warden.tools.sandboxed import build_registry
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 WORKSPACE = REPO_ROOT / "examples" / "target-repo"
@@ -77,15 +78,28 @@ async def main(kind: str) -> int:
         session.add(task)
         await session.flush()
 
-        registry = build_registry(WORKSPACE)
         policy = load_policy(POLICY)
         print(f"task {task.id}  provider={provider.name}  workspace={WORKSPACE}")
-        print(f"policy {POLICY.name}  hash={policy.policy_hash[:12]}\n")
+        print(f"policy {POLICY.name}  hash={policy.policy_hash[:12]}")
 
-        result = await run_task(
-            session, task, provider, registry, policy, workspace=WORKSPACE, budget=DEMO_BUDGET
-        )
-        await session.commit()
+        # The same path the worker takes. A demo running tools on the host while the real
+        # thing sandboxes them would be demonstrating something that does not ship.
+        sandbox = await Sandbox.create(SandboxProfile(), WORKSPACE, task_id=str(task.id))
+        print(f"sandbox {sandbox.id[:12]}  image={SandboxProfile().image}\n")
+        try:
+            result = await run_task(
+                session,
+                task,
+                provider,
+                build_registry(sandbox),
+                policy,
+                workspace=WORKSPACE,
+                budget=DEMO_BUDGET,
+            )
+            await session.commit()
+        finally:
+            await sandbox.destroy()
+            await asyncio.to_thread(discard_workspace_volume, str(task.id))
 
         # Read back from the database rather than from memory: the point of the demo is
         # showing that the event log is what happened, not that the loop says so.

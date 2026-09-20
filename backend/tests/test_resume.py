@@ -16,12 +16,12 @@ provider would produce given the replayed messages.
 import pathlib
 import uuid
 from collections.abc import AsyncIterator, Sequence
-from typing import Any
 
 import pytest
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from tests.fake_tools import FakeWorkspace
 from warden.core import queue
 from warden.core.events import read_events
 from warden.core.loop import Budget, RunResult
@@ -29,10 +29,7 @@ from warden.core.worker import run_claimed_task
 from warden.models import ModelCall, Task, ToolCall, User
 from warden.policy.engine import Effect, Policy, Rule
 from warden.providers.base import ToolCall as ProviderToolCall
-from warden.providers.base import ToolSchema
 from warden.providers.fake import FakeProvider, ScriptStep
-from warden.tools.local import build_registry
-from warden.tools.registry import ToolRegistry
 
 BUDGET = Budget(max_iterations=6)
 
@@ -61,37 +58,6 @@ def _allow_all() -> Policy:
         default=Effect.DENY,
         policy_hash="test",
     )
-
-
-class CountingRegistry:
-    """The real registry, plus a record of what actually executed.
-
-    The `tool_calls` assertion says the database holds no duplicate row. This says the side
-    effect itself did not happen twice, which is the thing that row stands in for.
-
-    `crash_after` makes the Nth execution raise, which is how a worker dying between two
-    tools of one iteration is simulated.
-    """
-
-    def __init__(self, inner: ToolRegistry, *, crash_after: int | None = None) -> None:
-        self._inner = inner
-        self._crash_after = crash_after
-        self.executions: list[str] = []
-
-    def schemas(self) -> list[ToolSchema]:
-        return self._inner.schemas()
-
-    def has(self, name: str) -> bool:
-        return self._inner.has(name)
-
-    def path_arg(self, name: str) -> str | None:
-        return self._inner.path_arg(name)
-
-    async def execute(self, name: str, arguments: dict[str, Any]) -> str:
-        if self._crash_after is not None and len(self.executions) >= self._crash_after:
-            raise RuntimeError("worker died mid-iteration")
-        self.executions.append(name)
-        return await self._inner.execute(name, arguments)
 
 
 def _two_reads() -> ScriptStep:
@@ -124,7 +90,7 @@ async def _run(
     session: AsyncSession,
     task: Task,
     script: Sequence[ScriptStep],
-    registry: CountingRegistry,
+    files: FakeWorkspace,
     workspace: pathlib.Path,
 ) -> RunResult:
     return await run_claimed_task(
@@ -133,25 +99,26 @@ async def _run(
         FakeProvider(list(script)),
         _allow_all(),
         workspace,
-        registry=registry,  # type: ignore[arg-type]
+        files.registry(),
         budget=BUDGET,
     )
 
 
 async def _crash_midway(
     session: AsyncSession, task: Task, workspace: pathlib.Path
-) -> CountingRegistry:
+) -> FakeWorkspace:
     """First worker: claims, runs iteration 1, and dies on the second of two tools."""
     claim = await queue.claim(session, "worker-dead", lease_seconds=60)
     assert claim is not None
-    registry = CountingRegistry(build_registry(workspace), crash_after=1)
+    workspace_files = FakeWorkspace()
+    workspace_files.crash_after = 1
 
     with pytest.raises(RuntimeError, match="worker died"):
-        await _run(session, claim, [_two_reads(), _finish()], registry, workspace)
+        await _run(session, claim, [_two_reads(), _finish()], workspace_files, workspace)
     await session.commit()
 
-    assert registry.executions == ["read_file"], "the first tool should have run exactly once"
-    return registry
+    assert workspace_files.executions == ["read_file"], "the first tool ran exactly once"
+    return workspace_files
 
 
 async def test_a_crashed_run_resumes_and_no_tool_runs_twice(
@@ -170,7 +137,7 @@ async def test_a_crashed_run_resumes_and_no_tool_runs_twice(
     second_claim = await queue.claim(session, "worker-live", lease_seconds=60)
     assert second_claim is not None and second_claim.id == task.id
 
-    surviving = CountingRegistry(build_registry(workspace))
+    surviving = FakeWorkspace()
     result = await _run(session, second_claim, [_finish("resumed")], surviving, workspace)
     await session.commit()
 
@@ -202,9 +169,7 @@ async def test_resuming_does_not_buy_the_interrupted_model_call_again(
     await queue.expire_lease_now(session, task.id)
     resumed = await queue.claim(session, "worker-live")
     assert resumed is not None
-    await _run(
-        session, resumed, [_finish()], CountingRegistry(build_registry(workspace)), workspace
-    )
+    await _run(session, resumed, [_finish()], FakeWorkspace(), workspace)
     await session.commit()
 
     after = await session.scalar(
@@ -226,9 +191,7 @@ async def test_the_budget_is_not_reset_by_a_crash(
     await queue.expire_lease_now(session, task.id)
     resumed = await queue.claim(session, "worker-live")
     assert resumed is not None
-    result = await _run(
-        session, resumed, [_finish()], CountingRegistry(build_registry(workspace)), workspace
-    )
+    result = await _run(session, resumed, [_finish()], FakeWorkspace(), workspace)
 
     # FakeProvider costs nothing, so the number is zero either way. What matters is that it
     # came from the replayed log rather than from a counter that started over: the events
@@ -249,9 +212,7 @@ async def test_a_resumed_task_leaves_one_coherent_event_log(
     await queue.expire_lease_now(session, task.id)
     resumed = await queue.claim(session, "worker-live")
     assert resumed is not None
-    await _run(
-        session, resumed, [_finish()], CountingRegistry(build_registry(workspace)), workspace
-    )
+    await _run(session, resumed, [_finish()], FakeWorkspace(), workspace)
     await session.commit()
 
     kinds = [event.type for event in await read_events(session, task.id)]
@@ -279,7 +240,7 @@ async def test_a_task_with_no_history_simply_starts(
     claim = await queue.claim(session, "worker-a")
     assert claim is not None
 
-    registry = CountingRegistry(build_registry(workspace))
+    registry = FakeWorkspace()
     result = await _run(session, claim, [_two_reads(), _finish("ok")], registry, workspace)
 
     assert result.status == "SUCCEEDED"

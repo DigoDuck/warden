@@ -235,3 +235,22 @@ async def test_a_failure_while_creating_leaves_nothing_behind(
         await Sandbox.create(SandboxProfile(), workspace)
 
     assert count() == before
+
+
+async def test_an_anonymous_workspace_goes_with_its_container(
+    docker_available: None, workspace: pathlib.Path
+) -> None:
+    """Nobody can re-attach to an anonymous volume, so keeping it past destroy is a leak.
+
+    Regression test: making task workspaces survive destroy briefly made every one-off
+    sandbox leak its volume, which showed up as fourteen strays after a suite run.
+    """
+    import docker as docker_sdk
+
+    client = docker_sdk.from_env()
+    before = len(client.volumes.list(filters={"label": "warden.sandbox=1"}))
+
+    box = await Sandbox.create(SandboxProfile(), workspace)
+    await box.destroy()
+
+    assert len(client.volumes.list(filters={"label": "warden.sandbox=1"})) == before
