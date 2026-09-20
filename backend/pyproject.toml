@@ -11,6 +11,7 @@ dependencies = [
     "pydantic-settings>=2.7.0",
     "anthropic>=1.0",
     "pyyaml>=6.0",
+    "docker>=7.2.0",
 ]
 
 [dependency-groups]
@@ -57,7 +58,14 @@ warn_return_any = true
 no_implicit_reexport = true
 strict_equality = true
 
+# The Docker SDK ships no py.typed and has no maintained stub package. A narrow override
+# rather than a global ignore_missing_imports, so a future untyped dependency still shows up.
+[[tool.mypy.overrides]]
+module = ["docker.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
+markers = ["sandbox: needs a working Docker daemon; runs real containers"]
 asyncio_mode = "auto"
 # Fixtures and tests need the SAME loop: the engine is created once per session,
 # and an asyncpg connection opened in one loop cannot be used in another. Leaving
