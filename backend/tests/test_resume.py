@@ -19,7 +19,7 @@ from collections.abc import AsyncIterator, Sequence
 
 import pytest
 from sqlalchemy import func, select, text
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from tests.fake_tools import FakeWorkspace
 from warden.core import queue
@@ -101,34 +101,50 @@ async def _run(
         workspace,
         files.registry(),
         budget=BUDGET,
+        # Fences every checkpoint against the claim `task` actually carries, the same as a
+        # real `Worker` passing its own id. Every task here is legitimately held by whoever
+        # is running it, so this never raises `LeaseLost`; it just exercises the real path
+        # instead of the `holder=None` shortcut.
+        holder=task.claimed_by,
     )
 
 
 async def _crash_midway(
-    session: AsyncSession, task: Task, workspace: pathlib.Path
+    session_factory: async_sessionmaker[AsyncSession], task: Task, workspace: pathlib.Path
 ) -> FakeWorkspace:
-    """First worker: claims, runs iteration 1, and dies on the second of two tools."""
-    claim = await queue.claim(session, "worker-dead", lease_seconds=60)
-    assert claim is not None
-    workspace_files = FakeWorkspace()
-    workspace_files.crash_after = 1
+    """First worker: claims, runs iteration 1, and dies on the second of two tools.
 
-    with pytest.raises(RuntimeError, match="worker died"):
-        await _run(session, claim, [_two_reads(), _finish()], workspace_files, workspace)
-    await session.commit()
+    Runs on its own session, rolled back and closed on the way out instead of committed: a
+    real dead process never gets to commit, so relying on one here would be exactly the lie
+    ADR-019 exists to fix (a resume test that proves replay by committing after the fact, not
+    durability). Per-step commits already made everything up to the crash durable on their
+    own; the rollback below has nothing left to discard by the time it runs, which is the
+    point, not an oversight.
+    """
+    async with session_factory() as crashed:
+        claim = await queue.claim(crashed, "worker-dead", lease_seconds=60)
+        assert claim is not None
+        workspace_files = FakeWorkspace()
+        workspace_files.crash_after = 1
+
+        with pytest.raises(RuntimeError, match="worker died"):
+            await _run(crashed, claim, [_two_reads(), _finish()], workspace_files, workspace)
+        await crashed.rollback()
 
     assert workspace_files.executions == ["read_file"], "the first tool ran exactly once"
     return workspace_files
 
 
 async def test_a_crashed_run_resumes_and_no_tool_runs_twice(
-    session: AsyncSession, workspace: pathlib.Path
+    session: AsyncSession,
+    session_factory: async_sessionmaker[AsyncSession],
+    workspace: pathlib.Path,
 ) -> None:
     """The checklist item, end to end."""
     task = await _queued_task(session)
     await session.commit()
 
-    await _crash_midway(session, task, workspace)
+    await _crash_midway(session_factory, task, workspace)
 
     # The worker is gone. The lease expires and a second worker takes over.
     await queue.expire_lease_now(session, task.id)
@@ -154,12 +170,14 @@ async def test_a_crashed_run_resumes_and_no_tool_runs_twice(
 
 
 async def test_resuming_does_not_buy_the_interrupted_model_call_again(
-    session: AsyncSession, workspace: pathlib.Path
+    session: AsyncSession,
+    session_factory: async_sessionmaker[AsyncSession],
+    workspace: pathlib.Path,
 ) -> None:
     """The assistant turn is replayed from the log, not requested from the provider again."""
     task = await _queued_task(session)
     await session.commit()
-    await _crash_midway(session, task, workspace)
+    await _crash_midway(session_factory, task, workspace)
 
     before = await session.scalar(
         select(func.count()).select_from(ModelCall).where(ModelCall.task_id == task.id)
@@ -181,12 +199,14 @@ async def test_resuming_does_not_buy_the_interrupted_model_call_again(
 
 
 async def test_the_budget_is_not_reset_by_a_crash(
-    session: AsyncSession, workspace: pathlib.Path
+    session: AsyncSession,
+    session_factory: async_sessionmaker[AsyncSession],
+    workspace: pathlib.Path,
 ) -> None:
     """A crash is not a fresh allowance. Spending carries across the resume."""
     task = await _queued_task(session)
     await session.commit()
-    await _crash_midway(session, task, workspace)
+    await _crash_midway(session_factory, task, workspace)
 
     await queue.expire_lease_now(session, task.id)
     resumed = await queue.claim(session, "worker-live")
@@ -202,12 +222,14 @@ async def test_the_budget_is_not_reset_by_a_crash(
 
 
 async def test_a_resumed_task_leaves_one_coherent_event_log(
-    session: AsyncSession, workspace: pathlib.Path
+    session: AsyncSession,
+    session_factory: async_sessionmaker[AsyncSession],
+    workspace: pathlib.Path,
 ) -> None:
     """A resume must not write a second task.created or leave the log ending mid-iteration."""
     task = await _queued_task(session)
     await session.commit()
-    await _crash_midway(session, task, workspace)
+    await _crash_midway(session_factory, task, workspace)
 
     await queue.expire_lease_now(session, task.id)
     resumed = await queue.claim(session, "worker-live")
