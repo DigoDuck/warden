@@ -15,6 +15,7 @@ from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import (
+    CHAR,
     BigInteger,
     CheckConstraint,
     DateTime,
@@ -177,3 +178,33 @@ class ModelCall(Base):
     retries: Mapped[int] = mapped_column(Integer, default=0)
     fallback_from: Mapped[str | None] = mapped_column(String(64), default=None)
     error: Mapped[str | None] = mapped_column(Text, default=None)
+
+
+class AuditLog(Base):
+    """One append-only, hash-chained entry. See warden/audit/log.py and ADR-007.
+
+    Independent of the other tables on purpose (briefing, section on the data model): it
+    references a task or actor by id in `target_id`/`actor_id`, not by foreign key, so
+    deleting or rewriting unrelated data can never cascade into the audit trail, and the
+    trail keeps making sense even for actors (an approver, a revoked token) that never had
+    a row of their own here.
+
+    `prev_hash`/`hash` are fixed-width `CHAR(64)`, not `String`, because every row always
+    holds exactly one lowercase hex sha256 digest: the column type says so instead of
+    relying on application code to keep them that length.
+    """
+
+    __tablename__ = "audit_log"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    # Generated in Python, not server_default=func.now(): the value has to be known
+    # *before* the insert so it can be part of what gets hashed (see audit/log.py).
+    ts: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    actor_type: Mapped[str] = mapped_column(String(32))
+    actor_id: Mapped[str] = mapped_column(String(128))
+    action: Mapped[str] = mapped_column(String(64))
+    target_type: Mapped[str | None] = mapped_column(String(32), default=None)
+    target_id: Mapped[str | None] = mapped_column(String(128), default=None)
+    details: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
+    prev_hash: Mapped[str] = mapped_column(CHAR(64))
+    hash: Mapped[str] = mapped_column(CHAR(64))
