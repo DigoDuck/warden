@@ -259,7 +259,7 @@ async def test_a_live_worker_that_loses_its_lease_stops_without_touching_what_is
         script = FakeProvider([ScriptStep(tool_calls=[read]), _finish()])
         return _PausingProvider(script, paused, release)
 
-    worker_a = Worker(session_factory, provider_factory, _allow_all(), workspace)  # type: ignore[arg-type]
+    worker_a = Worker(session_factory, provider_factory, _allow_all(), workspace)
     client = docker_sdk.from_env()
     running = asyncio.create_task(worker_a.run_once())
     try:

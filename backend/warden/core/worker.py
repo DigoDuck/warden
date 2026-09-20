@@ -219,10 +219,10 @@ async def main() -> int:  # pragma: no cover - process entry point
         default=DEMO_SCRIPT,
         help="FakeProvider YAML script to replay instead of the demo one.",
     )
-    # For tests/test_durability.py only: the default policy has no allow rule for a
-    # long-running command (on purpose, ADR-019), and weakening it so a probe can run one
-    # would loosen every other task's policy along with it. A test-only file, loaded through
-    # this flag, keeps policies/default.yaml untouched.
+    # First needed by tests/test_durability.py: the default policy has no allow rule for a
+    # long-running command, on purpose, and loosening it so a probe can run one would loosen
+    # every other task along with it. Not a back door: `task.created` records the
+    # `policy_hash` of whatever was loaded, so a run under another policy says so in its log.
     parser.add_argument(
         "--policy",
         type=pathlib.Path,

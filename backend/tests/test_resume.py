@@ -15,7 +15,7 @@ provider would produce given the replayed messages.
 
 import pathlib
 import uuid
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 
 import pytest
 from sqlalchemy import func, select, text
@@ -310,22 +310,24 @@ async def test_two_crashes_in_a_row_still_run_each_tool_once(
     assert [r.tool_call_id for r in tool_results[-1].results] == ["call-a", "call-b"]
 
 
+def _event(seq: int, kind: str, payload: Mapping[str, object]) -> TaskEvent:
+    """A bare event for the pure replay tests: no database, only what `rebuild` reads."""
+    return TaskEvent(task_id=uuid.uuid4(), seq=seq, type=kind, payload=dict(payload))
+
+
 def test_replay_ignores_a_repeated_request_for_the_same_call() -> None:
     """Belt to the loop's braces: every reader of `requested` routes through `rebuild`, so
     it is the one place where a duplicate, from whatever future writer, cannot become a
     second execution."""
 
-    def event(seq: int, kind: str, payload: dict[str, object]) -> TaskEvent:
-        return TaskEvent(task_id=uuid.uuid4(), seq=seq, type=kind, payload=payload)
-
     request = {"tool": "read_file", "id": "call-a", "arguments": {"path": "src/app.py"}}
     state = rebuild(
         [
-            event(1, "task.created", {"spec": "x"}),
-            event(2, "iteration.started", {"n": 1}),
-            event(3, "model.called", {"cost_usd": "0", "raw_content": []}),
-            event(4, "tool.requested", request),
-            event(5, "tool.requested", request),
+            _event(1, "task.created", {"spec": "x"}),
+            _event(2, "iteration.started", {"n": 1}),
+            _event(3, "model.called", {"cost_usd": "0", "raw_content": []}),
+            _event(4, "tool.requested", request),
+            _event(5, "tool.requested", request),
         ]
     )
     assert [call.id for call in state.pending_tool_calls] == ["call-a"]
@@ -336,13 +338,10 @@ def test_replay_reruns_an_iteration_that_never_got_its_model_call() -> None:
     held across a model call), so a crash inside the call leaves it alone in the log. That
     iteration bought nothing and has to run again, not be skipped."""
 
-    def event(seq: int, kind: str, payload: dict[str, object]) -> TaskEvent:
-        return TaskEvent(task_id=uuid.uuid4(), seq=seq, type=kind, payload=payload)
-
     state = rebuild(
         [
-            event(1, "task.created", {"spec": "x"}),
-            event(2, "iteration.started", {"n": 1}),
+            _event(1, "task.created", {"spec": "x"}),
+            _event(2, "iteration.started", {"n": 1}),
         ]
     )
     assert state.next_iteration == 1

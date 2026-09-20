@@ -36,10 +36,14 @@ porque não conseguia avisar que ainda estava vivo.
 
 ## Decisão
 
-**Commit a cada passo, não um por tarefa.** Cinco pontos de checkpoint em `core/loop.py`:
+**Commit a cada passo, não um por tarefa.** A regra que organiza os pontos de checkpoint em
+`core/loop.py`: **nenhuma transação fica aberta enquanto o processo espera algo de fora**,
+seja o provider, seja o sandbox.
 
 - (a) depois de `task.created`, e é este commit que libera o lock de linha que o `UPDATE` de
   `started_at` tinha acabado de tomar, cedo o bastante para o heartbeat não passar fome;
+- (a2) depois de `iteration.started`, **antes** de chamar o provider. Não estava no desenho
+  original e entrou na revisão final; o motivo está em "Correções registradas na revisão";
 - (b) depois de `model.called`, **junto com todo `tool.requested` daquele turno**, num commit
   só. Emitir cada `tool.requested` no seu próprio commit, como cada tool era decidida, abriria
   uma janela nova: um crash depois da primeira tool executar e antes do `tool.requested` da
@@ -53,7 +57,10 @@ porque não conseguia avisar que ainda estava vivo.
 - (c) depois de `policy.decided`, antes de executar a tool: um deny fica registrado mesmo que
   o processo morra em seguida;
 - (d) depois de `tool.executed`, junto com as linhas de `tool_calls` e `policy_decisions`;
-- (e) em `_finish`.
+- (e) em `_finish`;
+- um turno `pause_turn` também é commitado na hora. Ele não tem tool call, então não passa
+  por (b), mas foi pago como qualquer outro: deixado para o próximo checkpoint, um crash
+  durante a chamada seguinte o compraria de novo.
 
 Cada checkpoint é `_checkpoint()`, que faz `session.commit()` puro quando não há `holder`
 (chamada direta de `run_task`, como `demo.py` e os testes de loop fazem hoje) ou, com um
@@ -70,19 +77,13 @@ mais nada. `run_task` ganha `holder: str | None`; o `Worker` passa o próprio id
 destrói o próprio container, e deliberadamente **não** descarta o volume do workspace, porque
 quem tem o lease agora ainda precisa dele.
 
-Escrever o teste de fencing revelou algo que o raciocínio sozinho não previa: uma conexão
-Postgres que ainda está viva, só pausada, **não** pode ser roubada por `queue.claim()`. O
-`INSERT` de `task_events` referencia `tasks.id` por chave estrangeira, e o Postgres toma um
-lock de linha implícito (`FOR KEY SHARE`) na linha referenciada enquanto essa transação não
-commita; `SELECT ... FOR UPDATE SKIP LOCKED` respeita esse lock e pula a linha em vez de
-devolvê-la. Isso está correto: uma conexão genuinamente viva ainda pode acordar e commitar, e
-deixar `claim()` roubar a tarefa dela seria a própria corrida que o fencing existe para evitar.
-Um processo morto de verdade não deixa esse problema: o kernel fecha o socket na hora, o
-Postgres nota a desconexão e desfaz a transação, soltando o lock, tipicamente em milissegundos.
-`tests/test_durability.py::test_a_worker_that_lost_its_lease_writes_nothing_after_and_cannot_finish`
-simula o crash chamando `_checkpoint`/`_finish` diretamente depois que B já reivindicou a
-tarefa, em vez de pausar uma execução com a conexão ainda de pé, que é a razão de o teste não
-usar `run_task` ao vivo para essa parte.
+O fencing tem dois testes. `test_a_worker_that_lost_its_lease_writes_nothing_after_and_cannot_finish` é o estreito e
+rápido, sem Docker: B reivindica, A chama um checkpoint e recebe `LeaseLost`.
+`test_a_live_worker_that_loses_its_lease_stops_without_touching_what_is_no_longer_its` é o
+zumbi de verdade: um `Worker` vivo, com container e volume reais, preso numa chamada de modelo
+que não volta; o lease vence, B reivindica, A acorda. Ele tem que devolver `None` sem exceção,
+levar o próprio container, **deixar o volume do workspace**, e nada do que fez depois de
+acordar, nem a chamada de modelo que pagou, pode estar no log.
 
 **Container órfão.** Um worker morto por `kill -9` nunca roda o `finally` de `run_once`, então
 o container que ele criou fica vivo, possivelmente ainda no meio de um comando contra o volume
@@ -92,11 +93,44 @@ existente com o mesmo rótulo: o dono do lease agora é o único dono legítimo.
 anônimas (sem `task_id`, usadas em testes avulsos) não são afetadas.
 
 **Ponto de entrada do worker.** `python -m warden.core.worker` ganhou `--script PATH` (roteiro
-`FakeProvider` diferente do de demo) e `--policy PATH` (policy diferente da default). O
-segundo existe só para `tests/test_durability.py`: a policy default não tem regra que permita
-um comando de longa duração (`run-project-commands` só libera pytest/ruff/mypy/npm), e
-afrouxar a default para caber um teste afrouxaria toda tarefa real. Uma policy só de teste,
-carregada por essa flag, mantém `policies/default.yaml` intocada.
+`FakeProvider` diferente do de demo) e `--policy PATH` (policy diferente da default). Quem
+precisou do segundo primeiro foi `tests/test_durability.py`: a policy default não tem regra
+que permita um comando de longa duração (`run-project-commands` só libera
+pytest/ruff/mypy/npm), e afrouxar a default para caber um teste afrouxaria toda tarefa real.
+Não é porta dos fundos: o `task.created` de toda tarefa grava o `policy_hash`, então uma
+policy diferente da default fica visível no log de quem rodou com ela.
+
+## Correções registradas na revisão
+
+Esta ADR conserta um defeito que passou porque o teste simulava a falha em vez de causá-la.
+A primeira versão do conserto repetiu o erro duas vezes, e as duas foram achadas do mesmo
+jeito: causando a falha de verdade.
+
+**Dois crashes seguidos.** O caminho de resume reemitia `tool.requested` para as calls que o
+replay tinha acabado de achar pendentes. Como o replay monta "pendente" a partir desses
+eventos, cada crash a mais dobrava a entrada: depois de dois crashes o terceiro worker
+executava a tool **duas vezes** e respondia um turno de dois `tool_use` com quatro
+`tool_result`, que a API rejeita com 400. O desenho original (PR 7) já fazia isso e chamava o
+pedido repetido de "registro honesto" num comentário de teste; era inofensivo só porque um
+crash real não commitava nada, então o segundo pedido nunca encontrava o primeiro. Foi o commit
+por passo que tornou o defeito alcançável. Correção em dois lugares: o loop não pede de novo
+o que já está no log (só passa pelo fence), e `replay.rebuild` mantém o primeiro pedido por
+`id`, porque é por ali que todo leitor passa. Nenhum teste crashava mais de uma vez;
+`test_two_crashes_in_a_row_still_run_each_tool_once` agora crasha.
+
+**O worker que trava em vez de morrer.** A primeira versão desta ADR registrava como
+comportamento correto que `claim()` não consegue tomar a tarefa de uma conexão viva e parada:
+o `INSERT` em `task_events` ainda não commitado segura um lock `FOR KEY SHARE` na linha da
+tarefa pela chave estrangeira, e `FOR UPDATE SKIP LOCKED` pula linha com lock. O mecanismo
+está certo. A conclusão estava errada, e o sinal era o próprio teste de fencing, que por causa
+disso teve que **simular** o worker zumbi em vez de criar um. O `iteration.started` ficava sem
+commit durante toda a chamada ao provider, então um worker preso numa chamada de rede que
+nunca volta mantinha a tarefa irreivindicável para sempre, com o lease vencido há horas. O
+lease protegia contra worker que morre, não contra worker que trava, e travar é o modo de
+falha mais provável de uma chamada HTTP. Com o checkpoint (a2) nada fica aberto durante a
+espera, B consegue reivindicar, e é o fence que segura o zumbi quando ele acorda. O replay
+ganhou o caso novo que isso cria: um `iteration.started` sozinho no log (crash dentro da
+chamada) é uma iteração que não comprou nada e roda de novo, em vez de ser pulada.
 
 ## Alternativas consideradas
 
@@ -138,9 +172,16 @@ auditoria) já existe sem precisar do evento.
   round-trip de commit ao Postgres local custa baixos milissegundos, uma chamada de modelo
   custa segundos e centavos. O que se compra com isso (a diferença entre perder uma tarefa
   inteira e perder o último passo dela) vale muito mais do que esse custo.
-- **`queue.claim()` só rouba uma tarefa de uma conexão que já foi embora.** Documentado acima
-  na decisão de fencing porque foi descoberto escrevendo o teste, não planejado de antemão:
-  vale registrar para quem for depurar "por que minha tarefa não foi reivindicada" no futuro.
+- **Uma linha de `tasks` com lock não é reivindicável, vencido o lease ou não.** `claim()` usa
+  `SKIP LOCKED`, e qualquer `INSERT` não commitado numa tabela filha segura `FOR KEY SHARE` na
+  tarefa. Hoje nada fica aberto durante uma espera, mas a regra vale para código futuro: quem
+  abrir transação e for esperar rede com ela aberta recria o defeito. Vale lembrar ao depurar
+  "por que minha tarefa não foi reivindicada".
+- **O container órfão de um zumbi vivo também é removido.** Quando B cria o sandbox, o
+  container de A some debaixo dele. É o resultado desejado (A não é mais dono de nada), e a
+  próxima tool de A falha e o próximo checkpoint dele levanta `LeaseLost`. Limite conhecido:
+  um erro inesperado do Docker nesse intervalo sobe por `run_once` e derruba o `run_forever`
+  daquele worker. O volume não é tocado nesse caminho; quem sofre é só o processo zumbi.
 - **Efeito colateral corrigido de graça.** O heartbeat parar de morrer de fome era consequência
   do mesmo commit por passo, não uma correção separada; sem ele o worker vivo podia perder a
   própria tarefa por não conseguir avisar que ainda respirava.
