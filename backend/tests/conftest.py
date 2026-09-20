@@ -1,4 +1,5 @@
 import asyncio
+import os
 import pathlib
 from collections.abc import AsyncIterator
 
@@ -12,7 +13,10 @@ from warden.config import get_settings
 from warden.db import make_engine, make_session_factory, with_database
 
 BACKEND = pathlib.Path(__file__).resolve().parents[1]
-TEST_DB = "warden_test"
+# Overridable so two checkouts can run the suite against one Postgres at the same time.
+# The fixture below drops and recreates this database, so with a shared name one run
+# would destroy the other's. CI and a single checkout keep the default.
+TEST_DB = os.environ.get("WARDEN_TEST_DB", "warden_test")
 
 
 @pytest.fixture(scope="session")
