@@ -79,13 +79,67 @@ def test_touched_paths_adds_the_source_of_a_rename() -> None:
     assert _touched_paths(diff, numstat) == ["src/new.py", "src/old.py"]
 
 
-def test_touched_paths_ignores_a_rename_header_git_did_not_act_on() -> None:
-    """The mismatch experiment from ADR-017, as a regression test: a `rename from`/`rename
-    to` pair whose destination git's own numstat never reports must not be trusted, because
-    nothing here confirms git actually treated it as a rename.
+def test_touched_paths_still_judges_a_rename_header_numstat_never_confirmed() -> None:
+    """The old design here cross-checked a header pair against numstat before trusting it,
+    on the reasoning that git ignores a header numstat never confirmed. That check was
+    itself the bypass (see the three tests below): there is no cross-check left, so a
+    header naming a path numstat never reported is still judged, on top of numstat's real
+    destination, rather than silently dropped. Fail closed: an extra path can only make the
+    combined decision more restrictive, never less.
     """
     diff = "rename from decoy_old.py\nrename to decoy_new.py\n"
-    assert _touched_paths(diff, "1\t0\tsrc/real.py\x00") == ["src/real.py"]
+    touched = _touched_paths(diff, "1\t0\tsrc/real.py\x00")
+    assert touched == ["src/real.py", "decoy_old.py", "decoy_new.py"]
+
+
+def test_touched_paths_unquotes_a_c_quoted_rename_source() -> None:
+    """POLICY BYPASS this closes: git accepts a C-quoted extended-header path even when
+    nothing about it required quoting (`rename from ".env"` applies identically to `rename
+    from .env`). A bare regex capture would keep the quote marks, and the quoted string
+    would then never match a `never-read-secrets` rule written against the real `.env`.
+    """
+    diff = (
+        "diff --git a/.env b/src/leaked.py\n"
+        "similarity index 0%\n"
+        'rename from ".env"\n'
+        "rename to src/leaked.py\n"
+    )
+    assert _touched_paths(diff, "0\t0\tsrc/leaked.py\x00") == ["src/leaked.py", ".env"]
+
+
+def test_touched_paths_strips_a_trailing_cr_from_a_rename_header() -> None:
+    """POLICY BYPASS this closes: a CRLF-terminated diff leaves `\\r` on the regex capture
+    (`$` in MULTILINE mode matches before `\\n`, not before `\\r\\n`), which used to break
+    the byte-identical match against numstat's LF-terminated destination and drop the
+    source entirely.
+    """
+    diff = (
+        "diff --git a/.env b/src/leaked.py\r\n"
+        "similarity index 0%\r\n"
+        "rename from .env\r\n"
+        "rename to src/leaked.py\r\n"
+    )
+    assert _touched_paths(diff, "0\t0\tsrc/leaked.py\x00") == ["src/leaked.py", ".env"]
+
+
+def test_touched_paths_keeps_the_real_source_despite_a_later_decoy_pair() -> None:
+    """POLICY BYPASS this closes: the old dict comprehension kept only the last `old` seen
+    for a given destination, so a second `rename from`/`rename to` pair anywhere in the
+    diff text, even in prose git itself ignores, silently overwrote the real source. There
+    is no dict keyed by destination left to overwrite: every header path found is judged.
+    """
+    diff = (
+        "diff --git a/.env b/src/leaked.py\n"
+        "similarity index 0%\n"
+        "rename from .env\n"
+        "rename to src/leaked.py\n"
+        "-- decoy trailing prose git ignores --\n"
+        "rename from src/decoy.py\n"
+        "rename to src/leaked.py\n"
+    )
+    touched = _touched_paths(diff, "0\t0\tsrc/leaked.py\x00")
+    assert "src/leaked.py" in touched
+    assert ".env" in touched
 
 
 def test_apply_patch_args_take_a_diff_string() -> None:
@@ -131,6 +185,16 @@ _RENAME_INTO_DENIED_TREE = (
     "similarity index 100%\n"
     "rename from src/a.py\n"
     "rename to .github/x.py\n"
+)
+
+# The exploit chain the review reproduced against a real sandbox: a C-quoted source lets
+# `.env` move into `src/**` (`write-source` allows it) while the old pairing logic dropped
+# the quoted source from the judged set entirely, so `never-read-secrets` never saw it.
+_RENAME_ENV_INTO_SRC_QUOTED = (
+    "diff --git a/.env b/src/leaked.py\n"
+    "similarity index 0%\n"
+    'rename from ".env"\n'
+    "rename to src/leaked.py\n"
 )
 
 _DOTDOT_CREATE = (
@@ -347,6 +411,40 @@ async def test_a_rename_into_a_denied_tree_is_denied_and_the_destination_is_judg
     ]
     assert len(decided) == 1
     assert set(decided[0]["paths"]) == {"src/a.py", ".github/x.py"}
+
+
+@pytest.mark.sandbox
+async def test_a_quoted_rename_source_is_still_judged_and_denied(
+    session: AsyncSession, workspace: pathlib.Path, sandbox: Sandbox
+) -> None:
+    """The full exploit the review reproduced in a real sandbox: `.env` renamed into
+    `src/**`, its source quoted in the extended header. `write-source` would allow the
+    destination alone; `never-read-secrets` has to see `.env` regardless, or the secret
+    ends up readable at `src/leaked.py`.
+    """
+    task = await _a_task(session, "add a helper module")
+    provider = FakeProvider(
+        [_step("apply_patch", diff=_RENAME_ENV_INTO_SRC_QUOTED), _step("finish", summary="done")]
+    )
+
+    await run_task(
+        session,
+        task,
+        provider,
+        build_registry(sandbox),
+        load_policy(DEFAULT_POLICY),
+        workspace=workspace,
+    )
+
+    row = await _apply_patch_row(session, task.id)
+    assert row.decision == "deny"
+    decision = (
+        await session.scalars(select(PolicyDecision).where(PolicyDecision.tool_call_id == row.id))
+    ).one()
+    assert "never-read-secrets" in decision.matched_rules
+    assert await read_file(sandbox, ReadFileArgs(path=".env")) == "SECRET=nope\n"
+    leaked = await sandbox.exec(["sh", "-c", "test -e src/leaked.py && echo YES || echo NO"])
+    assert leaked.output.strip() == "NO"
 
 
 @pytest.mark.sandbox

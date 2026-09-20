@@ -74,9 +74,25 @@ parser, porque a alternativa era confiar em documentação para uma decisão de 
    decorativa para esse efeito. Ler essas duas linhas não reintroduz o risco de parser
    differential que esta ADR existe para evitar, porque não há duas interpretações possíveis: o
    `git apply` não lê mais nada além delas para decidir o rename.
-   Por segurança adicional, um par `(origem, destino)` só é aceito quando o destino também
-   aparece na saída do `--numstat -z`, que é a única coisa aqui que o git de fato computou (em vez
-   de apenas ecoar). Implementado em `tools/sandboxed.py::_touched_paths`.
+   **Correção (revisão de segurança, mesmo branch):** a primeira versão só aceitava um par
+   `(origem, destino)` quando o destino também aparecia na saída do `--numstat -z`, para não
+   confiar num par decorativo que o texto do diff apenas contém. Essa checagem era ela mesma o
+   furo. Três formas provadas contra um sandbox de verdade: um destino com aspas C-style
+   (`rename to "src/leaked.py"`, aceito pelo `git apply` mesmo sem necessidade de quotação)
+   nunca bate byte a byte com a forma sem aspas que `--numstat -z` devolve; um diff com `\r\n`
+   deixa um `\r` sobrando na captura da linha de cabeçalho, mesmo problema; e como o pareamento
+   era um dict indexado pelo destino, um segundo par decorativo mais adiante no texto (que o
+   `git apply` ignora) sobrescrevia a origem real em silêncio. Com um `rename from ".env"` /
+   `rename to src/leaked.py`, a origem `.env` desaparecia do conjunto julgado, `write-source`
+   autorizava o destino como um path de source comum e o segredo ficava legível em
+   `src/leaked.py`, sem `never-read-secrets` nunca ter visto `.env`.
+
+   A correção não pareia mais nada. Todo path citado em qualquer linha `rename from`/`rename
+   to`/`copy from`/`copy to` do diff entra no conjunto julgado, além dos destinos do
+   `--numstat -z`, depois de remover um `\r` final e desfazer a quotação C-style
+   (`quote.c::unquote_c_style`) quando presente. Um path decorativo ou malformado só pode tornar
+   a decisão mais restritiva, nunca menos: não sobrou pareamento nenhum para falsificar.
+   Implementado em `tools/sandboxed.py::_touched_paths` e `_unquote_c_style`.
 
 4. **`git apply` recusa path fora do workspace por conta própria.** Um patch com `../outside.py`
    é recusado tanto em `--check` quanto no apply de verdade: `error: invalid path

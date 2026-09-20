@@ -161,29 +161,79 @@ def _parse_numstat_z(output: str) -> list[str]:
     return [field.split("\t", 2)[2] for field in output.split("\0") if field]
 
 
+# git's C-style quoting of an extended-header path (quote.c: quote_c_style / unquote_c_style).
+# A path holding a quote, a backslash, or (core.quotepath, on by default) a non-ASCII byte is
+# wrapped in double quotes, with `\\`, `\"`, the usual single-letter C escapes, and every other
+# non-printable byte written as a 3-digit octal `\NNN`. `git apply` accepts a quoted header path
+# even when nothing about it required quoting (verified: `rename from ".env"` behaves exactly
+# like `rename from .env`), so a bare regex capture would keep the quote marks around a path
+# that has none on disk, and the quoted string would then never match a deny rule written
+# against the real name.
+_C_ESCAPES = {"a": "\a", "b": "\b", "t": "\t", "n": "\n", "v": "\v", "f": "\f", "r": "\r"}
+_OCTAL_ESCAPE = re.compile(r"[0-7]{1,3}")
+
+
+def _unquote_c_style(raw: str) -> str:
+    """Undo git's C-style quoting, or return `raw` unchanged if it was never quoted."""
+    if len(raw) < 2 or raw[0] != '"' or raw[-1] != '"':
+        return raw
+    body = raw[1:-1]
+    out = bytearray()
+    i = 0
+    while i < len(body):
+        char = body[i]
+        if char != "\\":
+            out.extend(char.encode("utf-8", "replace"))
+            i += 1
+            continue
+        escape = body[i + 1 : i + 2]
+        if escape in ("\\", '"'):
+            out.extend(escape.encode("ascii"))
+            i += 2
+        elif escape in _C_ESCAPES:
+            out.extend(_C_ESCAPES[escape].encode("ascii"))
+            i += 2
+        else:
+            octal = _OCTAL_ESCAPE.match(body, i + 1)
+            if octal:
+                out.append(int(octal.group(), 8) & 0xFF)
+                i = octal.end()
+            else:
+                # Not an escape git would ever emit; keep the backslash literally rather
+                # than guess. This only ever changes what an already-strange path decodes
+                # to, never whether it ends up in the judged set below.
+                out.extend(char.encode("ascii"))
+                i += 1
+    return out.decode("utf-8", "replace")
+
+
 # ADR-017: verified empirically that `git apply --numstat -z` reports only the
 # *destination* of a rename, never the source, in every git version this project has
 # tested. The source is recoverable, safely, from the patch's own extended header: a
 # `rename from` line is always immediately followed by `rename to`, and a throwaway patch
 # with a decoy `diff --git a/X b/Y` line proved git apply itself ignores that line for a
 # rename and acts on these two instead, so reading them is reading exactly what git reads,
-# not guessing at it. `findall` alone would still trust an attacker-shaped pair blindly,
-# so a (source, destination) pair is only kept when the destination also appears in git's
-# own numstat output for this same patch, which is the one thing here git actually
-# computed rather than merely echoed.
-_RENAME_HEADER = re.compile(r"^rename from (.+)\n^rename to (.+)$", re.MULTILINE)
+# not guessing at it. `copy from`/`copy to` get the same treatment, same reasoning.
+#
+# This used to keep a (source, destination) pair only when the destination also byte-matched
+# one of numstat's, to avoid trusting a decoy header the patch text merely contains rather
+# than one git actually reads. That cross-check was itself the bug: a C-quoted or
+# CRLF-terminated destination never byte-matches numstat's unquoted, LF-terminated form, so
+# the pair, and the real source with it, silently disappeared; and because the match was a
+# plain dict keyed by destination, a *later* decoy pair for the same destination overwrote
+# the real source outright. There is no pairing left to spoof: every path named in any
+# `rename`/`copy` header line is judged, in addition to numstat's destinations, so a decoy
+# or a mangled header can only ever add an extra path to the judged set, never remove the
+# real one.
+_HEADER_PATH_LINE = re.compile(r"^(?:rename|copy) (?:from|to) (.+)$", re.MULTILINE)
 
 
 def _touched_paths(diff: str, numstat_output: str) -> list[str]:
     destinations = _parse_numstat_z(numstat_output)
-    renamed_from = {new: old for old, new in _RENAME_HEADER.findall(diff)}
-    touched: list[str] = []
-    for destination in destinations:
-        touched.append(destination)
-        source = renamed_from.get(destination)
-        if source is not None:
-            touched.append(source)
-    return touched
+    header_paths = [_unquote_c_style(raw.rstrip("\r")) for raw in _HEADER_PATH_LINE.findall(diff)]
+    # dict.fromkeys dedupes while keeping numstat's order first, which is what the existing
+    # rename test pins; the values are never read.
+    return list(dict.fromkeys([*destinations, *header_paths]))
 
 
 class RunCommandArgs(BaseModel):
