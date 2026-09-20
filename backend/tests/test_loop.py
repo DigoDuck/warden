@@ -13,6 +13,7 @@ import pytest
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from tests.fake_tools import FakeWorkspace
 from warden.core.events import read_events
 from warden.core.loop import Budget, run_task
 from warden.models import ModelCall, PolicyDecision, Task, ToolCall, User
@@ -20,7 +21,6 @@ from warden.policy.engine import Effect, Policy, Rule, load_policy
 from warden.providers.base import Completion, Usage
 from warden.providers.base import ToolCall as ProviderToolCall
 from warden.providers.fake import FakeProvider, ScriptStep
-from warden.tools.local import build_registry
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 DEFAULT_POLICY = REPO_ROOT / "policies" / "default.yaml"
@@ -94,7 +94,7 @@ async def test_successful_run_records_everything(
     )
 
     result = await run_task(
-        session, task, provider, build_registry(workspace), _allow_all(), workspace=workspace
+        session, task, provider, FakeWorkspace().registry(), _allow_all(), workspace=workspace
     )
 
     assert result.status == "SUCCEEDED"
@@ -131,7 +131,7 @@ async def test_a_refused_tool_does_not_kill_the_task(
     )
 
     result = await run_task(
-        session, task, provider, build_registry(workspace), _allow_all(), workspace=workspace
+        session, task, provider, FakeWorkspace().registry(), _allow_all(), workspace=workspace
     )
 
     assert result.status == "SUCCEEDED"
@@ -153,7 +153,7 @@ async def test_a_run_that_never_finishes_stops_at_max_iterations(
         session,
         task,
         provider,
-        build_registry(workspace),
+        FakeWorkspace().registry(),
         _allow_all(),
         workspace=workspace,
         budget=Budget(max_iterations=3),
@@ -175,7 +175,7 @@ async def test_spending_over_the_ceiling_stops_the_run(
         session,
         task,
         provider,
-        build_registry(workspace),
+        FakeWorkspace().registry(),
         _allow_all(),
         workspace=workspace,
         budget=Budget(max_iterations=10, max_usd=Decimal("1.00")),
@@ -191,7 +191,7 @@ async def test_scripted_run_costs_nothing(session: AsyncSession, workspace: path
     provider = FakeProvider([_step("finish", summary="done")])
 
     result = await run_task(
-        session, task, provider, build_registry(workspace), _allow_all(), workspace=workspace
+        session, task, provider, FakeWorkspace().registry(), _allow_all(), workspace=workspace
     )
 
     assert result.cost_usd == Decimal("0")
@@ -224,7 +224,7 @@ async def test_policy_denies_a_readable_secret_and_the_task_carries_on(
         session,
         task,
         provider,
-        build_registry(workspace),
+        FakeWorkspace().registry(),
         load_policy(DEFAULT_POLICY),
         workspace=workspace,
     )
@@ -253,7 +253,7 @@ async def test_a_denied_call_is_recorded_with_the_rule_that_decided(
         session,
         task,
         provider,
-        build_registry(workspace),
+        FakeWorkspace().registry(),
         load_policy(DEFAULT_POLICY),
         workspace=workspace,
     )
@@ -283,7 +283,7 @@ async def test_the_refusal_reaches_the_model_and_names_the_rule(
         session,
         task,
         provider,
-        build_registry(workspace),
+        FakeWorkspace().registry(),
         load_policy(DEFAULT_POLICY),
         workspace=workspace,
     )
@@ -308,7 +308,7 @@ async def test_an_allowed_call_still_runs(session: AsyncSession, workspace: path
         session,
         task,
         provider,
-        build_registry(workspace),
+        FakeWorkspace().registry(),
         load_policy(DEFAULT_POLICY),
         workspace=workspace,
     )
@@ -337,7 +337,7 @@ async def test_require_approval_degrades_to_a_refusal_until_week_3(
         [_step("read_file", path="src/app.py"), _step("finish", summary="could not")]
     )
 
-    await run_task(session, task, provider, build_registry(workspace), policy, workspace=workspace)
+    await run_task(session, task, provider, FakeWorkspace().registry(), policy, workspace=workspace)
 
     row = (
         await session.scalars(
@@ -359,7 +359,7 @@ async def test_a_path_escaping_the_workspace_is_denied_by_policy_too(
         session,
         task,
         provider,
-        build_registry(workspace),
+        FakeWorkspace().registry(),
         load_policy(DEFAULT_POLICY),
         workspace=workspace,
     )
@@ -389,7 +389,7 @@ async def test_every_tool_call_leaves_a_policy_event(
         session,
         task,
         provider,
-        build_registry(workspace),
+        FakeWorkspace().registry(),
         load_policy(DEFAULT_POLICY),
         workspace=workspace,
     )

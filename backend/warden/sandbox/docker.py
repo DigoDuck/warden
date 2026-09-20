@@ -23,7 +23,7 @@ import docker
 from docker.errors import NotFound
 from docker.models.containers import Container
 
-from warden.tools.local import is_ignored
+from warden.tools.workspace import is_ignored
 
 # A uid that exists neither in the image nor on the host: if a file ever escaped, it would
 # not be owned by a real account on either side.
@@ -102,6 +102,38 @@ def _workspace_tar(workspace: pathlib.Path) -> io.BytesIO:
     return stream
 
 
+def workspace_volume_name(task_id: str) -> str:
+    return f"warden-workspace-{task_id}"
+
+
+def _workspace_volume(client: docker.DockerClient, task_id: str | None) -> tuple[Any, bool]:
+    """The task's workspace volume, and whether this call created it.
+
+    Anonymous when there is no task id, which is the one-off case in tests: nothing is meant
+    to survive, so there is nothing to attach to.
+    """
+    if task_id is None:
+        return client.volumes.create(labels={"warden.sandbox": "1"}), True
+
+    name = workspace_volume_name(task_id)
+    try:
+        return client.volumes.get(name), False
+    except NotFound:
+        return (
+            client.volumes.create(
+                name=name, labels={"warden.sandbox": "1", "warden.task": task_id}
+            ),
+            True,
+        )
+
+
+def discard_workspace_volume(task_id: str, *, client: docker.DockerClient | None = None) -> None:
+    """Remove a task's workspace without needing a live sandbox to do it."""
+    client = client or docker.from_env()
+    with contextlib.suppress(NotFound, docker.errors.APIError):
+        client.volumes.get(workspace_volume_name(task_id)).remove(force=True)
+
+
 @dataclass
 class ExecResult:
     exit_code: int
@@ -111,10 +143,20 @@ class ExecResult:
 class Sandbox:
     """One container, hardened, holding one task's workspace."""
 
-    def __init__(self, container: Container, client: docker.DockerClient, volume_name: str) -> None:
+    def __init__(
+        self,
+        container: Container,
+        client: docker.DockerClient,
+        volume_name: str,
+        *,
+        task_scoped: bool,
+    ) -> None:
         self._container = container
         self._client = client
         self._volume_name = volume_name
+        # A task-scoped volume outlives its container because another worker may attach to
+        # it. An anonymous one cannot be re-attached by anyone, so keeping it is pure leak.
+        self._task_scoped = task_scoped
 
     @property
     def id(self) -> str:
@@ -126,17 +168,29 @@ class Sandbox:
         profile: SandboxProfile,
         workspace: pathlib.Path,
         *,
+        task_id: str | None = None,
         client: docker.DockerClient | None = None,
     ) -> "Sandbox":
+        """Start a container holding `task_id`'s workspace.
+
+        With a `task_id` the workspace belongs to the task rather than to this container:
+        a second sandbox for the same task attaches to what the first one left behind.
+        That is what makes resume after a crash honest. Without it, a task that wrote a
+        file, died and resumed would get a fresh copy of the original workspace while its
+        own event log told the model the file was there, so the model would reason about a
+        world the disk had stopped agreeing with.
+        """
         client = client or docker.from_env()
-        return await asyncio.to_thread(cls._create_sync, profile, workspace, client)
+        return await asyncio.to_thread(cls._create_sync, profile, workspace, client, task_id)
 
     @staticmethod
     def _create_sync(
-        profile: SandboxProfile, workspace: pathlib.Path, client: docker.DockerClient
+        profile: SandboxProfile,
+        workspace: pathlib.Path,
+        client: docker.DockerClient,
+        task_id: str | None,
     ) -> "Sandbox":
-        # Removed in destroy(); a leaked volume would outlive the task it belonged to.
-        volume = client.volumes.create(labels={"warden.sandbox": "1"})
+        volume, is_new = _workspace_volume(client, task_id)
         container = client.containers.run(
             image=profile.image,
             # Idles so that commands can be exec'd into it. The container has no entrypoint
@@ -169,7 +223,10 @@ class Sandbox:
 
         try:
             # The mount exists only once the container is running, so the copy happens after.
-            container.put_archive(MOUNT_ROOT, _workspace_tar(workspace).getvalue())
+            # An existing task volume already holds the workspace, including whatever the
+            # task changed before it was interrupted. Copying over it would undo that.
+            if is_new:
+                container.put_archive(MOUNT_ROOT, _workspace_tar(workspace).getvalue())
         except BaseException:
             # Anything failing past this point must not leave the container or the volume
             # behind: the caller never receives a Sandbox, so nobody is left to call
@@ -177,10 +234,13 @@ class Sandbox:
             # here on every call and left fourteen containers running.
             with contextlib.suppress(Exception):
                 container.remove(force=True)
-            with contextlib.suppress(Exception):
-                volume.remove(force=True)
+            if is_new:
+                # Only if this call created it. An existing task volume holds work that
+                # predates this container and must survive a failure to start one.
+                with contextlib.suppress(Exception):
+                    volume.remove(force=True)
             raise
-        return Sandbox(container, client, volume.name)
+        return Sandbox(container, client, volume.name, task_scoped=task_id is not None)
 
     # Named kill_after, not timeout, and the difference is the behaviour. A timeout says
     # "stop waiting", which for a container means abandoning a command that keeps running.
@@ -243,9 +303,21 @@ class Sandbox:
         await asyncio.to_thread(self._destroy_sync)
 
     def _destroy_sync(self) -> None:
+        # The container always goes. A task's workspace stays, because discarding it here
+        # would destroy the work of a task that is merely between workers; only a task in a
+        # terminal state should call `discard_workspace`. An anonymous workspace has no such
+        # future and goes with the container.
         with contextlib.suppress(NotFound):
             self._container.remove(force=True)
-        with contextlib.suppress(NotFound):
+        if not self._task_scoped:
+            self._discard_sync()
+
+    async def discard_workspace(self) -> None:
+        """Delete the workspace volume. Only for a task that will not run again."""
+        await asyncio.to_thread(self._discard_sync)
+
+    def _discard_sync(self) -> None:
+        with contextlib.suppress(NotFound, docker.errors.APIError):
             self._client.volumes.get(self._volume_name).remove(force=True)
 
 

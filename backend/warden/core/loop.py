@@ -33,8 +33,8 @@ from warden.providers.base import (
     ToolSchema,
     UserMessage,
 )
-from warden.tools.local import normalize_path
 from warden.tools.registry import ToolError, ToolRegistry
+from warden.tools.workspace import normalize_path
 
 FINISH_TOOL = "finish"
 
@@ -255,30 +255,24 @@ async def run_task(
 
 
 def _build_context(
-    call: ToolCall,
-    registry: ToolRegistry,
-    user: UserRef,
-    workspace: pathlib.Path,
-    task_id: UUID,
+    call: ToolCall, registry: ToolRegistry, user: UserRef, task_id: UUID
 ) -> PolicyContext:
     """Normalise the path once, here, so policy and tool judge the same string.
 
     The two layers still do different work, and that is intentional. The policy rules on the
-    normalised path; the tool resolves it again when it opens the file. A symlink inside the
-    workspace pointing outside reaches the policy as an innocent `src/app.py` and is stopped
-    by the tool. Neither layer alone covers both cases.
+    normalised string, deterministically and without touching a disk, so the decision is
+    reproducible from the event log. The tool resolves the path again inside the container
+    when it opens the file, which is the only place a symlink the agent created is visible.
+    Neither layer alone covers both cases.
     """
     path_arg = registry.path_arg(call.name)
     normalised: str | None = None
     if path_arg is not None:
         raw = call.arguments.get(path_arg)
         if isinstance(raw, str):
-            try:
-                normalised = normalize_path(workspace, raw)
-            except ToolError:
-                # Escapes the workspace. Leaving the path unset means no allow rule can
-                # match it and the default deny applies; the tool would refuse it anyway.
-                normalised = None
+            # None when the path escapes: no allow rule can match an unset path, so the
+            # default deny applies before the container is ever asked.
+            normalised = normalize_path(raw)
     return PolicyContext(
         tool=call.name, args=call.arguments, path=normalised, user=user, task_id=task_id
     )
@@ -312,7 +306,7 @@ async def _run_tools(
             {"tool": call.name, "id": call.id, "arguments": call.arguments},
         )
 
-        decision = policy.evaluate(_build_context(call, registry, user, workspace, task_id))
+        decision = policy.evaluate(_build_context(call, registry, user, task_id))
         await events.append_event(
             session,
             task_id,
