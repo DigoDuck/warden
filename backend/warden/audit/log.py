@@ -81,6 +81,31 @@ def _compute_hash(prev_hash: str, canonical: str) -> str:
     return hashlib.sha256((prev_hash + canonical).encode("utf-8")).hexdigest()
 
 
+def _reject_non_round_tripping_floats(value: Any) -> None:
+    """Postgres stores JSONB numbers as `numeric` and prints them without an exponent, so a
+    float Python renders as `1e+16` comes back from a round trip as the literal integer
+    `10000000000000000`. `_canonical_json` would then hash a different string on the way
+    back out than the one `append()` hashed on the way in, and `verify()` would flag an
+    untouched row as tampered. `details` is a trust boundary (model output, see the
+    module docstring), so this has to be caught here, not discovered as a false tamper
+    alert later. `allow_nan=False` also closes NaN/Infinity, valid Python floats but not
+    valid JSON, which Postgres would otherwise only reject at flush time.
+    """
+    if isinstance(value, float):
+        try:
+            rendered = json.dumps(value, allow_nan=False)
+        except ValueError as exc:
+            raise ValueError(f"details contains a non-finite float: {value!r}") from exc
+        if "e" in rendered.lower():
+            raise ValueError(f"details contains a float Postgres cannot round-trip: {value!r}")
+    elif isinstance(value, dict):
+        for item in value.values():
+            _reject_non_round_tripping_floats(item)
+    elif isinstance(value, list):
+        for item in value:
+            _reject_non_round_tripping_floats(item)
+
+
 async def append(
     session: AsyncSession,
     *,
@@ -116,6 +141,7 @@ async def append(
 
     ts = datetime.now(UTC)
     resolved_details = details if details is not None else {}
+    _reject_non_round_tripping_floats(resolved_details)
     try:
         canonical = _canonical_json(
             ts=ts,
@@ -126,9 +152,10 @@ async def append(
             target_id=target_id,
             details=resolved_details,
         )
-    except TypeError as exc:
+    except (TypeError, ValueError) as exc:
         # Trust boundary: `details` can arrive from anywhere up the call chain, including
-        # model output. A value json.dumps refuses must fail loudly here, not get past
+        # model output. A value json.dumps refuses (TypeError for a plain non-serialisable
+        # object, ValueError for a circular reference) must fail loudly here, not get past
         # this function and produce a row whose hash nothing can ever re-derive.
         raise ValueError(f"details is not JSON-serialisable: {exc}") from exc
 

@@ -79,6 +79,52 @@ async def test_append_rejects_details_that_json_cannot_serialise(session: AsyncS
         )
 
 
+async def test_append_rejects_a_float_postgres_cannot_round_trip(session: AsyncSession) -> None:
+    """Postgres renders JSONB numbers via `numeric`, without an exponent: `1e+16` comes
+    back as the literal integer `10000000000000000`, which would hash to a different
+    canonical string than the one `append()` computed. Nested, to prove the walk recurses.
+    """
+    with pytest.raises(ValueError, match="round-trip"):
+        await audit.append(
+            session,
+            actor_type="system",
+            actor_id="x",
+            action="x",
+            details={"nested": {"n": 1e16}},
+        )
+
+
+async def test_append_rejects_a_non_finite_float(session: AsyncSession) -> None:
+    with pytest.raises(ValueError, match="non-finite"):
+        await audit.append(
+            session,
+            actor_type="system",
+            actor_id="x",
+            action="x",
+            details={"n": float("inf")},
+        )
+
+
+async def test_details_with_a_nested_payload_round_trips_and_verifies_ok(
+    session: AsyncSession,
+) -> None:
+    """`_seed()` always appends with the default `{}`, so nothing else in this file
+    exercises a non-empty `details` through an actual Postgres round trip. Nest a dict, a
+    list and an ordinary (non-scientific-notation) float, force a real SELECT, and confirm
+    verify() still finds the row untampered.
+    """
+    details = {"count": 3, "ok": True, "ratio": 0.5, "tags": ["a", "b"], "meta": {"k": "v"}}
+    row = await audit.append(
+        session, actor_type="system", actor_id="x", action="x", details=details
+    )
+    await session.refresh(row)  # force a real SELECT, not the Python object just built
+
+    result = await audit.verify(session)
+
+    assert result == VerifyResult(ok=True, rows_checked=1)
+    assert row.details == details
+
+
 # --- tamper detection ---------------------------------------------------------------------
 
 
