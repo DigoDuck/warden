@@ -69,7 +69,7 @@ aprovação não existe, o loop degrada `require_approval` para recusa, que é o
 
 - O engine é puro: não executa nada, não lê arquivo, não toca rede, e não interpreta texto
   do modelo. Dá para testá-lo por tabela, e é isso que `tests/policy_cases.yaml` faz com
-  38 casos.
+  36 casos.
 - A contenção de path da tool **não** é substituída pela policy, e vice-versa. A policy
   julga o path normalizado; a tool resolve de novo ao abrir. Um symlink dentro do workspace
   apontando para fora chega à policy como `src/app.py` inocente e é barrado pela tool.
