@@ -17,6 +17,10 @@ class Settings(BaseSettings):
     # comment there for why it is not 5432.
     database_url: str = "postgresql+asyncpg://warden:warden@localhost:5434/warden"
 
+    # Read from the .env file rather than the process environment so that a run cannot
+    # pick up a key by accident. Empty means the demo refuses to call the real API.
+    anthropic_api_key: str = ""
+
 
 @lru_cache
 def get_settings() -> Settings:
