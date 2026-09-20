@@ -863,6 +863,7 @@ Formato: contexto, decisão, alternativas, consequências. Escrever no momento e
 - ADR-014 Guard detecta, policy impõe
 - ADR-015 Capability manifest: pedido do agente, não concessão; risco computado e versionado em vez de auto-declarado
 - ADR-016 `Completion` carrega o conteúdo do provider como opaco; trocar de provider no meio da tarefa é proibido por contrato
+- ADR-017 Autorização de `apply_patch` por path via `git apply --numstat -z`, nunca por parsing próprio do diff; `combine()` funde as decisões de uma chamada multi-path
 
 ---
 

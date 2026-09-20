@@ -122,6 +122,48 @@ class Policy:
         )
 
 
+def combine(decisions: list[Decision]) -> Decision:
+    """Fold the per-path decisions of one multi-path call into a single verdict.
+
+    Same ADR-003 semantics as `Policy.evaluate`, one level up: there the inputs are the
+    rules that matched one context, here they are the decisions already made for each path
+    a call touches (`apply_patch` on a diff that renames a file into `.github/` is one call
+    but two paths). The most restrictive effect still wins, `matched_rules` is still the
+    full union, and scopes still come only from the decisions that decided.
+
+    `scopes` is the one place this is stricter than a single evaluate(): they are handed
+    out only when *every* path was itself allowed. A call spanning N files is authorised as
+    one action, so a call where 9 paths are allowed and 1 is denied must not leak the
+    scopes of the 9, because `effect` on the combined decision is deny and those scopes
+    would otherwise look like they belonged to a call the control plane actually approved.
+    Since ALLOW is the least severe effect, "every decision is allow" and "the combined
+    effect is allow" are the same condition, checked once below.
+    """
+    if not decisions:
+        raise ValueError("combine() requires at least one decision")
+
+    effect = max((decision.effect for decision in decisions), key=lambda e: _SEVERITY[e])
+    deciding = [decision for decision in decisions if decision.effect == effect]
+    reason = next(
+        (decision.reason for decision in deciding if decision.reason),
+        f"{effect.value} across {len(decisions)} path(s)",
+    )
+
+    return Decision(
+        effect=effect,
+        matched_rules=sorted({rule for decision in decisions for rule in decision.matched_rules}),
+        reason=reason,
+        scopes=(
+            sorted({scope for decision in decisions for scope in decision.scopes})
+            if effect is Effect.ALLOW
+            else []
+        ),
+        # Every decision folded here came from evaluating the same loaded Policy, so they
+        # all carry the same hash; the first is as good as any other.
+        policy_hash=decisions[0].policy_hash,
+    )
+
+
 def load_policy(path: str | pathlib.Path) -> Policy:
     document = yaml.safe_load(pathlib.Path(path).read_text(encoding="utf-8")) or {}
     rules = [Rule.model_validate(raw) for raw in document.get("rules", [])]

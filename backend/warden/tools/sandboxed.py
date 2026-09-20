@@ -20,8 +20,15 @@ ponytail: each call starts a CPython interpreter in the container, which measure
 dominated by a model call of seconds. If tool latency ever shows up in the metrics, the
 upgrade is a resident helper process in the image reading commands from a pipe, which
 removes the interpreter startup without giving up containment.
+
+`apply_patch` contains itself differently: a diff can touch several files, so there is no
+single argument for a Python probe to resolve. It leans on git instead, which already
+refuses a path outside the workspace and a target beyond a symlink (verified, not assumed:
+ADR-017), and on the policy engine judging every path a diff touches before `apply_patch`
+is allowed to run at all (`core/loop.py`, `policy/engine.py::combine`).
 """
 
+import re
 import shlex
 import uuid
 
@@ -36,6 +43,9 @@ MAX_LISTED_FILES = 200
 # 1 MB: generous for source files, small enough that a runaway write cannot fill the
 # workspace volume or blow the event log storing the tool call's arguments.
 MAX_WRITE_BYTES = 1_000_000
+# Same ceiling, same reasoning, named separately because a diff and a file's content are
+# different things that happen to share a limit today.
+MAX_PATCH_BYTES = 1_000_000
 MAX_COMMAND_OUTPUT = 20_000
 RUN_COMMAND_DEFAULT_TIMEOUT = 60.0
 # pytest gets more room than an arbitrary command: a real suite can legitimately take longer
@@ -131,6 +141,49 @@ class ListFilesArgs(BaseModel):
 class WriteFileArgs(BaseModel):
     path: str = Field(description="Path to write, relative to the workspace root")
     content: str = Field(description="UTF-8 text content for the file")
+
+
+class ApplyPatchArgs(BaseModel):
+    diff: str = Field(
+        description=(
+            "A unified diff in `git diff` format, one or more files, including renames "
+            "and deletions. Paths are relative to the workspace root."
+        )
+    )
+
+
+# `git apply --numstat -z` (ADR-017 has the verified byte layout): one NUL-terminated
+# record per touched file, "<added>\t<deleted>\t<path>". Counts are never parsed, so a
+# binary file's "-" placeholder is harmless; the path is everything after the second tab,
+# taken verbatim rather than by further splitting, because a path is untrusted input and a
+# literal tab inside one must not be mistaken for the field separator that preceded it.
+def _parse_numstat_z(output: str) -> list[str]:
+    return [field.split("\t", 2)[2] for field in output.split("\0") if field]
+
+
+# ADR-017: verified empirically that `git apply --numstat -z` reports only the
+# *destination* of a rename, never the source, in every git version this project has
+# tested. The source is recoverable, safely, from the patch's own extended header: a
+# `rename from` line is always immediately followed by `rename to`, and a throwaway patch
+# with a decoy `diff --git a/X b/Y` line proved git apply itself ignores that line for a
+# rename and acts on these two instead, so reading them is reading exactly what git reads,
+# not guessing at it. `findall` alone would still trust an attacker-shaped pair blindly,
+# so a (source, destination) pair is only kept when the destination also appears in git's
+# own numstat output for this same patch, which is the one thing here git actually
+# computed rather than merely echoed.
+_RENAME_HEADER = re.compile(r"^rename from (.+)\n^rename to (.+)$", re.MULTILINE)
+
+
+def _touched_paths(diff: str, numstat_output: str) -> list[str]:
+    destinations = _parse_numstat_z(numstat_output)
+    renamed_from = {new: old for old, new in _RENAME_HEADER.findall(diff)}
+    touched: list[str] = []
+    for destination in destinations:
+        touched.append(destination)
+        source = renamed_from.get(destination)
+        if source is not None:
+            touched.append(source)
+    return touched
 
 
 class RunCommandArgs(BaseModel):
@@ -229,6 +282,72 @@ async def write_file(sandbox: Sandbox, args: WriteFileArgs) -> str:
     return f"wrote {args.path}"
 
 
+async def _stage_patch(sandbox: Sandbox, diff: str) -> str:
+    """Upload a diff under `.warden/` and return its staged path, over the size cap.
+
+    Shared by the inspector and the executor: each call stages, uses and removes its own
+    copy, so there is never a staged patch left behind for either to trip over the other.
+    """
+    content = diff.encode("utf-8")
+    if len(content) > MAX_PATCH_BYTES:
+        raise ToolError(f"diff is {len(content)} bytes, over the {MAX_PATCH_BYTES}-byte limit")
+    staged = f"{STAGING_DIR}/{uuid.uuid4().hex}"
+    await sandbox.put_file(staged, content)
+    return staged
+
+
+async def apply_patch_paths(sandbox: Sandbox, args: ApplyPatchArgs) -> list[str]:
+    """The inspector: ask git what this diff would touch, without changing anything.
+
+    ADR-017's design: the control plane cannot parse a diff itself without risking a
+    parser differential against what git apply actually does, so git is asked instead.
+    `--numstat -z` neither applies the patch nor validates it against real file content (a
+    context mismatch still reports a path here; that only fails later, at `--check` inside
+    `apply_patch`), so a malformed patch is the only thing that makes this raise.
+    """
+    staged = await _stage_patch(sandbox, args.diff)
+    try:
+        result = await sandbox.exec(
+            ["git", "-C", WORKSPACE, "apply", "--numstat", "-z", f"{MOUNT_ROOT}/{staged}"],
+            kill_after=30,
+        )
+    finally:
+        await sandbox.exec(["rm", "-f", f"{MOUNT_ROOT}/{staged}"], kill_after=30)
+
+    if result.exit_code != 0:
+        raise ToolError(f"could not read the patch: {result.output.strip()[:300]}")
+    return _touched_paths(args.diff, result.output)
+
+
+async def apply_patch(sandbox: Sandbox, args: ApplyPatchArgs) -> str:
+    """The executor: validate for real, then apply for real, both inside the workspace.
+
+    `--check` first and only then the real apply, the same two-step shape `write_file`'s
+    containment probe uses, because a change this one-way deserves a dry run first. git's
+    own refusal of a `../` path and of any target beyond a symlink (ADR-017, verified
+    empirically rather than assumed) is the actual containment here: this tool adds no
+    realpath probe of its own on top of it, because there is nothing left for one to catch
+    that git does not already refuse first.
+    """
+    staged = await _stage_patch(sandbox, args.diff)
+    try:
+        check = await sandbox.exec(
+            ["git", "-C", WORKSPACE, "apply", "--check", f"{MOUNT_ROOT}/{staged}"], kill_after=30
+        )
+        if check.exit_code != 0:
+            raise ToolError(f"patch does not apply: {check.output.strip()[:300]}")
+
+        result = await sandbox.exec(
+            ["git", "-C", WORKSPACE, "apply", f"{MOUNT_ROOT}/{staged}"], kill_after=30
+        )
+        if result.exit_code != 0:
+            raise ToolError(f"apply_patch failed: {result.output.strip()[:300]}")
+    finally:
+        await sandbox.exec(["rm", "-f", f"{MOUNT_ROOT}/{staged}"], kill_after=30)
+
+    return f"applied patch ({len(args.diff.encode('utf-8'))} bytes)"
+
+
 async def run_command(sandbox: Sandbox, args: RunCommandArgs) -> str:
     try:
         argv = shlex.split(args.cmd)
@@ -285,6 +404,15 @@ def build_registry(sandbox: Sandbox) -> ToolRegistry:
         args_model=WriteFileArgs,
         execute=lambda args: write_file(sandbox, args),
         path_arg="path",
+    )
+    registry.register(
+        name="apply_patch",
+        description="Apply a unified diff to the workspace: edits, creates, deletes and renames.",
+        args_model=ApplyPatchArgs,
+        execute=lambda args: apply_patch(sandbox, args),
+        # No path_arg: a diff can touch several files, so the paths it would touch come
+        # from path_inspector instead, one call judging all of them together.
+        path_inspector=lambda args: apply_patch_paths(sandbox, args),
     )
     registry.register(
         name="run_command",
