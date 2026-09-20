@@ -87,10 +87,6 @@ async def test_tampering_a_row_makes_verify_point_at_that_row(session: AsyncSess
     await session.execute(
         text("UPDATE audit_log SET action = 'tampered' WHERE id = :id"), {"id": second.id}
     )
-    # Raw SQL through the same session does not refresh the ORM identity map. Without this,
-    # verify()'s query would hand back the Python objects _seed() already built, not what
-    # the UPDATE above actually put in Postgres.
-    session.expire_all()
 
     result = await audit.verify(session)
 
@@ -107,13 +103,39 @@ async def test_tampering_prev_hash_is_caught(session: AsyncSession) -> None:
         text("UPDATE audit_log SET prev_hash = :bad WHERE id = :id"),
         {"bad": "f" * 64, "id": second.id},
     )
-    session.expire_all()
 
     result = await audit.verify(session)
 
     assert result.ok is False
     assert result.broken_row_id == second.id
     assert result.reason is not None and "prev_hash" in result.reason
+
+
+async def test_verify_is_not_fooled_by_its_own_sessions_stale_identity_map(
+    session: AsyncSession,
+    session_factory: async_sessionmaker[AsyncSession],
+    clean_committed_audit_log: None,
+) -> None:
+    """verify() has to be authoritative about what is in Postgres, not what this session
+    already has cached. `session` here both appended and, without `populate_existing=True`
+    in verify()'s query, would already hold these rows warm in its identity map: SQLAlchemy
+    would hand back those Python objects instead of re-reading the tampered column, and
+    verify() would report ok=True against a database that is not ok. The tampering has to
+    come from a genuinely separate, committed session/connection, same as a real attacker.
+    """
+    _first, second, _third = await _seed(session, n=3)
+    await session.commit()
+
+    async with session_factory() as attacker:
+        await attacker.execute(
+            text("UPDATE audit_log SET action = 'tampered' WHERE id = :id"), {"id": second.id}
+        )
+        await attacker.commit()
+
+    result = await audit.verify(session)
+
+    assert result.ok is False
+    assert result.broken_row_id == second.id
 
 
 async def test_deleting_a_middle_row_is_caught_at_the_following_row(

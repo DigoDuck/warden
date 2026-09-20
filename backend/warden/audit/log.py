@@ -153,8 +153,19 @@ async def verify(session: AsyncSession) -> VerifyResult:
 
     ponytail: loads the full table into memory to walk it. Fine at the size this project
     ever reaches; page by id range before this runs against a log with millions of rows.
+
+    `populate_existing=True` matters as much as the hash comparisons below: without it,
+    SQLAlchemy's identity map hands back whatever Python objects this session already has
+    for these rows (loaded by an earlier query, or by `append()` itself in the same
+    session) instead of what the SELECT just fetched. A session that appended, then
+    verified, would silently verify its own cached state and report `ok=True` against a
+    database an attacker on a different connection had actually tampered with.
     """
-    rows = (await session.scalars(select(AuditLog).order_by(AuditLog.id))).all()
+    rows = (
+        await session.scalars(
+            select(AuditLog).order_by(AuditLog.id).execution_options(populate_existing=True)
+        )
+    ).all()
 
     expected_prev = GENESIS_HASH
     for checked, row in enumerate(rows, start=1):
