@@ -86,6 +86,12 @@ def upgrade() -> None:
     # the first place (it only covers SELECT/INSERT/UPDATE/DELETE), so revoking it here is
     # belt-and-suspenders: it survives someone widening that blanket grant later without
     # remembering this table needs the exception.
+    #
+    # This REVOKE is per-table, but ALTER DEFAULT PRIVILEGES above is not: it re-applies to
+    # every future table this connected role creates. If a later migration ever DROPs and
+    # recreates audit_log, the table silently regains UPDATE/DELETE from that default and
+    # this REVOKE would need repeating. Nothing enforces that today; a migration that drops
+    # this table must re-run this line.
     op.execute("REVOKE UPDATE, DELETE, TRUNCATE ON audit_log FROM warden_app")
     # alembic_version: the application has no business changing which migration a database
     # is on. Read is harmless and occasionally useful for a health check; write is not.
