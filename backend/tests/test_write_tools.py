@@ -142,6 +142,24 @@ async def test_symlink_out_is_refused_as_a_parent_and_as_the_target(sandbox: San
     assert "nope" not in result.output
 
 
+async def test_reading_and_writing_through_an_in_tree_symlink_is_refused(sandbox: Sandbox) -> None:
+    """POLICY BYPASS this closes: the resolved target staying under the workspace root was
+    never proof that it was the *same* file the caller named. `src/alias -> ../top.txt`
+    resolves inside the workspace, so the old `_CONTAIN` check waved it through; policy then
+    judges the allowed-looking name `src/alias`, never the real, possibly-denied `top.txt`.
+    """
+    await write_file(sandbox, WriteFileArgs(path="top.txt", content="SECRET=nope\n"))
+    link = await sandbox.exec(["ln", "-s", "../top.txt", "src/alias"])
+    assert link.exit_code == 0, link.output
+
+    with pytest.raises(ToolError, match="outside the workspace"):
+        await read_file(sandbox, ReadFileArgs(path="src/alias"))
+    with pytest.raises(ToolError, match="outside the workspace"):
+        await write_file(sandbox, WriteFileArgs(path="src/alias", content="pwned"))
+
+    assert await read_file(sandbox, ReadFileArgs(path="top.txt")) == "SECRET=nope\n"
+
+
 async def test_content_over_the_limit_is_a_tool_error(sandbox: Sandbox) -> None:
     with pytest.raises(ToolError, match="limit"):
         await write_file(sandbox, WriteFileArgs(path="too_big.txt", content="x" * 1_000_001))

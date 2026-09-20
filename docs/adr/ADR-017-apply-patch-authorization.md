@@ -108,7 +108,27 @@ parser, porque a alternativa era confiar em documentação para uma decisão de 
    `realpath` que `write_file` já tem. Ele recusa, então `apply_patch` não duplica esse probe; a
    contenção aqui é do próprio git, testada em `test_apply_patch.py`, não assumida.
 
-6. **`--numstat -z` não valida, só faz parsing.** Um patch cujo contexto não bate com o conteúdo
+6. **`git` deixa criar um symlink novo, e isso é um furo diferente do item 5.** O item 5 mostra
+   que o `git apply` recusa *escrever através* de um symlink que já existe e sai do workspace,
+   mas nada nele recusa um diff que *cria* um symlink novo dentro do workspace (`new file mode
+   120000`). Um diff assim (`src/link` apontando para `../.env`) passa normal pelo
+   `--numstat -z`, `write-source` autoriza `src/link` como se fosse um path de source comum, e
+   o `git apply` cria o link de verdade. Qualquer ferramenta que depois resolva por esse nome
+   devolveria o conteúdo real do arquivo apontado, com a policy tendo julgado só o nome do link.
+   Verificado contra a checagem de contenção que `read_file`/`write_file` já tinham (a mesma
+   forma do item 5, `realpath` sob o workspace root): ela prova só que o alvo *resolvido* fica
+   dentro do workspace, não que é o *mesmo arquivo* que o path pedido nomeia, então um symlink
+   apontando para outro path dentro do workspace passava por ela sem ser pego. As duas defesas,
+   as duas neste branch: `apply_patch` recusa de cara qualquer diff cujo cabeçalho estendido
+   tenha `new file mode 120000` ou `new mode 120000` (`_SYMLINK_MODE_HEADER`), antes de o git
+   rodar; e `_CONTAIN`, o preâmbulo que `read_file`/`write_file` compartilham, passou a exigir
+   que o path lexical (o que a policy julgou) seja igual ao path relativo obtido a partir do
+   `realpath` resolvido, recusando quando um symlink no meio do caminho faz os dois divergirem.
+   Independentes de propósito: a primeira fecha a criação pela raiz, a segunda fecha qualquer
+   symlink que já exista no workspace por outro motivo (por exemplo, um repositório de exemplo
+   que já tinha um).
+
+7. **`--numstat -z` não valida, só faz parsing.** Um patch cujo contexto não bate com o conteúdo
    real do arquivo ainda é reportado normalmente por `--numstat -z` (exit 0): ele não abre os
    arquivos do workspace, só lê o texto do patch. Só o `--check` (ou o apply de verdade) detecta a
    incompatibilidade de contexto. Consequência direta: a policy pode autorizar um `apply_patch`
@@ -116,7 +136,7 @@ parser, porque a alternativa era confiar em documentação para uma decisão de 
    um furo: autorização é sobre *quais paths* uma chamada tocaria, não sobre se o patch aplica de
    fato.
 
-7. **Patch malformado falha já no `--numstat -z`** (`exit 128`, "No valid patches in input"), o
+8. **Patch malformado falha já no `--numstat -z`** (`exit 128`, "No valid patches in input"), o
    que é o sinal que vira `ToolError` na inspeção e, no loop, o deny sintetizado descrito acima.
 
 ## Alternativas consideradas
@@ -154,6 +174,12 @@ jeito, então é a mesma coisa que negar sempre, só com um nome mais bonito.
 - `apply_patch` não tem `path_arg`: sua contenção depende inteiramente do git (itens 4 e 5) mais
   da policy julgando cada path relatado. Não há probe de `realpath` próprio, porque não sobrou
   nada para ele capturar que o git já não recuse primeiro.
+- Exceção pontual ao ponto acima (item 6): criar um symlink novo é algo que o git *permite*, não
+  recusa, então `apply_patch` ganhou uma checagem própria, textual, sobre o cabeçalho do diff, em
+  vez de depender do git para isso. E `_touched_paths`/`_unquote_c_style` (item 3) e `_CONTAIN`
+  (item 6) foram corrigidos numa revisão de segurança sobre este mesmo branch, não na primeira
+  versão: os testes que os regride estão em `test_apply_patch.py` (pareamento) e
+  `test_write_tools.py` (symlink dentro do workspace).
 - Descoberta reaproveitável: qualquer ferramenta futura que precise saber "o que este diff toca"
   antes de decidir algo sobre ele deve usar `git apply --numstat -z` mais o par `rename
   from`/`rename to`, não `git diff`, porque o alvo não é um repositório real.

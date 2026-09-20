@@ -197,6 +197,17 @@ _RENAME_ENV_INTO_SRC_QUOTED = (
     "rename to src/leaked.py\n"
 )
 
+_CREATE_SYMLINK_TO_ENV = (
+    "diff --git a/src/link b/src/link\n"
+    "new file mode 120000\n"
+    "index 0000000..8888888\n"
+    "--- /dev/null\n"
+    "+++ b/src/link\n"
+    "@@ -0,0 +1 @@\n"
+    "+../.env\n"
+    "\\ No newline at end of file\n"
+)
+
 _DOTDOT_CREATE = (
     "diff --git a/../outside.py b/../outside.py\n"
     "new file mode 100644\n"
@@ -445,6 +456,38 @@ async def test_a_quoted_rename_source_is_still_judged_and_denied(
     assert await read_file(sandbox, ReadFileArgs(path=".env")) == "SECRET=nope\n"
     leaked = await sandbox.exec(["sh", "-c", "test -e src/leaked.py && echo YES || echo NO"])
     assert leaked.output.strip() == "NO"
+
+
+@pytest.mark.sandbox
+async def test_apply_patch_refuses_to_create_a_symlink(
+    session: AsyncSession, workspace: pathlib.Path, sandbox: Sandbox
+) -> None:
+    """The other half of the symlink bypass: even with `_CONTAIN` now checking the
+    *effective* path against the judged one, a control plane that authorises by path
+    string cannot safely let the agent create a new name for an existing file at all.
+    Policy has no reason to refuse `src/link` (it looks like an ordinary source path), so
+    the refusal has to come from the tool itself, before git ever creates the link.
+    """
+    task = await _a_task(session, "add a helper module")
+    provider = FakeProvider(
+        [_step("apply_patch", diff=_CREATE_SYMLINK_TO_ENV), _step("finish", summary="done")]
+    )
+
+    await run_task(
+        session,
+        task,
+        provider,
+        build_registry(sandbox),
+        load_policy(DEFAULT_POLICY),
+        workspace=workspace,
+    )
+
+    row = await _apply_patch_row(session, task.id)
+    assert row.decision == "allow"  # policy had no reason to refuse the textual path
+    assert row.error is not None
+    assert "symlink" in row.error
+    exists = await sandbox.exec(["sh", "-c", "test -e src/link && echo YES || echo NO"])
+    assert exists.output.strip() == "NO"
 
 
 @pytest.mark.sandbox

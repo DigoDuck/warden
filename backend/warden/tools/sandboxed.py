@@ -56,15 +56,39 @@ RUN_TESTS_TIMEOUT = 120.0
 STAGING_DIR = ".warden"
 
 # Shared preamble: resolve the argument under the workspace root or refuse. `realpath`
-# follows symlinks all the way to their final target, so this alone catches a relative
-# escape, an absolute path, a symlinked parent directory pointing outside, and an existing
-# target that is itself a symlink pointing outside: every case has the same shape once
-# resolved, an absolute path that is not under the workspace root.
+# follows symlinks all the way to their final target, so the first check alone catches a
+# relative escape, an absolute path, a symlinked parent directory pointing outside, and an
+# existing target that is itself a symlink pointing outside: every case has the same shape
+# once resolved, an absolute path that is not under the workspace root.
+#
+# That check alone is not enough: it only proves the resolved target is *somewhere* inside
+# the workspace, not that it is the *same* file the caller named and the policy engine
+# judged. A symlink whose target is also inside the workspace, `src/link -> ../.env`,
+# resolves to a path under the root, so the first check waves it through, but `read_file`
+# would then return `.env`'s content under the name `src/link`, which `never-read-secrets`
+# never got a chance to judge. The second check closes that: recompute the purely lexical
+# path the same way policy sees it (drop `.`/empty segments, pop a parent on `..`), and
+# require it to equal where `sys.argv[1]` actually resolves to, relative to the root. A
+# mismatch means some component along the way is a symlink standing in for a different
+# path, trusted or not, so it is refused exactly like an out-of-tree escape.
 _CONTAIN = f"""
 import os, sys
 root = os.path.realpath({WORKSPACE!r})
-target = os.path.realpath(os.path.join(root, sys.argv[1]))
+raw = sys.argv[1]
+target = os.path.realpath(os.path.join(root, raw))
 if target != root and not target.startswith(root + os.sep):
+    print("__REFUSED__", file=sys.stderr)
+    sys.exit(3)
+parts = []
+for part in raw.split("/"):
+    if part in ("", "."):
+        continue
+    if part == "..":
+        if parts:
+            parts.pop()
+    else:
+        parts.append(part)
+if os.path.relpath(target, root) != ("/".join(parts) or "."):
     print("__REFUSED__", file=sys.stderr)
     sys.exit(3)
 """
@@ -369,6 +393,16 @@ async def apply_patch_paths(sandbox: Sandbox, args: ApplyPatchArgs) -> list[str]
     return _touched_paths(args.diff, result.output)
 
 
+# A symlink is a name standing in for a different file. Every path-based rule here,
+# `never-read-secrets` included, is judged against the name, so a diff that creates one lets
+# the agent alias an allowed-looking name to whatever it points at, no matter what `_CONTAIN`
+# does afterwards for read_file/write_file. Refusing the diff outright, before git ever runs,
+# is cheaper and more general than trying to enumerate every tool that might later resolve
+# through the new link. All git symlinks are mode 120000 (there is no other symlink mode), so
+# a `new file mode 120000` or a mode change `new mode 120000` is unambiguously a symlink.
+_SYMLINK_MODE_HEADER = re.compile(r"^(?:new file mode|new mode) 120000$", re.MULTILINE)
+
+
 async def apply_patch(sandbox: Sandbox, args: ApplyPatchArgs) -> str:
     """The executor: validate for real, then apply for real, both inside the workspace.
 
@@ -377,8 +411,15 @@ async def apply_patch(sandbox: Sandbox, args: ApplyPatchArgs) -> str:
     own refusal of a `../` path and of any target beyond a symlink (ADR-017, verified
     empirically rather than assumed) is the actual containment here: this tool adds no
     realpath probe of its own on top of it, because there is nothing left for one to catch
-    that git does not already refuse first.
+    that git does not already refuse first. Creating a *new* symlink is a different problem
+    git happily allows, which is why it gets its own refusal, checked against the diff text
+    directly rather than through git, so no symlink is ever momentarily created.
     """
+    if _SYMLINK_MODE_HEADER.search(args.diff):
+        raise ToolError(
+            "apply_patch refuses a diff that creates or changes a symlink (mode 120000)"
+        )
+
     staged = await _stage_patch(sandbox, args.diff)
     try:
         check = await sandbox.exec(
