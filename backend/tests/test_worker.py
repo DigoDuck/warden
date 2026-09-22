@@ -145,7 +145,7 @@ def docker_available() -> None:
         pytest.skip(f"Docker is not available on this machine: {exc}")
 
 
-@pytest.fixture(autouse=True)
+@pytest.fixture
 async def _empty_tasks_and_users(session: AsyncSession) -> AsyncIterator[None]:
     await session.execute(text("TRUNCATE tasks, users CASCADE"))
     await session.commit()
@@ -173,6 +173,7 @@ def _allow_all() -> Policy:
 @pytest.mark.sandbox
 async def test_run_once_applies_the_tightened_per_task_budget(
     docker_available: None,
+    _empty_tasks_and_users: None,
     session: AsyncSession,
     session_factory: async_sessionmaker[AsyncSession],
     _repo_workspace: pathlib.Path,
