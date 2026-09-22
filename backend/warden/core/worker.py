@@ -94,7 +94,11 @@ def _tightened_seconds(ceiling: float | None, value: Any) -> float | None:
     deadline still tightens it, it just has nothing to be compared against."""
     if isinstance(value, bool) or not isinstance(value, int | float):
         return ceiling
-    parsed = float(value)
+    try:
+        parsed = float(value)
+    except OverflowError:
+        # An int too large for a float (JSONB keeps any numeric): no real deadline anyway.
+        return ceiling
     if not math.isfinite(parsed) or parsed <= 0:
         return ceiling
     return parsed if ceiling is None else min(ceiling, parsed)
