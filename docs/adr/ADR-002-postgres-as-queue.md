@@ -22,10 +22,11 @@ Dois mecanismos carregam o desenho:
 - **Lease com heartbeat** é o que distingue worker morto de worker lento. Quem morre para de
   estender e perde a tarefa quando o lease vence; quem está vivo renova.
 
-O argumento decisivo não é desempenho, é **transação**. Fila e event log no mesmo banco
-commitam juntos: não existe tarefa marcada como rodando cujos eventos não foram gravados,
-nem o contrário. Com broker separado isso vira two-phase commit ou outbox, que é mais
-código para um problema que este projeto não precisa ter.
+O argumento decisivo não é desempenho, é **transação**. Fila e event log vivem no mesmo banco
+e commitam juntos, **a cada passo da tarefa, não uma vez por tarefa inteira** (ADR-019 corrige
+essa segunda parte: até ela, a tarefa inteira era uma transação só, e um processo morto de
+verdade, não uma exceção capturada, perdia o log inteiro). Com broker separado isso vira
+two-phase commit ou outbox, que é mais código para um problema que este projeto não precisa ter.
 
 ## Alternativas consideradas
 
@@ -51,7 +52,9 @@ latência entre submissão e pickup aparecer numa métrica.
   tecnologia, e só depois um broker.
 - **Crash recovery não tem caminho especial.** Worker morto para de estender o lease; outro
   reivindica e reconstrói a conversa do event log. Recuperação é o claim normal encontrando
-  uma tarefa que já tem história.
+  uma tarefa que já tem história. Isso só é verdade de fato a partir da ADR-019: antes dela o
+  log de uma tarefa em andamento não tinha história nenhuma até o fim, porque nada commitava
+  antes disso.
 - **O resume exigiu que o event log fosse completo.** Antes deste PR o `model.called` não
   guardava `raw_content` e o `tool.executed` não guardava a saída, então a conversa era
   irreconstituível e a promessa da ADR-016 era falsa. Agora guarda.

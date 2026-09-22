@@ -53,10 +53,13 @@ async def session_factory() -> AsyncIterator[async_sessionmaker[AsyncSession]]:
 async def session(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> AsyncIterator[AsyncSession]:
-    """One session per test, always rolled back.
+    """One session per test, rolled back at the end.
 
-    Tests use `flush()` and never `commit()`: the constraint fires just the same, and
-    the rollback leaves a clean database for the next test without TRUNCATE in between.
+    The rollback only isolates a test that never commits. Since ADR-019 the loop commits at
+    every step, so any test that drives `run_task` leaves rows behind regardless, and so
+    does any test that commits on purpose. Those clean up after themselves with a TRUNCATE
+    in an autouse fixture (see test_queue.py, test_resume.py, test_audit.py). A test whose
+    assertions count rows must scope them by an id it created, never assume an empty table.
     """
     async with session_factory() as s:
         yield s

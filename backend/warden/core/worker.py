@@ -9,6 +9,7 @@ when the lease expires another worker claims the task and rebuilds the conversat
 the event log. Recovery is the normal claim path meeting a task that already has history.
 """
 
+import argparse
 import asyncio
 import contextlib
 import os
@@ -84,11 +85,14 @@ async def run_claimed_task(
     registry: ToolRegistry,
     *,
     budget: Budget | None = None,
+    holder: str | None = None,
 ) -> RunResult:
     """Run a task from wherever it left off.
 
     A task with no prior events starts fresh; one with history resumes. The caller does not
-    have to know which, and neither does the loop.
+    have to know which, and neither does the loop. `holder` fences every checkpoint the run
+    makes (ADR-019): the `Worker` below passes its own id, so a run that outlives its lease
+    stops with `LeaseLost` instead of writing over the next owner.
     """
     history = await events.read_events(session, task.id)
     resume: ResumeState | None = None
@@ -104,6 +108,7 @@ async def run_claimed_task(
         workspace=workspace,
         budget=budget,
         resume=resume,
+        holder=holder,
     )
 
 
@@ -145,6 +150,10 @@ class Worker:
         beat = asyncio.create_task(_beat(self._sessions, task_id, self.id, self._lease_seconds))
         # The workspace volume is named after the task, so a sandbox created here attaches
         # to whatever a previous worker left behind rather than starting from a fresh copy.
+        # `Sandbox.create` also force-removes any container still labelled for this task
+        # (sandbox/docker.py): a worker that was killed outright never runs this `finally`
+        # block, so its container could otherwise sit there orphaned, possibly still running
+        # a command against the volume this one is about to attach to.
         sandbox = await Sandbox.create(
             self._profile,
             self._workspace,
@@ -152,19 +161,30 @@ class Worker:
             # What a deny rule names never enters the container (ADR-018).
             exclude=never_readable(self._policy),
         )
+        lease_lost = False
         try:
             async with self._sessions() as session:
                 claimed = await session.get(Task, task_id)
                 assert claimed is not None
-                result = await run_claimed_task(
-                    session,
-                    claimed,
-                    self._provider_factory(),
-                    self._policy,
-                    self._workspace,
-                    build_registry(sandbox),
-                    budget=self._budget,
-                )
+                try:
+                    result = await run_claimed_task(
+                        session,
+                        claimed,
+                        self._provider_factory(),
+                        self._policy,
+                        self._workspace,
+                        build_registry(sandbox),
+                        budget=self._budget,
+                        holder=self.id,
+                    )
+                except queue.LeaseLost:
+                    # Another worker already reclaimed this task. Every checkpoint fences
+                    # its own commit (ADR-019), so nothing this run wrote after losing the
+                    # lease survived; stop quietly rather than keep spending on a task that
+                    # is no longer ours to finish, and let the `finally` below leave the
+                    # workspace alone for whoever owns it now.
+                    lease_lost = True
+                    return None
                 await session.commit()
                 return result
         finally:
@@ -174,10 +194,11 @@ class Worker:
             # The container always goes. The workspace only goes when the task is over: a
             # task between workers still needs what it changed before it was interrupted.
             await sandbox.destroy()
-            async with self._sessions() as session:
-                finished = await session.get(Task, task_id)
-                if finished is not None and finished.status in TERMINAL_STATUSES:
-                    await asyncio.to_thread(discard_workspace_volume, str(task_id))
+            if not lease_lost:
+                async with self._sessions() as session:
+                    finished = await session.get(Task, task_id)
+                    if finished is not None and finished.status in TERMINAL_STATUSES:
+                        await asyncio.to_thread(discard_workspace_volume, str(task_id))
 
     async def run_forever(self) -> None:
         while not self._stopping.is_set():
@@ -191,6 +212,25 @@ class Worker:
 
 
 async def main() -> int:  # pragma: no cover - process entry point
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--script",
+        type=pathlib.Path,
+        default=DEMO_SCRIPT,
+        help="FakeProvider YAML script to replay instead of the demo one.",
+    )
+    # First needed by tests/test_durability.py: the default policy has no allow rule for a
+    # long-running command, on purpose, and loosening it so a probe can run one would loosen
+    # every other task along with it. Not a back door: `task.created` records the
+    # `policy_hash` of whatever was loaded, so a run under another policy says so in its log.
+    parser.add_argument(
+        "--policy",
+        type=pathlib.Path,
+        default=POLICY_FILE,
+        help="Policy YAML file to load instead of the default.",
+    )
+    args = parser.parse_args()
+
     settings = get_settings()
     engine = make_engine(settings.database_url)
     sessions = make_session_factory(engine)
@@ -198,9 +238,9 @@ async def main() -> int:  # pragma: no cover - process entry point
     def provider_factory() -> ModelProvider:
         from warden.providers.fake import FakeProvider
 
-        return FakeProvider.from_yaml(DEMO_SCRIPT)
+        return FakeProvider.from_yaml(args.script)
 
-    worker = Worker(sessions, provider_factory, load_policy(POLICY_FILE), WORKSPACE)
+    worker = Worker(sessions, provider_factory, load_policy(args.policy), WORKSPACE)
 
     loop = asyncio.get_running_loop()
     for signame in ("SIGINT", "SIGTERM"):

@@ -67,6 +67,10 @@ def rebuild(task_events: Sequence[TaskEvent]) -> ResumeState:
     requested: list[dict[str, Any]] = []
     executed: dict[str, dict[str, Any]] = {}
     iteration = 0
+    # Whether the iteration being read got as far as its model call. `iteration.started` is
+    # committed before the provider is asked, so a crash inside the call leaves it alone in
+    # the log, and that iteration has to run again rather than be counted as done.
+    model_called = False
 
     def flush_results() -> None:
         """Emit the tool results message for the iteration that just ended."""
@@ -87,14 +91,21 @@ def rebuild(task_events: Sequence[TaskEvent]) -> ResumeState:
             flush_results()
             requested, executed = [], {}
             iteration = int(payload.get("n", iteration + 1))
+            model_called = False
 
         elif event.type == ev.MODEL_CALLED:
+            model_called = True
             state.spent += Decimal(str(payload.get("cost_usd", "0")))
             if "raw_content" in payload:
                 state.messages.append(AssistantMessage(raw_content=payload["raw_content"]))
 
         elif event.type == ev.TOOL_REQUESTED:
-            requested.append(payload)
+            # First request wins. The loop records each call once, but everything below
+            # (pending, partial results, the results message) is built from this list, so a
+            # repeated id would become a tool that runs twice and a tool_use answered twice.
+            # Every reader routes through here, which makes it the place to be strict.
+            if all(item["id"] != payload["id"] for item in requested):
+                requested.append(payload)
 
         elif event.type == ev.TOOL_EXECUTED:
             executed[str(payload["id"])] = payload
@@ -121,6 +132,6 @@ def rebuild(task_events: Sequence[TaskEvent]) -> ResumeState:
         state.next_iteration = iteration
     else:
         flush_results()
-        state.next_iteration = iteration + 1
+        state.next_iteration = iteration + 1 if model_called or iteration == 0 else iteration
 
     return state

@@ -53,6 +53,22 @@ _HEARTBEAT = text("""
     RETURNING id
 """)
 
+# Locks the row while checking who holds it. Taken inside the same transaction a
+# per-step checkpoint (ADR-019) is about to commit, so a worker that lost its lease either
+# observes the new owner's `claimed_by` and fails the check, or briefly waits behind the new
+# owner's own write to that row and then observes it. There is no third outcome where it
+# commits believing it still owns a task someone else has already reclaimed.
+_VERIFY_HOLDER = text("SELECT claimed_by FROM tasks WHERE id = :task_id FOR UPDATE")
+
+
+class LeaseLost(RuntimeError):
+    """A checkpoint tried to commit after another worker had already reclaimed the task.
+
+    Raised by callers of `verify_holder` (`core/loop.py`'s checkpoint helper): this module
+    only answers whether the lease still belongs to the caller, and leaves what a lost lease
+    means for a run in progress to the loop.
+    """
+
 
 async def enqueue(
     session: AsyncSession,
@@ -125,6 +141,19 @@ async def heartbeat(
     )
     await session.flush()
     return extended is not None
+
+
+async def verify_holder(session: AsyncSession, task_id: UUID, holder: str) -> bool:
+    """True if `holder` is still the worker holding this task's lease.
+
+    Used to fence a per-step commit: durability alone is not enough once a run can commit
+    more than once, because a worker that lost its lease keeps running and would otherwise
+    interleave events with the new owner mid-task and corrupt replay. Called with the row
+    already locked by `_VERIFY_HOLDER`'s `FOR UPDATE`, so the answer is never stale by the
+    time the caller's commit lands.
+    """
+    current: str | None = await session.scalar(_VERIFY_HOLDER, {"task_id": task_id})
+    return current == holder
 
 
 async def release(session: AsyncSession, task_id: UUID, worker_id: str) -> bool:

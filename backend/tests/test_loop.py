@@ -396,3 +396,27 @@ async def test_every_tool_call_leaves_a_policy_event(
 
     kinds = [event.type for event in await read_events(session, task.id)]
     assert kinds.count("policy.decided") == 2
+
+
+async def test_finish_leaves_no_tool_requested_or_tool_executed_event(
+    session: AsyncSession, workspace: pathlib.Path
+) -> None:
+    """ADR-019: `finish` deliberately gets no `tool.requested`/`tool.executed` event.
+
+    Replay derives "still pending" as requested-minus-executed, and `finish` is never
+    registered in the tool registry: a `tool.requested` for it, with no `tool.executed` to
+    cancel it out, would make a resumed run try to dispatch a tool that does not exist. The
+    `tool_calls` row it still gets, for the audit trail, is a separate table this test does
+    not need to touch.
+    """
+    task = await _a_task(session)
+    provider = FakeProvider([_step("finish", summary="done")])
+
+    result = await run_task(
+        session, task, provider, FakeWorkspace().registry(), _allow_all(), workspace=workspace
+    )
+
+    assert result.status == "SUCCEEDED"
+    kinds = [event.type for event in await read_events(session, task.id)]
+    assert "tool.requested" not in kinds
+    assert "tool.executed" not in kinds
