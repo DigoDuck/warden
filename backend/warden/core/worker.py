@@ -19,6 +19,7 @@ import socket
 import uuid
 from collections.abc import Callable
 
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from warden.config import get_settings
@@ -38,6 +39,11 @@ IDLE_POLL_SECONDS = 1.0
 # Fast on purpose, unlike the heartbeat: a lease is minutes long, but a cancelled task has
 # to stop within a few seconds of the request, not within a fraction of the lease.
 CANCEL_POLL_SECONDS = 1.0
+# What a single poll from `_beat` or `_watch_cancel` may hit and survive: the connection
+# dropping (OSError) or the database refusing one statement (SQLAlchemyError wraps asyncpg).
+# Anything else is a bug and still propagates.
+# ponytail: retried silently, there is no logging yet; log it once structlog lands (week 7).
+_TRANSIENT_DB_ERRORS = (OSError, SQLAlchemyError)
 
 # States a task does not come back from. Only then is its workspace thrown away: a task
 # merely between workers still needs whatever it changed before it was interrupted.
@@ -70,9 +76,17 @@ async def _beat(
     interval = max(1.0, lease_seconds * HEARTBEAT_FRACTION)
     while True:
         await asyncio.sleep(interval)
-        async with session_factory() as session:
-            alive = await queue.heartbeat(session, task_id, holder, lease_seconds=lease_seconds)
-            await session.commit()
+        try:
+            async with session_factory() as session:
+                alive = await queue.heartbeat(
+                    session, task_id, holder, lease_seconds=lease_seconds
+                )
+                await session.commit()
+        except _TRANSIENT_DB_ERRORS:
+            # One failed beat costs one interval; the lease is several intervals long. Dying
+            # here instead would let `run_once`'s `finally` re-raise the error, skip
+            # `sandbox.destroy()` and take `run_forever` down over a blip.
+            continue
         if not alive:
             # The task was reclaimed by someone else. Stop beating; the run will finish and
             # find it no longer owns the row.
@@ -95,8 +109,13 @@ async def _watch_cancel(
     """
     while True:
         await asyncio.sleep(CANCEL_POLL_SECONDS)
-        async with session_factory() as session:
-            requested = await cancel.is_requested(session, task_id)
+        try:
+            async with session_factory() as session:
+                requested = await cancel.is_requested(session, task_id)
+        except _TRANSIENT_DB_ERRORS:
+            # Same reasoning as `_beat`: one bad poll costs one poll. A watcher that died
+            # here would stop killing the sandbox for the rest of the run.
+            continue
         if requested:
             await sandbox.kill_for_cancel()
             return
