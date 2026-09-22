@@ -8,6 +8,7 @@ committed before the app's own session can see it, the same reason test_identity
 cross-session tests do this.
 """
 
+import asyncio
 import uuid
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
@@ -216,6 +217,33 @@ async def test_an_agent_token_is_refused_even_with_a_matching_scope_name(
     assert response.status_code == 403
 
 
+@pytest.mark.parametrize(
+    ("method", "path", "granted"),
+    [
+        ("POST", "/tasks", ["tasks:read", "audit:read"]),
+        ("GET", f"/tasks/{uuid.uuid4()}", ["tasks:write", "audit:read"]),
+        ("GET", f"/tasks/{uuid.uuid4()}/events", ["tasks:write", "audit:read"]),
+        ("GET", "/audit/verify", ["tasks:write", "tasks:read"]),
+    ],
+)
+async def test_each_route_demands_its_own_scope(
+    client: AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+    keys: KeyPair,
+    method: str,
+    path: str,
+    granted: list[str],
+) -> None:
+    token = await _user_token(session_factory, keys, await _user(session_factory), granted)
+    response = await client.request(
+        method,
+        path,
+        json={"spec": "x"} if method == "POST" else None,
+        headers={**_auth(token), "Idempotency-Key": str(uuid.uuid4())},
+    )
+    assert response.status_code == 403
+
+
 # --- POST /tasks: validation ----------------------------------------------------------------
 
 
@@ -270,6 +298,29 @@ async def test_the_same_idempotency_key_returns_the_same_task_once_created(
             select(func.count())
             .select_from(AuditLog)
             .where(AuditLog.action == "task.submitted", AuditLog.target_id == first.json()["id"])
+        )
+    assert count == 1
+
+
+async def test_concurrent_submissions_with_one_key_create_one_task_and_one_audit_row(
+    client: AsyncClient, session_factory: async_sessionmaker[AsyncSession], keys: KeyPair
+) -> None:
+    """ADR-020's claim: the unique index serialises same-key inserts, so the audit-row
+    existence check that tells created from replayed has exactly one winner even when the
+    requests overlap.
+    """
+    token = await _user_token(session_factory, keys, await _user(session_factory), ["tasks:write"])
+    headers = {**_auth(token), "Idempotency-Key": str(uuid.uuid4())}
+
+    responses = await asyncio.gather(
+        *(client.post("/tasks", json={"spec": "race"}, headers=headers) for _ in range(5))
+    )
+
+    assert sorted(r.status_code for r in responses) == [200, 200, 200, 200, 201]
+    assert len({r.json()["id"] for r in responses}) == 1
+    async with session_factory() as session:
+        count = await session.scalar(
+            select(func.count()).select_from(AuditLog).where(AuditLog.action == "task.submitted")
         )
     assert count == 1
 
