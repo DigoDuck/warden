@@ -14,7 +14,9 @@ class BudgetIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     max_iterations: int | None = Field(default=None, gt=0, le=1000)
-    max_usd: float | None = Field(default=None, gt=0)
+    # allow_inf_nan=False: Python's json parser accepts a bare `Infinity`, `gt=0` passes it,
+    # and JSONB then refuses it at insert time as a 500 instead of a 422 here.
+    max_usd: float | None = Field(default=None, gt=0, allow_inf_nan=False)
 
 
 class TaskCreate(BaseModel):

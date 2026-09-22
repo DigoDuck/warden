@@ -279,6 +279,26 @@ async def test_unknown_field_is_rejected(
     assert response.status_code == 422
 
 
+async def test_a_non_finite_budget_is_422_not_a_500(
+    client: AsyncClient, session_factory: async_sessionmaker[AsyncSession], keys: KeyPair
+) -> None:
+    """Python's json parser accepts the bare `Infinity` token, and `gt=0` alone lets it
+    through; JSONB cannot store it, so without `allow_inf_nan=False` this is a 500 from the
+    driver instead of a validation error.
+    """
+    token = await _user_token(session_factory, keys, await _user(session_factory), ["tasks:write"])
+    response = await client.post(
+        "/tasks",
+        content=b'{"spec": "x", "budget": {"max_usd": Infinity}}',
+        headers={
+            **_auth(token),
+            "Idempotency-Key": str(uuid.uuid4()),
+            "Content-Type": "application/json",
+        },
+    )
+    assert response.status_code == 422
+
+
 # --- POST /tasks: idempotency ----------------------------------------------------------------
 
 
