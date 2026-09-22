@@ -15,11 +15,11 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from tests.fake_tools import FakeWorkspace
-from warden.core import cancel
+from warden.core import cancel, queue
 from warden.core.events import read_events
 from warden.core.loop import Budget, run_task
 from warden.core.replay import ResumeState
-from warden.models import ModelCall, PolicyDecision, Task, ToolCall, User
+from warden.models import Approval, AuditLog, ModelCall, PolicyDecision, Task, ToolCall, User
 from warden.policy.engine import Effect, Policy, Rule, load_policy
 from warden.providers.base import Completion, Usage, UserMessage
 from warden.providers.base import ToolCall as ProviderToolCall
@@ -326,29 +326,203 @@ async def test_an_allowed_call_still_runs(session: AsyncSession, workspace: path
     assert row.error is None
 
 
-async def test_require_approval_degrades_to_a_refusal_until_week_3(
-    session: AsyncSession, workspace: pathlib.Path
-) -> None:
-    """Without the approval machinery, the loop errs on the restrictive side."""
-    task = await _a_task(session)
-    policy = Policy(
-        [Rule(id="needs-human", effect=Effect.REQUIRE_APPROVAL, when={"tool": "read_file"})],
+async def _claimed_task(session: AsyncSession) -> Task:
+    """A task actually claimed by a worker, so pausing it can meaningfully assert the lease
+    was released (`_a_task` above builds a bare, unclaimed Task, which has no lease to
+    release in the first place)."""
+    user = User(email=f"{uuid.uuid4()}@warden.test", password_hash="x", role="worker")
+    session.add(user)
+    await session.flush()
+    await queue.enqueue(
+        session, user_id=user.id, spec="open a pull request", idempotency_key=str(uuid.uuid4())
+    )
+    await session.commit()
+    claimed = await queue.claim(session, "worker-a")
+    assert claimed is not None
+    await session.commit()
+    return claimed
+
+
+def _require_approval_policy(tool: str = "github.open_pr") -> Policy:
+    return Policy(
+        [
+            Rule(id="allow-read", effect=Effect.ALLOW, when={"tool": "read_file"}),
+            Rule(
+                id="needs-human",
+                effect=Effect.REQUIRE_APPROVAL,
+                reason="opening a pull request is visible outside the control plane",
+                scopes=["github:pr:open"],
+                when={"tool": tool},
+            ),
+        ],
         default=Effect.DENY,
         policy_hash="test",
     )
-    provider = FakeProvider(
-        [_step("read_file", path="src/app.py"), _step("finish", summary="could not")]
+
+
+async def test_require_approval_pauses_the_task_and_releases_the_lease(
+    session: AsyncSession, workspace: pathlib.Path
+) -> None:
+    """ADR-022: a REQUIRE_APPROVAL decision used to degrade to a refusal (week 2). Now it
+    parks the task for a human instead, with the lease released so a worker can pick up
+    something else while it waits.
+    """
+    task = await _claimed_task(session)
+    holder = task.claimed_by
+    provider = FakeProvider([_step("github.open_pr", title="x")])
+
+    result = await run_task(
+        session,
+        task,
+        provider,
+        FakeWorkspace().registry(),
+        _require_approval_policy(),
+        workspace=workspace,
+        holder=holder,
     )
 
-    await run_task(session, task, provider, FakeWorkspace().registry(), policy, workspace=workspace)
+    assert result.status == "WAITING_APPROVAL"
+    assert task.status == "WAITING_APPROVAL"
+    assert task.claimed_by is None
+    assert task.claimed_until is None
 
-    row = (
+    rows = list(await session.scalars(select(Approval).where(Approval.task_id == task.id)))
+    assert len(rows) == 1
+    assert rows[0].status == "pending"
+    assert rows[0].tool == "github.open_pr"
+    assert rows[0].matched_rules == ["needs-human"]
+
+    kinds = [event.type for event in await read_events(session, task.id)]
+    assert "approval.requested" in kinds
+    assert "tool.executed" not in kinds
+    # WAITING_APPROVAL is not terminal (worker.py's TERMINAL_STATUSES excludes it): no
+    # task.finished, and finished_at stays unset.
+    assert "task.finished" not in kinds
+    assert task.finished_at is None
+
+
+async def test_calls_before_the_paused_one_still_ran_and_calls_after_stay_pending(
+    session: AsyncSession, workspace: pathlib.Path
+) -> None:
+    task = await _claimed_task(session)
+    provider = FakeProvider(
+        [
+            ScriptStep(
+                tool_calls=[
+                    ProviderToolCall(
+                        id="call-read", name="read_file", arguments={"path": "src/app.py"}
+                    ),
+                    ProviderToolCall(id="call-pr", name="github.open_pr", arguments={"title": "x"}),
+                    ProviderToolCall(id="call-list", name="list_files", arguments={}),
+                ]
+            )
+        ]
+    )
+
+    result = await run_task(
+        session,
+        task,
+        provider,
+        FakeWorkspace().registry(),
+        _require_approval_policy(),
+        workspace=workspace,
+        holder=task.claimed_by,
+    )
+
+    assert result.status == "WAITING_APPROVAL"
+    events_by_type: dict[str, list[str]] = {}
+    for event in await read_events(session, task.id):
+        events_by_type.setdefault(event.type, []).append(str(event.payload.get("tool")))
+
+    # requested: all three, in one batch, before any of them ran (ADR-019 checkpoint b).
+    assert events_by_type["tool.requested"] == ["read_file", "github.open_pr", "list_files"]
+    # decided: read_file (allowed) and github.open_pr (paused); list_files never even got a
+    # policy decision, because the loop stopped at the call before it.
+    assert events_by_type["policy.decided"] == ["read_file", "github.open_pr"]
+    # executed: only the call before the pause.
+    assert events_by_type["tool.executed"] == ["read_file"]
+    assert events_by_type["approval.requested"] == ["github.open_pr"]
+
+
+# --- audit log entries the loop itself writes (ADR-022 / week 3 list) -----------------------
+
+
+async def test_a_policy_deny_writes_an_audit_entry(
+    session: AsyncSession, workspace: pathlib.Path
+) -> None:
+    (workspace / ".env").write_text("SECRET=x\n", encoding="utf-8", newline="\n")
+    task = await _a_task(session)
+    provider = FakeProvider([_step("read_file", path=".env"), _step("finish", summary="done")])
+
+    await run_task(
+        session,
+        task,
+        provider,
+        FakeWorkspace().registry(),
+        load_policy(DEFAULT_POLICY),
+        workspace=workspace,
+    )
+
+    rows = list(
         await session.scalars(
-            select(ToolCall).where(ToolCall.task_id == task.id, ToolCall.tool_name == "read_file")
+            select(AuditLog).where(
+                AuditLog.action == "policy.deny", AuditLog.target_id == str(task.id)
+            )
         )
-    ).one()
-    assert row.decision == "require_approval"
-    assert "human approval" in (row.error or "")
+    )
+    assert len(rows) == 1
+    assert rows[0].details["tool"] == "read_file"
+    assert "never-read-secrets" in rows[0].details["matched_rules"]
+
+
+async def test_an_approval_request_writes_an_audit_entry(
+    session: AsyncSession, workspace: pathlib.Path
+) -> None:
+    task = await _claimed_task(session)
+    provider = FakeProvider([_step("github.open_pr", title="x")])
+
+    await run_task(
+        session,
+        task,
+        provider,
+        FakeWorkspace().registry(),
+        _require_approval_policy(),
+        workspace=workspace,
+        holder=task.claimed_by,
+    )
+
+    approval = (await session.scalars(select(Approval).where(Approval.task_id == task.id))).one()
+    rows = list(
+        await session.scalars(
+            select(AuditLog).where(
+                AuditLog.action == "approval.requested",
+                AuditLog.target_id == str(approval.id),
+            )
+        )
+    )
+    assert len(rows) == 1
+    assert rows[0].details["tool"] == "github.open_pr"
+
+
+async def test_a_finished_task_writes_an_audit_entry(
+    session: AsyncSession, workspace: pathlib.Path
+) -> None:
+    task = await _a_task(session)
+    provider = FakeProvider([_step("finish", summary="done")])
+
+    await run_task(
+        session, task, provider, FakeWorkspace().registry(), _allow_all(), workspace=workspace
+    )
+
+    rows = list(
+        await session.scalars(
+            select(AuditLog).where(
+                AuditLog.action == "task.finished", AuditLog.target_id == str(task.id)
+            )
+        )
+    )
+    assert len(rows) == 1
+    assert rows[0].details["status"] == "SUCCEEDED"
 
 
 async def test_a_path_escaping_the_workspace_is_denied_by_policy_too(
