@@ -12,9 +12,10 @@ from collections.abc import AsyncIterator
 
 import pytest
 from sqlalchemy import text
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from warden.core import cancel, events, queue
+from warden.core import cancel, events, queue, worker
 from warden.core.events import read_events
 from warden.models import Task, User
 
@@ -226,3 +227,47 @@ async def test_a_cancel_landing_while_the_worker_holds_an_uncommitted_event_does
     assert outcome is cancel.CancelOutcome.MARKED
     rows = await read_events(session, task_id)
     assert [(e.seq, e.type) for e in rows] == [(1, "iteration.started"), (2, "cancel.requested")]
+
+
+class _RecordingSandbox:
+    def __init__(self) -> None:
+        self.killed = asyncio.Event()
+
+    async def kill_for_cancel(self) -> None:
+        self.killed.set()
+
+
+@pytest.mark.parametrize(
+    "transient",
+    [
+        OSError("connection reset by peer"),
+        OperationalError("SELECT", {}, Exception("server closed the connection")),
+    ],
+    ids=["os-error", "sqlalchemy-operational-error"],
+)
+async def test_the_cancel_watcher_survives_a_transient_database_error(
+    session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+    transient: Exception,
+) -> None:
+    """A watcher that died on one failed poll would stop killing the sandbox for the rest of
+    the run, and `run_once`'s `finally` would re-raise the error, skip `sandbox.destroy()`
+    and take `run_forever` down with it. One bad poll must cost one poll, nothing more."""
+    answers: list[Exception | bool] = [transient, True]
+
+    async def flaky_is_requested(_session: AsyncSession, _task_id: uuid.UUID) -> bool:
+        answer = answers.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    monkeypatch.setattr(worker, "CANCEL_POLL_SECONDS", 0)
+    monkeypatch.setattr(cancel, "is_requested", flaky_is_requested)
+    sandbox = _RecordingSandbox()
+
+    await asyncio.wait_for(
+        worker._watch_cancel(session_factory, uuid.uuid4(), sandbox),  # type: ignore[arg-type]
+        timeout=5,
+    )
+
+    assert sandbox.killed.is_set()
