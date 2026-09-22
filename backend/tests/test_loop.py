@@ -18,9 +18,10 @@ from tests.fake_tools import FakeWorkspace
 from warden.core import cancel
 from warden.core.events import read_events
 from warden.core.loop import Budget, run_task
+from warden.core.replay import ResumeState
 from warden.models import ModelCall, PolicyDecision, Task, ToolCall, User
 from warden.policy.engine import Effect, Policy, Rule, load_policy
-from warden.providers.base import Completion, Usage
+from warden.providers.base import Completion, Usage, UserMessage
 from warden.providers.base import ToolCall as ProviderToolCall
 from warden.providers.fake import FakeProvider, ScriptStep
 
@@ -567,3 +568,33 @@ async def test_max_iterations_still_ends_timed_out_when_no_deadline_is_set(
 
     assert result.status == "TIMED_OUT"
     assert "max_iterations" in (result.reason or "")
+
+
+async def test_a_resumed_run_keeps_the_original_clock_for_max_seconds(
+    session: AsyncSession, workspace: pathlib.Path
+) -> None:
+    """The deadline is measured from the persisted `task.started_at`, so a task that crashed
+    and was reclaimed an hour later is already out of time: the resume path must not stamp
+    a fresh start. An empty `FakeProvider` blows up if the model is asked for a turn.
+    """
+    task = await _a_task(session)
+    task.status = "RUNNING"
+    task.started_at = datetime.now(UTC) - timedelta(hours=1)
+    await session.flush()
+    resume = ResumeState(messages=[UserMessage(text=task.spec)], next_iteration=2)
+
+    result = await run_task(
+        session,
+        task,
+        FakeProvider([]),
+        FakeWorkspace().registry(),
+        _allow_all(),
+        workspace=workspace,
+        budget=Budget(max_iterations=10, max_seconds=60),
+        resume=resume,
+    )
+
+    assert result.status == "TIMED_OUT"
+    assert "max_seconds" in (result.reason or "")
+    kinds = [event.type for event in await read_events(session, task.id)]
+    assert kinds == ["task.finished"]
