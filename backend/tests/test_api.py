@@ -23,7 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from warden import audit, identity
 from warden.api.app import create_app
 from warden.core import events
-from warden.identity.jwt import ALGORITHM, AUDIENCE, ISSUER, KeyPair, _kid_for
+from warden.identity.jwt import ALGORITHM, KeyPair, _kid_for
 from warden.models import AuditLog, Task, TaskEvent, User
 
 
@@ -103,23 +103,26 @@ async def _agent_token(
         return token
 
 
-def _expired_token(keys: KeyPair) -> str:
-    """Built by hand, like test_identity.py's `_valid_claims`/`_sign`: PyJWT rejects an
-    expired `exp` before `identity.verify()` ever looks the `jti` up, so this does not need
-    a registered row to prove the 401.
+async def _expired_token(session_factory: async_sessionmaker[AsyncSession], keys: KeyPair) -> str:
+    """A token that is genuine in every way except that it has expired.
+
+    Issued for real, so its `jti` has a live row: otherwise the 401 would come from the
+    unknown-jti check and prove nothing about expiry. The row's `expires_at` is moved into
+    the past (this connection is not `warden_app`) and the token re-signed with the matching
+    `exp`, so `identity.verify()`'s row comparison agrees and only the expiry check is left
+    to refuse it.
     """
-    now = datetime.now(UTC)
-    claims = {
-        "iss": ISSUER,
-        "aud": AUDIENCE,
-        "sub": f"user:{uuid.uuid4()}",
-        "jti": str(uuid.uuid4()),
-        "iat": int((now - timedelta(minutes=30)).timestamp()),
-        "exp": int((now - timedelta(minutes=15)).timestamp()),
-        "scopes": ["tasks:write"],
-        "typ": "user",
-    }
-    return jwt.encode(claims, keys.private_key, algorithm=ALGORITHM, headers={"kid": keys.kid})
+    token = await _user_token(session_factory, keys, await _user(session_factory), ["tasks:write"])
+    payload = jwt.decode(token, options={"verify_signature": False})
+    expired_at = datetime.now(UTC).replace(microsecond=0) - timedelta(minutes=15)
+    async with session_factory() as session:
+        await session.execute(
+            text("UPDATE issued_tokens SET expires_at = :at WHERE jti = :jti"),
+            {"at": expired_at, "jti": uuid.UUID(payload["jti"])},
+        )
+        await session.commit()
+    payload["exp"] = int(expired_at.timestamp())
+    return jwt.encode(payload, keys.private_key, algorithm=ALGORITHM, headers={"kid": keys.kid})
 
 
 def _auth(token: str) -> dict[str, str]:
@@ -135,33 +138,30 @@ async def test_no_bearer_token_is_401_with_www_authenticate(client: AsyncClient)
     assert response.headers["www-authenticate"] == "Bearer"
 
 
-async def test_a_token_signed_by_a_different_key_is_401(client: AsyncClient) -> None:
+async def test_a_token_signed_by_a_different_key_is_401(
+    client: AsyncClient, session_factory: async_sessionmaker[AsyncSession], keys: KeyPair
+) -> None:
+    """Same claims as a genuinely issued token, live `jti` included, so the only thing wrong
+    is the signature.
+    """
+    token = await _user_token(session_factory, keys, await _user(session_factory), ["tasks:write"])
+    payload = jwt.decode(token, options={"verify_signature": False})
     other = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    token = jwt.encode(
-        {
-            "iss": ISSUER,
-            "aud": AUDIENCE,
-            "sub": f"user:{uuid.uuid4()}",
-            "jti": str(uuid.uuid4()),
-            "iat": int(datetime.now(UTC).timestamp()),
-            "exp": int((datetime.now(UTC) + timedelta(minutes=5)).timestamp()),
-            "scopes": ["tasks:write"],
-            "typ": "user",
-        },
-        other,
-        algorithm=ALGORITHM,
-    )
+    forged = jwt.encode(payload, other, algorithm=ALGORITHM, headers={"kid": keys.kid})
+
     response = await client.post(
-        "/tasks", json={"spec": "x"}, headers={**_auth(token), "Idempotency-Key": "k"}
+        "/tasks", json={"spec": "x"}, headers={**_auth(forged), "Idempotency-Key": "k"}
     )
     assert response.status_code == 401
 
 
-async def test_an_expired_token_is_401(client: AsyncClient, keys: KeyPair) -> None:
+async def test_an_expired_token_is_401(
+    client: AsyncClient, session_factory: async_sessionmaker[AsyncSession], keys: KeyPair
+) -> None:
     response = await client.post(
         "/tasks",
         json={"spec": "x"},
-        headers={**_auth(_expired_token(keys)), "Idempotency-Key": "k"},
+        headers={**_auth(await _expired_token(session_factory, keys)), "Idempotency-Key": "k"},
     )
     assert response.status_code == 401
 
@@ -182,8 +182,10 @@ async def test_a_revoked_token_is_401(
     assert response.status_code == 401
 
 
-async def test_error_body_never_echoes_the_token(client: AsyncClient, keys: KeyPair) -> None:
-    token = _expired_token(keys)
+async def test_error_body_never_echoes_the_token(
+    client: AsyncClient, session_factory: async_sessionmaker[AsyncSession], keys: KeyPair
+) -> None:
+    token = await _expired_token(session_factory, keys)
     response = await client.post(
         "/tasks", json={"spec": "x"}, headers={**_auth(token), "Idempotency-Key": "k"}
     )
