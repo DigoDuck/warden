@@ -683,6 +683,17 @@ async def test_a_cancel_request_kills_a_long_running_tool_and_the_task_ends_canc
         # sandbox.destroy() in the worker's own `finally` force-removes whatever the cancel
         # watcher's kill left behind.
         assert client.containers.list(all=True, filters={"label": f"warden.task={task_id}"}) == []
+        # CANCELLED is terminal, so its workspace goes like any other terminal task's.
+        from warden.sandbox.docker import workspace_volume_name
+
+        with pytest.raises(docker_sdk.errors.NotFound):
+            client.volumes.get(workspace_volume_name(str(task_id)))
+
+        # The kill was the cancel's, not the command's own 30s deadline: nothing on record
+        # may say the command timed out.
+        executed = [e for e in await read_events(session, task_id) if e.type == "tool.executed"]
+        assert len(executed) == 1
+        assert "exceeded" not in str(executed[0].payload.get("output"))
 
         model_calls = await session.scalar(
             select(func.count()).select_from(ModelCall).where(ModelCall.task_id == task_id)
