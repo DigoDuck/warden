@@ -423,6 +423,8 @@ async def test_another_users_task_is_404_not_403(
     )
     response = await client.get(f"/tasks/{task_id}", headers=_auth(stranger_token))
     assert response.status_code == 404
+    events_response = await client.get(f"/tasks/{task_id}/events", headers=_auth(stranger_token))
+    assert events_response.status_code == 404
 
 
 async def test_an_admin_scope_sees_another_users_task(

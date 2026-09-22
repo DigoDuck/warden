@@ -16,8 +16,8 @@ agente. Esta ADR registra as decisões que não são óbvias a partir dessa fras
 ## Decisão
 
 **Autenticação: bearer JWT de usuário, emitido por `make user-token`, não por login.**
-`identity/jwt.py` (ADR-005) já emite e valida token de usuário; faltava só um jeito de um
-tem token na mão sem UI. `make user-token email=... scopes="..."` faz o-cria-se-não-existir do
+`identity/jwt.py` (ADR-005) já emite e valida token de usuário; faltava só um jeito de alguém
+ter um token na mão sem UI. `make user-token email=... scopes="..."` faz o-cria-se-não-existir do
 `users` e chama `identity.issue_user_token`. Alternativa descartada: escrever `/auth/login`
 agora. Não há tela para chamá-lo antes da semana 4, e um endpoint de senha sem UI de cadastro
 é herança que sobra sem uso; a linha de corte do projeto (briefing, "maior risco não é técnico")
@@ -73,13 +73,17 @@ em `(user_id, idempotency_key)`, que é migração de `models.py` e fica para qu
 **`GET /tasks/{id}/events` devolve o `payload` exatamente como gravado, e isso inclui argumento
 de tool sem redação.** `core/loop.py::_request_tools` grava `tool.requested` com
 `"arguments": call.arguments` completo — diferente de `tool_calls.args_safe`, que redige
-segredos (`core/events.py::redact_args`). Hoje isso não é um vazamento vivo: nada no desenho do
+segredos (`core/events.py::redact_args`). O mesmo vale para a saída de tool (`tool.completed`)
+e o `raw_content` do modelo: o log de eventos guarda exatamente o que o modelo viu e produziu,
+porque é disso que o replay precisa. Hoje isso não é um vazamento vivo: nada no desenho do
 projeto entrega segredo ao modelo (o broker nunca passa credencial para ele, briefing §10), então
-não há segredo para aparecer em `arguments` para começar. Mas é a fronteira que passaria a
+não há segredo para aparecer nesses campos para começar (ADR-018 tira os segredos
+do sandbox, e com isso do que as tools devolvem). Mas é a fronteira que passaria a
 importar no dia em que isso mudasse, e por isso `tasks:read` — não "sem autenticação" — guarda
 este endpoint.
 
 **Dependências novas, e por que nenhuma cabe na stdlib:**
+
 - `fastapi`: roteamento tipado sobre ASGI, validação Pydantic v2 na fronteira e OpenAPI de
   graça. Já é a escolha fechada do briefing (§11); esta PR só a instala.
 - `uvicorn[standard]`: servidor ASGI. O extra `[standard]` traz `httptools`/`watchfiles` (parse
@@ -93,6 +97,12 @@ este endpoint.
 colar um repositório inteiro) e `target_repo` até 512, o mesmo tamanho da coluna
 (`tasks.target_repo`, `String(512)`) — validar antes evita um erro feio de driver por string
 longa demais, em vez de um 422 legível.
+
+**Corpo do 422 sem o `input` rejeitado.** O handler padrão do FastAPI devolve o valor que falhou
+em cada erro. Isso reflete conteúdo da requisição na resposta (até 20.000 caracteres de `spec`
+hoje, uma senha quando `/auth/login` existir), e um `max_usd: Infinity`, que o parser JSON do
+Python aceita, nem serializa e vira 500. `create_app` troca o handler por um que devolve só
+`type`, `loc` e `msg`, o bastante para o cliente corrigir a requisição.
 
 ## Alternativas consideradas
 
