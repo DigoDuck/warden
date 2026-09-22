@@ -44,8 +44,18 @@ qualquer, então o broker herda de graça as garantias que `verify()` já fechou
 diverge da linha é recusado, `jti` revogado é recusado) em vez de reimplementar uma versão mais
 fraca delas.
 
-Duas checagens adicionais, deliberadamente redundantes com o que `verify()` já faz, porque o
-broker não pode assumir que todo chamador futuro passou por ele:
+Só que `Claims` é um dataclass comum: qualquer código monta um, e um `Claims` que `verify()`
+produziu de verdade continua vivo em memória depois que o token é revogado ou expira. Por isso o
+broker **relê a linha de `issued_tokens`** pelo `jti` (com `populate_existing`, a mesma armadilha
+de identity map que `verify()` documenta) e recusa se ela não existe, está revogada, já expirou,
+ou diverge da `Claims` em `subject`, `task_id` ou `scopes` (campos que nunca mudam depois de
+`_issue()`, então divergência só acontece com `Claims` forjada). Sem essa releitura, a contenção
+de incidente (`revoke_all_for_task`, briefing §25) só pararia as concessões quando o portador
+largasse a `Claims`, e uma `Claims` montada à mão com um scope colado passaria em tudo. É também
+o que dá sentido ao "TTL lógico" do item 17 do briefing: nenhuma concessão depois do `exp` ou da
+revogação do token de agente, checado na hora da chamada, não na hora do `verify()`.
+
+Mais duas checagens, baratas e em memória, antes da releitura:
 
 - **`typ == "agent"` e `task_id is not None`.** Um token de usuário nunca deveria trocar por
   credencial de terceiro; a UI autentica com o próprio login, não com um segredo de agente. Um
@@ -109,9 +119,9 @@ já faz para a chave privada de assinatura.
 
 **Rotação e escopo real por chamada do PAT do GitHub.** O `github_token` de hoje é um Personal
 Access Token único, com o escopo que ele tiver no GitHub, não um escopo que este control plane
-consiga restringir por baixo. "TTL lógico" (briefing item 17) significa que o broker controla
-por quanto tempo o *processo do agente* tem acesso ao valor, não que o token do GitHub em si
-expire nesse intervalo. Um GitHub App com token de instalação de curta duração fecharia essa
+consiga restringir por baixo. "TTL lógico" (briefing item 17) significa que o broker só concede
+enquanto o token de agente está vivo (não expirado, não revogado), não que o token do GitHub em
+si expire nesse intervalo: um `Credential` já entregue continua valendo o que o PAT vale. Um GitHub App com token de instalação de curta duração fecharia essa
 lacuna; fica registrado como o próximo passo óbvio, não implementado aqui.
 
 ## Alternativas consideradas
@@ -140,7 +150,11 @@ a partir de uma string de mensagem.
   call. Até lá, nada no sistema chama este módulo além dos próprios testes.
 - Toda concessão e toda recusa vira uma linha em `audit_log` (`credential.granted` /
   `credential.denied`), na mesma cadeia hash que `token.issued`/`token.revoked` já usam.
-  `audit.verify()` cobre estas linhas do mesmo jeito.
+  `audit.verify()` cobre estas linhas do mesmo jeito. A linha de recusa só é `flush`ada, dentro
+  da transação de quem chamou: se o gateway deixar a exceção desfazer essa transação, o registro
+  da recusa some junto. O chamador captura, faz commit e só então responde 403.
+- Cada chamada custa uma leitura por chave primária em `issued_tokens`, o preço de a revogação
+  valer na hora e não no próximo `verify()`.
 - `redact()` fica pronta e testada isolada; falta a wave 4 chamá-la de fato em `structlog` e em
   `task_events` antes que o item de checklist correspondente feche.
 - Um segundo segredo (segundo provedor, ou um GitHub App por instalação) adiciona um campo em

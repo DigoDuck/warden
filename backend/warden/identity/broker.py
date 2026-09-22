@@ -11,12 +11,15 @@ happens upstream when the token is issued (`identity.issue_agent_token`, on the 
 scope, get this one credential".
 """
 
+from datetime import UTC, datetime
+
 from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from warden import audit
 from warden.config import Settings, get_settings
 from warden.identity.jwt import Claims
+from warden.models import IssuedToken
 
 # The entire authorization surface for third-party credentials, in one place a reviewer can
 # read in a glance rather than trace through code. Each scope names exactly one setting on
@@ -93,7 +96,9 @@ async def get_credential(
     Every path, grant or refusal, appends exactly one audit row before returning or raising.
     None of them, and no exception message raised here, ever contains the secret value: the
     refusal reason is always one of a small fixed set of strings, never anything derived from
-    the credential itself.
+    the credential itself. The row is only flushed, into the caller's transaction: a caller
+    that lets a refusal exception roll that transaction back also rolls back the record of the
+    refusal, so catch it, commit, then answer 403.
 
     Same short-transaction rule as `identity.jwt._issue()`: `audit.append()` holds a
     transaction-scoped advisory lock until *this session's* transaction commits, so call this
@@ -119,6 +124,23 @@ async def get_credential(
     if claims.typ != "agent" or task_id is None:
         await deny("not a task-bound agent token")
         raise CredentialDenied("credential broker only serves task-bound agent claims")
+
+    # `Claims` is a plain dataclass: anyone can build one, and one that `verify()` really did
+    # produce keeps living in memory after its token is revoked or expires. So the broker asks
+    # the `issued_tokens` row again, the same way `verify()` does, instead of trusting the
+    # object it was handed. Without this, incident containment (`revoke_all_for_task`) would
+    # not stop grants until the holder dropped its `Claims`, and a hand-built one with scopes
+    # pasted on would pass every check above and below. populate_existing: same identity-map
+    # trap `verify()` documents, a revoke committed on another connection must be seen here.
+    row = await session.get(IssuedToken, claims.jti, populate_existing=True)
+    if row is None or row.revoked_at is not None or row.expires_at <= datetime.now(UTC):
+        await deny("token is not live")
+        raise CredentialDenied("token is unknown, revoked or expired")
+    # A row's subject, task and scopes never change after `_issue()`, so any difference here
+    # means these claims did not come from `verify()`.
+    if (row.subject, row.task_id, tuple(row.scopes)) != (claims.sub, claims.task_id, claims.scopes):
+        await deny("claims do not match the issued token")
+        raise CredentialDenied("claims do not match the issued token")
 
     if scope not in claims.scopes:
         await deny("scope not granted to this token")
