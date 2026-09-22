@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import viteConfig from "../../vite.config";
 import { apiFetch, ApiError, onUnauthorized } from "./client";
 import { clearToken, setToken } from "./token";
 
@@ -25,6 +26,25 @@ describe("apiFetch", () => {
     const [, init] = vi.mocked(fetch).mock.calls[0];
     const headers = new Headers(init?.headers);
     expect(headers.get("Authorization")).toBe("Bearer abc123");
+  });
+
+  it("calls the API same-origin under /api, not the backend's own origin", async () => {
+    // The backend has no CORS middleware, so a cross-origin call from the Vite dev server
+    // (localhost:5173 -> :8000) dies on the preflight. Same-origin + the dev proxy avoids it.
+    vi.mocked(fetch).mockResolvedValue(new Response("{}", { status: 200 }));
+
+    await apiFetch("/tasks/1");
+
+    expect(vi.mocked(fetch).mock.calls[0][0]).toBe("/api/tasks/1");
+  });
+
+  it("has the Vite dev server forward /api to the backend with the prefix stripped", () => {
+    const proxy = viteConfig.server?.proxy?.["/api"];
+    if (proxy === undefined || typeof proxy === "string") {
+      throw new Error(`expected an /api proxy object in vite.config.ts, got ${String(proxy)}`);
+    }
+    expect(proxy.target).toBe("http://127.0.0.1:8000");
+    expect(proxy.rewrite?.("/api/tasks/1/events")).toBe("/tasks/1/events");
   });
 
   it("sends no Authorization header when no token is stored", async () => {
