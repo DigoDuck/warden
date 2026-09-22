@@ -78,9 +78,7 @@ async def _beat(
         await asyncio.sleep(interval)
         try:
             async with session_factory() as session:
-                alive = await queue.heartbeat(
-                    session, task_id, holder, lease_seconds=lease_seconds
-                )
+                alive = await queue.heartbeat(session, task_id, holder, lease_seconds=lease_seconds)
                 await session.commit()
         except _TRANSIENT_DB_ERRORS:
             # One failed beat costs one interval; the lease is several intervals long. Dying
