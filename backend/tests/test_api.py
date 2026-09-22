@@ -274,6 +274,35 @@ async def test_the_same_idempotency_key_returns_the_same_task_once_created(
     assert count == 1
 
 
+async def test_another_users_idempotency_key_never_returns_their_task(
+    client: AsyncClient, session_factory: async_sessionmaker[AsyncSession], keys: KeyPair
+) -> None:
+    """The unique index on `idempotency_key` is global, not per user. Without an ownership
+    check, replaying someone else's key hands back their task, spec included.
+    """
+    key = str(uuid.uuid4())
+    owner_token = await _user_token(
+        session_factory, keys, await _user(session_factory), ["tasks:write"]
+    )
+    created = await client.post(
+        "/tasks",
+        json={"spec": "owner secret spec"},
+        headers={**_auth(owner_token), "Idempotency-Key": key},
+    )
+    assert created.status_code == 201
+
+    stranger_token = await _user_token(
+        session_factory, keys, await _user(session_factory), ["tasks:write"]
+    )
+    response = await client.post(
+        "/tasks", json={"spec": "mine"}, headers={**_auth(stranger_token), "Idempotency-Key": key}
+    )
+
+    assert response.status_code == 409
+    assert "owner secret spec" not in response.text
+    assert created.json()["id"] not in response.text
+
+
 # --- GET /tasks/{id}: ownership and 404-not-403 ---------------------------------------------
 
 

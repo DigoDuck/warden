@@ -96,6 +96,12 @@ async def submit_task(
         budget=budget,
     )
 
+    # The unique index on `idempotency_key` is global, not per user, so enqueue() hands back
+    # whoever's task already holds the key. Returning it would leak another user's task to
+    # anyone who guesses or reuses their key; 409 says "pick another key" and nothing else.
+    if task.user_id != user_id:
+        raise HTTPException(409, "idempotency key already used")
+
     # core.queue.enqueue only ever returns a Task, created or pre-existing, it does not say
     # which. Telling them apart without touching that module: Postgres serialises concurrent
     # inserts on `idempotency_key`'s unique index, so a second request with the same key

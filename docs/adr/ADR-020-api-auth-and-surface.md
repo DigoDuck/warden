@@ -62,6 +62,14 @@ a transação da primeira terminar), então, quando a segunda chega a este ponto
 primeira (se ela de fato committou) já existe. A pergunta "esta é a primeira vez?" tem sempre uma
 resposta correta no momento em que ela é feita.
 
+**Chave de idempotência de outro usuário: 409, nunca a tarefa dele.** O índice único de
+`tasks.idempotency_key` é global, não por usuário, então `enqueue()` devolve a tarefa de quem
+quer que já tenha usado a chave. Devolvê-la vazaria a tarefa (e o `spec`) de outro usuário para
+quem adivinhasse ou reutilizasse a chave. A rota compara `task.user_id` com o chamador e responde
+409 sem corpo útil. O 409 ainda confirma que a chave existe; aceitável, porque a chave é um valor
+aleatório escolhido pelo cliente e não identifica nada. O conserto de raiz seria um índice único
+em `(user_id, idempotency_key)`, que é migração de `models.py` e fica para quem for dono dele.
+
 **`GET /tasks/{id}/events` devolve o `payload` exatamente como gravado, e isso inclui argumento
 de tool sem redação.** `core/loop.py::_request_tools` grava `tool.requested` com
 `"arguments": call.arguments` completo — diferente de `tool_calls.args_safe`, que redige
