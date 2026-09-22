@@ -111,6 +111,17 @@ def test_an_invalid_max_seconds_falls_back_to_the_ceiling(bad: object) -> None:
     assert merge_budget(bounded, {"max_seconds": bad}).max_seconds == 60.0
 
 
+@pytest.mark.parametrize("bad", [float("inf"), float("nan"), 10**400])
+def test_a_non_finite_or_unrepresentable_max_seconds_keeps_an_unbounded_ceiling(
+    bad: object,
+) -> None:
+    """JSONB stores any numeric, and `json.loads` hands a 400-digit one back as a Python int
+    that `float()` cannot represent: it must degrade to "not set" like any other bad value,
+    not raise out of `Worker.run_once` and strand the claimed task RUNNING until its lease
+    runs out, only for the next worker to claim it and crash the same way."""
+    assert merge_budget(DEFAULT, {"max_seconds": bad}).max_seconds is None
+
+
 # --- Worker.run_once wiring, end to end -----------------------------------------------------
 #
 # Needs a real container (`build_registry` gives the loop a real `list_files` tool bound to
