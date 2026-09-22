@@ -14,7 +14,7 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from warden.core import cancel, queue
+from warden.core import cancel, events, queue
 from warden.core.events import read_events
 from warden.models import Task, User
 
@@ -185,3 +185,44 @@ async def test_cancel_racing_claim_never_lets_the_worker_win_a_task_that_was_can
             assert claimed is True
             assert row.status == "RUNNING"
             assert row.cancel_requested_at is not None
+
+
+async def test_a_cancel_landing_while_the_worker_holds_an_uncommitted_event_does_not_collide(
+    session: AsyncSession, session_factory: async_sessionmaker[AsyncSession]
+) -> None:
+    """`request_cancel` is the first writer to a RUNNING task's event log that is not the
+    worker running it. Replays the exact shape of a checkpoint (ADR-019): the worker has an
+    event flushed but not committed, then fences with `verify_holder` before committing,
+    and the cancel arrives in between. With `seq` allocated as an unlocked max+1 the two
+    pick the same `seq`: the cancel waits on the unique index for the worker's transaction,
+    the worker's `FOR UPDATE` waits on the cancel's row lock, and Postgres kills one of them
+    as a deadlock. Either loser is a bug: a crashed worker or a failed cancel request.
+    """
+    user = await _a_user(session)
+    task = await queue.enqueue(
+        session, user_id=user.id, spec="x", idempotency_key=str(uuid.uuid4())
+    )
+    await session.commit()
+    await queue.claim(session, "worker-a")
+    await session.commit()
+    task_id = task.id
+
+    async def do_cancel() -> cancel.CancelOutcome:
+        async with session_factory() as own:
+            outcome = await cancel.request_cancel(own, task_id)
+            await own.commit()
+            return outcome
+
+    async with session_factory() as worker_session:
+        await events.append_event(worker_session, task_id, events.ITERATION_STARTED, {"n": 1})
+        cancelling = asyncio.create_task(do_cancel())
+        # Long enough for the cancel to reach the database and block on whatever it blocks
+        # on; the worker's fence then has to get through regardless.
+        await asyncio.sleep(0.5)
+        assert await queue.verify_holder(worker_session, task_id, "worker-a")
+        await worker_session.commit()
+
+    outcome = await asyncio.wait_for(cancelling, timeout=10)
+    assert outcome is cancel.CancelOutcome.MARKED
+    rows = await read_events(session, task_id)
+    assert [(e.seq, e.type) for e in rows] == [(1, "iteration.started"), (2, "cancel.requested")]

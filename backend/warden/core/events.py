@@ -12,7 +12,7 @@ from decimal import Decimal
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from warden.models import ModelCall, PolicyDecision, TaskEvent, ToolCall
@@ -59,11 +59,21 @@ async def append_event(
 ) -> TaskEvent:
     """Append one event, allocating the next `seq` for this task.
 
-    ponytail: seq comes from max(seq)+1, which is only safe while one process writes a given
-    task. That holds in week 1 (the demo runs the loop in-process) and the
-    UNIQUE(task_id, seq) constraint turns a violation into an error rather than a silent
-    overwrite. Week 2 replaces this with allocation under the queue claim.
+    `seq` is max(seq)+1, allocated under a lock on the task's row. The lock is what makes
+    that safe with more than one writer per task, which ADR-021 introduced: a cancel request
+    appends `cancel.requested` from its own session while the worker is mid-run. Unlocked,
+    both read the same max from their snapshots and pick the same `seq`; the second then
+    waits on the unique index for the first's transaction, and when the first is a worker
+    about to fence its checkpoint (`queue.verify_holder`'s `FOR UPDATE`, which waits on the
+    cancel's row lock), Postgres breaks the cycle by killing one of them as a deadlock.
+    Taking the row lock *first* orders every writer on the same lock before anyone touches
+    the index, and the max below is read by a fresh statement after the wait, so it sees
+    whatever the previous holder committed. `NO KEY UPDATE` rather than `UPDATE`: enough to
+    serialise writers, while still letting other tables' foreign-key checks through.
     """
+    await session.execute(
+        text("SELECT 1 FROM tasks WHERE id = :task_id FOR NO KEY UPDATE"), {"task_id": task_id}
+    )
     highest = await session.scalar(
         select(func.max(TaskEvent.seq)).where(TaskEvent.task_id == task_id)
     )
