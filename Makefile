@@ -1,8 +1,10 @@
-.PHONY: db-up db-down migrate revision test lint fmt sandbox-image demo-fake demo worker keys api user-token
+.PHONY: db-up db-down migrate revision test lint fmt sandbox-image demo-fake demo worker keys api user-token frontend-install frontend-dev frontend-test
 
 # --directory avoids "cd backend &&", which breaks when the Windows make picks
 # cmd.exe instead of sh. Each recipe stays a single command.
 UV := uv run --directory backend
+# --prefix, same reason: no "cd frontend &&" to break under cmd.exe.
+NPM := npm --prefix frontend
 
 db-up:
 	docker compose up -d db
@@ -61,3 +63,15 @@ api:
 # that line along with the token.
 user-token:
 	@$(UV) python -m warden.api.user_token --email "$(email)" --scopes $(scopes)
+
+# `npm ci` matches CI/package-lock.json exactly, unlike `npm install`.
+frontend-install:
+	$(NPM) ci
+
+# gen:api (npm's predev hook) needs the backend's dependencies installed and importable:
+# run `uv sync --directory backend` first if this fails.
+frontend-dev:
+	$(NPM) run dev
+
+frontend-test:
+	$(NPM) test -- --run
