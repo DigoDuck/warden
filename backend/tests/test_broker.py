@@ -33,6 +33,10 @@ def _settings_with(token: str) -> Settings:
     plugin configured here) types the field as `SecretStr`, not `SecretStr | str`, even though
     the runtime validator happily coerces a plain string. One explicit wrapper, not a plugin
     just for this.
+
+    Always pass the token explicitly, `""` included: a bare `Settings()` reads GITHUB_TOKEN
+    from the developer's environment and `.env`, so the "unconfigured" tests would go red (and
+    run against a real token) on exactly the machine that has one configured.
     """
     return Settings(github_token=SecretStr(token))
 
@@ -162,7 +166,7 @@ async def test_refuse_unknown_scope(session: AsyncSession) -> None:
 
 async def test_refuse_when_unconfigured(session: AsyncSession) -> None:
     claims = _agent_claims(scopes=("github:pr:open",))
-    settings = Settings()  # github_token defaults to empty
+    settings = _settings_with("")
 
     with pytest.raises(broker.SecretNotConfigured):
         await broker.get_credential(session, claims, "github:pr:open", settings=settings)
@@ -172,7 +176,7 @@ async def test_refuse_when_unconfigured(session: AsyncSession) -> None:
 
 
 _CONFIGURED = _settings_with(FAKE_TOKEN)
-_UNCONFIGURED = Settings()  # github_token defaults to empty
+_UNCONFIGURED = _settings_with("")
 
 _REFUSAL_CASES = [
     # (claims overrides, requested scope, settings, expected exception)
@@ -238,7 +242,7 @@ def test_redact_replaces_the_configured_secret() -> None:
 
 
 def test_redact_leaves_text_alone_when_no_secret_is_configured() -> None:
-    settings = Settings()  # empty github_token
+    settings = _settings_with("")
     text = "nothing sensitive here"
 
     assert broker.redact(text, settings=settings) == text
