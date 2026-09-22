@@ -667,7 +667,13 @@ async def test_a_cancel_request_kills_a_long_running_tool_and_the_task_ends_canc
         cancel_requested_at = loop_time()
         killed_after: float | None = None
         while loop_time() < cancel_requested_at + 10:
-            container.reload()
+            # On a fast daemon (CI) the watcher kills it, the loop finishes CANCELLED and the
+            # worker's `finally` removes it before this first poll: gone counts as dead too.
+            try:
+                container.reload()
+            except docker_sdk.errors.NotFound:
+                killed_after = loop_time() - cancel_requested_at
+                break
             if container.status != "running":
                 killed_after = loop_time() - cancel_requested_at
                 break
