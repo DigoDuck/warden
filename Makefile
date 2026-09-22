@@ -57,5 +57,7 @@ api:
 
 # Mints a user JWT for manual testing, e.g.:
 #   TOKEN=$(make user-token email=you@example.com scopes="tasks:write tasks:read audit:read")
+# The leading @ matters: without it make echoes the recipe line to stdout and $(...) captures
+# that line along with the token.
 user-token:
-	$(UV) python -m warden.api.user_token --email "$(email)" --scopes $(scopes)
+	@$(UV) python -m warden.api.user_token --email "$(email)" --scopes $(scopes)
