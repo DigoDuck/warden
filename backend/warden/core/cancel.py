@@ -33,9 +33,11 @@ class CancelOutcome(StrEnum):
 # `status` as the row stood *before* this UPDATE (Postgres evaluates a statement's SET list
 # against the pre-image, never against a column the same statement is in the middle of
 # changing), and `claim()`'s own UPDATE takes the same row lock this one does, so the two can
-# never both act on a status the other has already changed out from under them. Whichever
-# commits first is the one whose branch actually ran; the loser's WHERE clause re-reads the
-# new status and simply stops matching, same shape as `queue._CLAIM`/`_HEARTBEAT`.
+# never both act on a status the other has already changed out from under them. If claim
+# holds the lock first, this UPDATE waits, then re-evaluates WHERE and SET against the row
+# claim committed: it now reads RUNNING and sets the marker instead. If this one goes first,
+# claim's `SKIP LOCKED` passes the row over and then finds it CANCELLED. Same shape as
+# `queue._CLAIM`/`_HEARTBEAT`.
 _REQUEST_CANCEL = text("""
     UPDATE tasks
        SET status = CASE WHEN status = 'QUEUED' THEN 'CANCELLED' ELSE status END,

@@ -51,9 +51,10 @@ Uma instrução só, não "ler status, decidir, escrever": o Postgres avalia tod
 de um `UPDATE` contra a imagem *anterior* da linha, nunca contra uma coluna que a mesma
 instrução está no meio de mudar, então os dois ramos (QUEUED e RUNNING) nunca podem
 enxergar um `status` que já mudou por conta própria. Isso é o que torna a operação
-race-safe contra `queue.claim()`: as duas tomam o lock da mesma linha, e quem commita
-primeiro é quem decide; a outra relê o `status` novo e o `WHERE` simplesmente para de
-casar. `tests/test_cancel.py::
+race-safe contra `queue.claim()`: as duas tomam o lock da mesma linha, e quem pega o lock
+primeiro é quem decide. Se o claim vem antes, este `UPDATE` espera, reavalia `WHERE` e `SET`
+contra a linha que o claim commitou, lê `RUNNING` e seta o marcador. Se o cancel vem antes,
+o `SKIP LOCKED` do claim pula a linha e depois a encontra `CANCELLED`. `tests/test_cancel.py::
 test_cancel_racing_claim_never_lets_the_worker_win_a_task_that_was_cancelled` roda as duas
 de verdade, concorrentes, e prova que não existe terceiro resultado (reivindicada sem
 marcador e sem cancelamento registrado).
@@ -61,6 +62,27 @@ marcador e sem cancelamento registrado).
 `COALESCE` faz um segundo pedido de cancelamento ser idempotente: não empurra o timestamp
 para frente. Um evento `cancel.requested` é gravado a cada pedido de qualquer forma, para
 auditoria de quantas vezes foi pedido; só o timestamp em si não se move.
+
+### Dois escritores no mesmo log de eventos: `seq` sob lock da linha da tarefa
+
+`cancel.requested` é o primeiro evento gravado por alguém que não é o worker dono da
+tarefa, e isso quebrou uma premissa antiga de `events.append_event`: `seq` era
+`max(seq)+1` sem lock, seguro só com um escritor por tarefa. Com dois, os dois leem o mesmo
+máximo e escolhem o mesmo `seq`. O cancel então espera no índice único pela transação do
+worker, e o worker, no fence do checkpoint (`queue.verify_holder`, `FOR UPDATE`), espera
+pelo lock de linha que o `UPDATE` do cancel já tomou. É um deadlock de verdade: o Postgres
+mata um dos dois, e qualquer perdedor é um bug (worker que cai no meio do run, ou pedido de
+cancelamento que falha). `test_cancel.py::test_a_cancel_landing_while_the_worker_holds_an_
+uncommitted_event_does_not_collide` reproduz a sequência exata e ficou vermelho antes da
+correção com `DeadlockDetectedError`.
+
+A correção: `append_event` toma `SELECT 1 FROM tasks WHERE id = :id FOR NO KEY UPDATE`
+antes de ler o máximo. Todo escritor passa a se ordenar no mesmo lock antes de tocar o
+índice, e o `max` é lido por uma instrução nova depois da espera, então enxerga o que o
+anterior commitou. `NO KEY UPDATE` basta para serializar escritores sem bloquear as checagens
+de chave estrangeira de outras tabelas. O custo é uma query a mais por evento e o heartbeat
+esperando, por milissegundos, entre um `append_event` e o checkpoint seguinte, janelas que o
+ADR-019 já mantém curtas (nada lento roda com evento não commitado).
 
 Uma tarefa já terminal, ou um id desconhecido, não é exceção: `CancelOutcome` tem os quatro
 resultados (`CANCELLED`, `MARKED`, `ALREADY_TERMINAL`, `NOT_FOUND`) porque um cancelamento
