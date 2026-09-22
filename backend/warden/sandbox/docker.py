@@ -402,6 +402,24 @@ class Sandbox:
             self._container.start()
         self._wait_until_started()
 
+    async def kill_for_cancel(self) -> None:
+        """Kill the container promptly and leave it dead, for a cancel request.
+
+        Deliberately not `_kill_sync`: that one restarts the container, because a command
+        that merely overran its own `kill_after` still has the rest of the task ahead of it
+        and needs a live container to keep going. A cancelled task has no "rest of the
+        task" — the loop is about to finish it, and `Worker.run_once` destroys this sandbox
+        right after — so restarting here would be wasted work racing that teardown, and the
+        container would briefly look alive again for no one. Reuses `_wait_until_stopped`
+        unchanged: same wait, just without the `start()` that follows it in `_kill_sync`.
+        """
+        await asyncio.to_thread(self._kill_for_cancel_sync)
+
+    def _kill_for_cancel_sync(self) -> None:
+        with contextlib.suppress(NotFound, docker.errors.APIError):
+            self._container.kill()
+        self._wait_until_stopped()
+
     def _wait_until_stopped(self) -> None:
         """Poll until the container is confirmed dead, or give up and report nothing.
 

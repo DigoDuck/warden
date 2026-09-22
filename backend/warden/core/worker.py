@@ -22,7 +22,7 @@ from collections.abc import Callable
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from warden.config import get_settings
-from warden.core import events, queue
+from warden.core import cancel, events, queue
 from warden.core.loop import Budget, RunResult, run_task
 from warden.core.replay import ResumeState, rebuild
 from warden.db import make_engine, make_session_factory
@@ -35,6 +35,9 @@ from warden.tools.sandboxed import build_registry
 
 HEARTBEAT_FRACTION = 0.4
 IDLE_POLL_SECONDS = 1.0
+# Fast on purpose, unlike the heartbeat: a lease is minutes long, but a cancelled task has
+# to stop within a few seconds of the request, not within a fraction of the lease.
+CANCEL_POLL_SECONDS = 1.0
 
 # States a task does not come back from. Only then is its workspace thrown away: a task
 # merely between workers still needs whatever it changed before it was interrupted.
@@ -73,6 +76,29 @@ async def _beat(
         if not alive:
             # The task was reclaimed by someone else. Stop beating; the run will finish and
             # find it no longer owns the row.
+            return
+
+
+async def _watch_cancel(
+    session_factory: async_sessionmaker[AsyncSession], task_id: uuid.UUID, sandbox: Sandbox
+) -> None:
+    """Kill the sandbox the moment a cancel is requested, instead of waiting for whatever
+    deadline the in-flight command was given.
+
+    A sibling to `_beat`, not folded into it, for the same reason it polls faster: the two
+    exist to answer different questions on different clocks. `_beat` extends a lease that is
+    minutes long; this has to notice within a few seconds. `core/loop.py::_check_stoppable`
+    is what actually ends the *task* once it notices the marker; this only makes sure a long
+    `run_command`/`run_tests` already in flight does not sit there until its own timeout
+    before the loop gets a turn to check anything. Cancelled the same way `_beat` is, from
+    `run_once`'s `finally`, once the task has actually finished.
+    """
+    while True:
+        await asyncio.sleep(CANCEL_POLL_SECONDS)
+        async with session_factory() as session:
+            requested = await cancel.is_requested(session, task_id)
+        if requested:
+            await sandbox.kill_for_cancel()
             return
 
 
@@ -161,6 +187,7 @@ class Worker:
             # What a deny rule names never enters the container (ADR-018).
             exclude=never_readable(self._policy),
         )
+        watcher = asyncio.create_task(_watch_cancel(self._sessions, task_id, sandbox))
         lease_lost = False
         try:
             async with self._sessions() as session:
@@ -191,6 +218,9 @@ class Worker:
             beat.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await beat
+            watcher.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await watcher
             # The container always goes. The workspace only goes when the task is over: a
             # task between workers still needs what it changed before it was interrupted.
             await sandbox.destroy()
