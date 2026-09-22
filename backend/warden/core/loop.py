@@ -19,7 +19,7 @@ from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from warden.core import events, queue
+from warden.core import cancel, events, queue
 from warden.core.replay import ResumeState
 from warden.models import Task, User
 from warden.policy.engine import Decision, Effect, Policy, PolicyContext, UserRef, combine
@@ -54,6 +54,10 @@ class Budget:
 
     max_iterations: int = 10
     max_usd: Decimal = Decimal("0.25")
+    # Wall clock, not CPU or model time: None means no deadline, same as today. Measured
+    # from `task.started_at`, which a resume never resets (queue.claim only COALESCEs it),
+    # so a task that crashes and comes back does not get a fresh clock along with it.
+    max_seconds: float | None = None
 
 
 @dataclass
@@ -63,6 +67,49 @@ class RunResult:
     cost_usd: Decimal
     summary: str | None = None
     reason: str | None = None
+
+
+def _now() -> datetime:
+    """The one clock the loop reads from. A thin wrapper so a test can freeze or fast
+    forward time with `monkeypatch.setattr`, instead of a real `asyncio.sleep` making the
+    max_seconds tests slow and, on a loaded CI box, flaky in the other direction."""
+    return datetime.now(UTC)
+
+
+class _RunStopped(Exception):
+    """Ends a run early with a specific terminal status.
+
+    Raised from deep inside a checkpoint or a tool execution (`_check_stoppable`,
+    `_run_tools`), where returning a sentinel up through every intermediate caller would be
+    noisier than raising once and catching it where the run actually ends, in `run_task`.
+    Two independent stop conditions share this one shape, cancellation and the max_seconds
+    deadline, because both have to win against "keep going" at exactly the same two points:
+    before the next model call, and before the next tool.
+    """
+
+    def __init__(self, status: str, reason: str) -> None:
+        self.status = status
+        self.reason = reason
+        super().__init__(f"{status}: {reason}")
+
+
+async def _check_stoppable(session: AsyncSession, task: Task, budget: Budget) -> None:
+    """Cooperative cancellation (briefing §16) and the wall-clock half of the timeout.
+
+    Cancellation is read fresh from the database on every call: the request lands in
+    another session entirely (another API request, another worker's heartbeat task), and
+    the only way this run finds out is by asking. The deadline needs no such query;
+    `task.started_at` was set once, in this same process, and never mutated afterwards, so
+    comparing it against `_now()` is pure Python.
+    """
+    if await cancel.is_requested(session, task.id):
+        raise _RunStopped("CANCELLED", "cancel requested")
+    if budget.max_seconds is not None and task.started_at is not None:
+        elapsed = (_now() - task.started_at).total_seconds()
+        if elapsed > budget.max_seconds:
+            raise _RunStopped(
+                "TIMED_OUT", f"reached max_seconds ({budget.max_seconds}) after {elapsed:.0f}s"
+            )
 
 
 def _refusal_message(decision: Decision) -> str:
@@ -168,7 +215,7 @@ async def run_task(
     if resume is None:
         messages: list[Message] = [UserMessage(text=task.spec)]
         first_iteration = 1
-        task.started_at = datetime.now(UTC)
+        task.started_at = _now()
         await events.append_event(
             session,
             task.id,
@@ -182,7 +229,15 @@ async def run_task(
     else:
         messages = list(resume.messages)
         first_iteration = resume.next_iteration
-        if resume.is_mid_iteration:
+
+    # Tracks which iteration to blame in the report if `_RunStopped` cuts the run short
+    # (cancellation, or the max_seconds deadline) before the for-loop below ever assigns its
+    # own `iteration`, which happens whenever the interrupted resume block right below is
+    # itself what gets stopped.
+    current_iteration = first_iteration
+
+    try:
+        if resume is not None and resume.is_mid_iteration:
             # The interrupted iteration is finished, not restarted: its assistant turn is
             # already in the messages and its tool_use blocks are still unanswered. Running
             # only the calls that never executed is what keeps "no tool runs twice" true.
@@ -203,127 +258,154 @@ async def run_task(
                 user_ref,
                 workspace,
                 holder,
+                task,
+                budget,
             )
             # Results already obtained travel with the new ones: the API wants every
             # tool_use from a turn answered in a single message.
             messages.append(ToolResultsMessage(results=[*resume.partial_results, *fresh]))
             first_iteration += 1
+            current_iteration = first_iteration
 
-    for iteration in range(first_iteration, budget.max_iterations + 1):
-        await events.append_event(session, task.id, events.ITERATION_STARTED, {"n": iteration})
-        # No transaction is held across a model call. An uncommitted `task_events` row holds
-        # a key-share lock on its task through the foreign key, and `claim()` skips locked
-        # rows, so a worker hung inside a provider call that never returns would keep its
-        # task unclaimable long after the lease expired: the lease would only protect against
-        # workers that die, not against ones that hang, which is the likelier failure for a
-        # network call. Committing here leaves nothing open while the process waits.
-        await _checkpoint(session, task.id, holder)
-
-        completion = await provider.generate(messages, tools=tool_schemas, system=SYSTEM_PROMPT)
-        cost = await events.record_model_call(session, task.id, completion)
-        spent += cost
-        await events.append_event(
-            session,
-            task.id,
-            events.MODEL_CALLED,
-            {
-                "model": completion.model,
-                "stop_reason": completion.stop_reason,
-                "tokens_in": completion.usage.input_tokens,
-                "tokens_out": completion.usage.output_tokens,
-                "cost_usd": str(cost),
-                # Verbatim, because ADR-016 says the assistant turn goes back to the
-                # provider exactly as it came. This is the field that makes replay possible
-                # at all, and without it the conversation cannot be rebuilt after a crash.
-                "raw_content": completion.raw_content,
-            },
-        )
-
-        # Checked straight after billing, so an expensive turn cannot be followed by
-        # another one. Stopping before the next model call is the whole point. Every branch
-        # below that ends the run goes through `_finish`, which is checkpoint (e) and covers
-        # this `model.called` too: nothing about ending a run needs its own separate commit.
-        if spent > budget.max_usd:
-            return await _finish(
-                session,
-                task,
-                "BUDGET_EXCEEDED",
-                iteration,
-                spent,
-                holder,
-                reason=f"spent {spent} over the {budget.max_usd} ceiling",
-            )
-
-        if completion.stop_reason == "refusal":
-            detail = completion.refusal.explanation if completion.refusal else None
-            return await _finish(
-                session, task, "FAILED", iteration, spent, holder, reason=f"model refused: {detail}"
-            )
-
-        if completion.stop_reason not in ("tool_use", "pause_turn", "end_turn"):
-            # max_tokens, stop_sequence and model_context_window_exceeded all mean the turn
-            # cannot be continued as it is. Failing names which one, rather than looping.
-            return await _finish(
-                session,
-                task,
-                "FAILED",
-                iteration,
-                spent,
-                holder,
-                reason=f"unusable stop_reason: {completion.stop_reason}",
-            )
-
-        messages.append(AssistantMessage(raw_content=completion.raw_content))
-
-        if completion.stop_reason == "pause_turn":
-            # The model paused mid-turn; resending the history continues it. The turn was
-            # paid for like any other, so it is made durable like any other: left to ride
-            # along with the next checkpoint, a crash during the following model call would
-            # buy this one again.
+        for iteration in range(first_iteration, budget.max_iterations + 1):
+            current_iteration = iteration
+            # Cooperative cancellation and the wall-clock deadline (briefing §16), both
+            # checked here at the top of every iteration and again inside `_run_tools`
+            # before every tool: a cancelled or expired run must not start another model
+            # call, which is exactly what stopping *here*, before `provider.generate`,
+            # guarantees.
+            await _check_stoppable(session, task, budget)
+            await events.append_event(session, task.id, events.ITERATION_STARTED, {"n": iteration})
+            # No transaction is held across a model call. An uncommitted `task_events` row
+            # holds a key-share lock on its task through the foreign key, and `claim()`
+            # skips locked rows, so a worker hung inside a provider call that never returns
+            # would keep its task unclaimable long after the lease expired: the lease would
+            # only protect against workers that die, not against ones that hang, which is
+            # the likelier failure for a network call. Committing here leaves nothing open
+            # while the process waits.
             await _checkpoint(session, task.id, holder)
-            continue
 
-        if completion.stop_reason == "end_turn":
-            # The model stopped talking without calling `finish`. The summary is whatever it
-            # said, and the task is done rather than stuck.
-            return await _finish(
-                session, task, "SUCCEEDED", iteration, spent, holder, summary=completion.text
+            completion = await provider.generate(messages, tools=tool_schemas, system=SYSTEM_PROMPT)
+            cost = await events.record_model_call(session, task.id, completion)
+            spent += cost
+            await events.append_event(
+                session,
+                task.id,
+                events.MODEL_CALLED,
+                {
+                    "model": completion.model,
+                    "stop_reason": completion.stop_reason,
+                    "tokens_in": completion.usage.input_tokens,
+                    "tokens_out": completion.usage.output_tokens,
+                    "cost_usd": str(cost),
+                    # Verbatim, because ADR-016 says the assistant turn goes back to the
+                    # provider exactly as it came. This is the field that makes replay
+                    # possible at all, and without it the conversation cannot be rebuilt
+                    # after a crash.
+                    "raw_content": completion.raw_content,
+                },
             )
 
-        finish_call = next(
-            (call for call in completion.tool_calls if call.name == FINISH_TOOL), None
+            # Checked straight after billing, so an expensive turn cannot be followed by
+            # another one. Stopping before the next model call is the whole point. Every
+            # branch below that ends the run goes through `_finish`, which is checkpoint
+            # (e) and covers this `model.called` too: nothing about ending a run needs its
+            # own separate commit.
+            if spent > budget.max_usd:
+                return await _finish(
+                    session,
+                    task,
+                    "BUDGET_EXCEEDED",
+                    iteration,
+                    spent,
+                    holder,
+                    reason=f"spent {spent} over the {budget.max_usd} ceiling",
+                )
+
+            if completion.stop_reason == "refusal":
+                detail = completion.refusal.explanation if completion.refusal else None
+                return await _finish(
+                    session,
+                    task,
+                    "FAILED",
+                    iteration,
+                    spent,
+                    holder,
+                    reason=f"model refused: {detail}",
+                )
+
+            if completion.stop_reason not in ("tool_use", "pause_turn", "end_turn"):
+                # max_tokens, stop_sequence and model_context_window_exceeded all mean the
+                # turn cannot be continued as it is. Failing names which one, rather than
+                # looping.
+                return await _finish(
+                    session,
+                    task,
+                    "FAILED",
+                    iteration,
+                    spent,
+                    holder,
+                    reason=f"unusable stop_reason: {completion.stop_reason}",
+                )
+
+            messages.append(AssistantMessage(raw_content=completion.raw_content))
+
+            if completion.stop_reason == "pause_turn":
+                # The model paused mid-turn; resending the history continues it. The turn
+                # was paid for like any other, so it is made durable like any other: left
+                # to ride along with the next checkpoint, a crash during the following
+                # model call would buy this one again.
+                await _checkpoint(session, task.id, holder)
+                continue
+
+            if completion.stop_reason == "end_turn":
+                # The model stopped talking without calling `finish`. The summary is
+                # whatever it said, and the task is done rather than stuck.
+                return await _finish(
+                    session, task, "SUCCEEDED", iteration, spent, holder, summary=completion.text
+                )
+
+            finish_call = next(
+                (call for call in completion.tool_calls if call.name == FINISH_TOOL), None
+            )
+            if finish_call is not None:
+                # Handled by core rather than dispatched, so it carries no policy decision,
+                # and deliberately no `tool.requested`/`tool.executed` event either: replay
+                # derives "still pending" as requested-minus-executed, and `finish` is
+                # never registered in the tool registry, so a `tool.requested` for it with
+                # no matching `tool.executed` would make a resumed run try to dispatch a
+                # tool that does not exist. The `tool_calls` row still exists for the audit
+                # trail; only the event-log/replay side treats it as nothing rather than as
+                # pending.
+                await events.record_tool_call(
+                    session, task.id, iteration, finish_call, decision="allow"
+                )
+                summary = str(finish_call.arguments.get("summary", "")) or completion.text
+                return await _finish(
+                    session, task, "SUCCEEDED", iteration, spent, holder, summary=summary
+                )
+
+            # Checkpoint (b): every tool.requested for this turn, committed together with
+            # the model.called above.
+            await _request_tools(session, task.id, completion.tool_calls, holder)
+            results = await _run_tools(
+                session,
+                task.id,
+                iteration,
+                completion.tool_calls,
+                registry,
+                policy,
+                user_ref,
+                workspace,
+                holder,
+                task,
+                budget,
+            )
+            messages.append(ToolResultsMessage(results=results))
+    except _RunStopped as stopped:
+        return await _finish(
+            session, task, stopped.status, current_iteration, spent, holder, reason=stopped.reason
         )
-        if finish_call is not None:
-            # Handled by core rather than dispatched, so it carries no policy decision, and
-            # deliberately no `tool.requested`/`tool.executed` event either: replay derives
-            # "still pending" as requested-minus-executed, and `finish` is never registered
-            # in the tool registry, so a `tool.requested` for it with no matching
-            # `tool.executed` would make a resumed run try to dispatch a tool that does not
-            # exist. The `tool_calls` row still exists for the audit trail; only the
-            # event-log/replay side treats it as nothing rather than as pending.
-            await events.record_tool_call(
-                session, task.id, iteration, finish_call, decision="allow"
-            )
-            summary = str(finish_call.arguments.get("summary", "")) or completion.text
-            return await _finish(
-                session, task, "SUCCEEDED", iteration, spent, holder, summary=summary
-            )
-
-        # Checkpoint (b): every tool.requested for this turn, committed together with the
-        # model.called above.
-        await _request_tools(session, task.id, completion.tool_calls, holder)
-        results = await _run_tools(
-            session,
-            task.id,
-            iteration,
-            completion.tool_calls,
-            registry,
-            policy,
-            user_ref,
-            workspace,
-            holder,
-        )
-        messages.append(ToolResultsMessage(results=results))
 
     return await _finish(
         session,
@@ -405,6 +487,8 @@ async def _run_tools(
     user: UserRef,
     workspace: pathlib.Path,
     holder: str | None,
+    task: Task,
+    budget: Budget,
 ) -> list[ToolResult]:
     """Decide on every call, execute the allowed ones, and answer all of them.
 
@@ -417,9 +501,23 @@ async def _run_tools(
     deny is on record even if the process dies next; then execution; then `tool.executed`
     together with its `tool_calls`/`policy_decisions` rows, checkpoint (d), so a completed
     tool is never mistaken for one still pending.
+
+    Two more checks bracket each call's execution, both raising `_RunStopped` straight out
+    of this function rather than returning a partial result for `run_task` to notice: a call
+    already mid-batch here can be the last one `_request_tools` requested, so there is no
+    "next call" left for a caller-side check to run before.
+
+    - Before deciding: cancellation and the max_seconds deadline (`_check_stoppable`), so a
+      call that has not started yet never does.
+    - After executing: cancellation only, in case the call now running is the one a cancel
+      arrives *during*. `worker.py`'s cancel watcher kills the sandbox out from under it to
+      make that fast, and this is what notices the kill was for a cancellation rather than
+      a genuine failure and stops the batch instead of feeding a next tool a dead container.
     """
     results: list[ToolResult] = []
     for call in calls:
+        await _check_stoppable(session, task, budget)
+
         decision, judged_paths = await _decide(call, registry, policy, user, task_id)
         await events.append_event(
             session,
@@ -449,6 +547,16 @@ async def _run_tools(
                 # model sees the message and corrects itself on the next turn.
                 output = str(exc)
                 error = str(exc)
+            except Exception:
+                # Nothing about a normal tool failure reaches here; `ToolError` already
+                # caught that. The only thing that kills a sandbox out from under an
+                # in-flight call is `worker.py`'s cancel watcher, so confirm that is really
+                # what happened before trusting it: anything else raising through this path
+                # is a genuine bug and has to surface as one, not get silently relabelled.
+                if not await cancel.is_requested(session, task_id):
+                    raise
+                output = "cancelled: the sandbox was killed to satisfy a cancel request"
+                error = output
         else:
             # The tool never runs. require_approval degrades to a refusal until week 3
             # builds the approval machinery, which errs on the restrictive side.
@@ -487,6 +595,12 @@ async def _run_tools(
         await _checkpoint(session, task_id, holder)
 
         results.append(ToolResult(tool_call_id=call.id, content=output, is_error=error is not None))
+
+        # Whatever this call's outcome was, clean, refused, errored or force-killed, a
+        # cancel that landed while it ran must not let the batch move on to another tool or
+        # hand this turn's results back for one more model call.
+        if await cancel.is_requested(session, task_id):
+            raise _RunStopped("CANCELLED", "cancel requested while a tool was running")
     return results
 
 
@@ -503,7 +617,7 @@ async def _finish(
 ) -> RunResult:
     task.status = status
     task.spent = {"usd": str(spent)}
-    task.finished_at = datetime.now(UTC)
+    task.finished_at = _now()
     await events.append_event(
         session,
         task.id,

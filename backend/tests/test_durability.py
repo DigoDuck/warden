@@ -24,7 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from tests.conftest import TEST_DB
 from tests.fake_tools import FakeWorkspace
 from warden.config import get_settings
-from warden.core import queue
+from warden.core import cancel, queue
 from warden.core.events import read_events
 from warden.core.loop import Budget, run_task
 from warden.core.loop import _finish as _loop_finish
@@ -586,6 +586,131 @@ script:
         if proc is not None and proc.poll() is None:
             proc.kill()
             proc.wait(timeout=15)
+        for stray in client.containers.list(all=True, filters={"label": f"warden.task={task_id}"}):
+            stray.remove(force=True)
+        await asyncio.to_thread(discard_workspace_volume, str(task_id))
+
+
+async def test_a_cancel_request_kills_a_long_running_tool_and_the_task_ends_cancelled(
+    docker_available: None,
+    session: AsyncSession,
+    session_factory: async_sessionmaker[AsyncSession],
+    workspace: pathlib.Path,
+) -> None:
+    """The real thing, end to end: a `Worker` is genuinely blocked inside a sandboxed
+    `run_command "sleep 30"`, `request_cancel` arrives on a completely different session
+    (standing in for an API request or another process), and the container has to die well
+    before the command's own 30 second deadline, not because of it.
+
+    A killed-for-cancel container and a killed-for-timeout one look identical once they are
+    both dead, so speed is what tells them apart here: the assertion is "gone within a
+    handful of seconds", not "gone eventually".
+    """
+    import docker as docker_sdk
+
+    user = User(email=f"{uuid.uuid4()}@warden.test", password_hash="x", role="worker")
+    session.add(user)
+    await session.flush()
+    task = await queue.enqueue(
+        session, user_id=user.id, spec="cancel probe", idempotency_key=str(uuid.uuid4())
+    )
+    await session.commit()
+    task_id = task.id
+
+    def provider_factory() -> FakeProvider:
+        return FakeProvider(
+            [
+                ScriptStep(
+                    tool_calls=[
+                        ProviderToolCall(
+                            id="c1",
+                            name="run_command",
+                            arguments={"cmd": "sleep 30", "timeout_seconds": 30},
+                        )
+                    ]
+                ),
+                _finish(),
+            ]
+        )
+
+    worker = Worker(session_factory, provider_factory, _allow_all(), workspace)
+    client = docker_sdk.from_env()
+    running = asyncio.create_task(worker.run_once())
+    try:
+        # Wait for `policy.decided` on `run_command`, not merely for the container to exist:
+        # the container is created before the model is ever asked for a turn, so requesting
+        # a cancel as soon as it appears can race ahead of the model call that produces
+        # `run_command` entirely, and the check at the top of iteration 1 would then stop
+        # the run before it ever generates. `policy.decided` only commits once that model
+        # call is durable and the tool is about to execute (same technique as
+        # `test_a_task_survives_the_worker_process_being_killed` above).
+        loop_time = asyncio.get_event_loop().time
+        deadline = loop_time() + 30
+        run_command_decided = False
+        while loop_time() < deadline:
+            rows = await read_events(session, task_id)
+            if any(
+                e.type == "policy.decided" and e.payload.get("tool") == "run_command" for e in rows
+            ):
+                run_command_decided = True
+                break
+            await asyncio.sleep(0.2)
+        assert run_command_decided, "policy.decided for run_command never showed up"
+
+        found = client.containers.list(filters={"label": f"warden.task={task_id}"})
+        assert found, "the sandbox should exist once run_command has been decided"
+        container = found[0]
+
+        await cancel.request_cancel(session, task_id)
+        await session.commit()
+
+        cancel_requested_at = loop_time()
+        killed_after: float | None = None
+        while loop_time() < cancel_requested_at + 10:
+            # On a fast daemon (CI) the watcher kills it, the loop finishes CANCELLED and the
+            # worker's `finally` removes it before this first poll: gone counts as dead too.
+            try:
+                container.reload()
+            except docker_sdk.errors.NotFound:
+                killed_after = loop_time() - cancel_requested_at
+                break
+            if container.status != "running":
+                killed_after = loop_time() - cancel_requested_at
+                break
+            await asyncio.sleep(0.2)
+
+        assert killed_after is not None, "the container was still running 10s after cancel"
+        assert killed_after < 10, "a cancel-kill should not take anywhere near the 30s deadline"
+
+        result = await asyncio.wait_for(running, timeout=30)
+        assert result is not None
+        assert result.status == "CANCELLED"
+
+        # sandbox.destroy() in the worker's own `finally` force-removes whatever the cancel
+        # watcher's kill left behind.
+        assert client.containers.list(all=True, filters={"label": f"warden.task={task_id}"}) == []
+        # CANCELLED is terminal, so its workspace goes like any other terminal task's.
+        from warden.sandbox.docker import workspace_volume_name
+
+        with pytest.raises(docker_sdk.errors.NotFound):
+            client.volumes.get(workspace_volume_name(str(task_id)))
+
+        # The kill was the cancel's, not the command's own 30s deadline: nothing on record
+        # may say the command timed out.
+        executed = [e for e in await read_events(session, task_id) if e.type == "tool.executed"]
+        assert len(executed) == 1
+        assert "exceeded" not in str(executed[0].payload.get("output"))
+
+        model_calls = await session.scalar(
+            select(func.count()).select_from(ModelCall).where(ModelCall.task_id == task_id)
+        )
+        # Exactly the one turn that asked for `run_command`; the cancel pre-empted the next.
+        assert model_calls == 1
+    finally:
+        if not running.done():
+            running.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await running
         for stray in client.containers.list(all=True, filters={"label": f"warden.task={task_id}"}):
             stray.remove(force=True)
         await asyncio.to_thread(discard_workspace_volume, str(task_id))
