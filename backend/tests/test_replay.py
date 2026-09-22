@@ -188,6 +188,57 @@ def test_events_out_of_order_are_sorted_before_replay() -> None:
     assert rebuild(shuffled).messages[0].text == "x"  # type: ignore[union-attr]
 
 
+# --- approval decisions (ADR-022): read off the event log, never off `approvals` ------------
+
+
+def test_a_pending_call_with_no_decision_yet_has_none_recorded() -> None:
+    state = rebuild(
+        _events(
+            (ev.TASK_CREATED, {"spec": "x"}),
+            (ev.ITERATION_STARTED, {"n": 1}),
+            _model_called([{"type": "tool_use"}]),
+            _requested("t1", "github.open_pr", title="x"),
+            (ev.APPROVAL_REQUESTED, {"approval_id": "a1", "tool": "github.open_pr", "id": "t1"}),
+        )
+    )
+    assert state.is_mid_iteration
+    assert [c.id for c in state.pending_tool_calls] == ["t1"]
+    assert state.approval_decisions == {}
+
+
+def test_a_granted_approval_is_recorded_by_call_id() -> None:
+    state = rebuild(
+        _events(
+            (ev.TASK_CREATED, {"spec": "x"}),
+            (ev.ITERATION_STARTED, {"n": 1}),
+            _model_called([{"type": "tool_use"}]),
+            _requested("t1", "github.open_pr", title="x"),
+            (ev.APPROVAL_REQUESTED, {"approval_id": "a1", "tool": "github.open_pr", "id": "t1"}),
+            (ev.APPROVAL_GRANTED, {"approval_id": "a1", "id": "t1"}),
+        )
+    )
+    outcome = state.approval_decisions["t1"]
+    assert outcome.status == "approved"
+    assert outcome.approval_id == "a1"
+    assert outcome.note is None
+
+
+def test_a_rejected_approval_carries_the_reviewers_note() -> None:
+    state = rebuild(
+        _events(
+            (ev.TASK_CREATED, {"spec": "x"}),
+            (ev.ITERATION_STARTED, {"n": 1}),
+            _model_called([{"type": "tool_use"}]),
+            _requested("t1", "github.open_pr", title="x"),
+            (ev.APPROVAL_REQUESTED, {"approval_id": "a1", "tool": "github.open_pr", "id": "t1"}),
+            (ev.APPROVAL_REJECTED, {"approval_id": "a1", "id": "t1", "note": "too risky"}),
+        )
+    )
+    outcome = state.approval_decisions["t1"]
+    assert outcome.status == "rejected"
+    assert outcome.note == "too risky"
+
+
 def test_raw_content_is_never_inspected() -> None:
     """ADR-016: opaque to everything outside the provider that produced it.
 
