@@ -1,4 +1,4 @@
-.PHONY: db-up db-down migrate revision test lint fmt sandbox-image demo-fake demo worker
+.PHONY: db-up db-down migrate revision test lint fmt sandbox-image demo-fake demo worker keys
 
 # --directory avoids "cd backend &&", which breaks when the Windows make picks
 # cmd.exe instead of sh. Each recipe stays a single command.
@@ -12,6 +12,11 @@ db-down:
 
 migrate:
 	$(UV) alembic upgrade head
+
+# Generates .keys/jwt-private.pem at the repo root (see warden/config.py). Refuses to
+# overwrite an existing key. The public key and kid are derived from it, never stored separately.
+keys:
+	$(UV) python -m warden.identity.generate_keys
 
 revision:
 	$(UV) alembic revision --autogenerate -m "$(m)"

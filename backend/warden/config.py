@@ -21,6 +21,12 @@ class Settings(BaseSettings):
     # pick up a key by accident. Empty means the demo refuses to call the real API.
     anthropic_api_key: str = ""
 
+    # The private key never lives in the repository (see .gitignore's `.keys/` and `*.pem`).
+    # Relative paths resolve against the repository root, not the process's cwd, in
+    # warden/identity/jwt.py: `make keys` and the app itself run from different working
+    # directories, and a cwd-relative default would silently point at two different files.
+    jwt_private_key_path: str = ".keys/jwt-private.pem"
+
 
 @lru_cache
 def get_settings() -> Settings:
