@@ -29,6 +29,20 @@ from warden.providers.base import (
 )
 
 
+@dataclass(frozen=True)
+class ApprovalOutcome:
+    """How a human resolved one pending call's `REQUIRE_APPROVAL` decision (ADR-022).
+
+    Read off `approval.granted`/`approval.rejected`, never off the `approvals` table: this
+    module stays pure (see the module docstring), and the event log is already the record
+    `core/approvals.py::decide_approval` writes in the same transaction as the decision.
+    """
+
+    status: str  # "approved" or "rejected"
+    approval_id: str
+    note: str | None = None
+
+
 @dataclass
 class ResumeState:
     """Everything the loop needs to carry on as if it had never stopped."""
@@ -45,6 +59,11 @@ class ResumeState:
     # message as the pending ones, because the API wants every tool_use answered at once.
     partial_results: list[ToolResult] = field(default_factory=list)
     finished: bool = False
+    # Keyed by the provider's tool call id (`ToolCall.id`), one entry for whichever pending
+    # call a human has since decided. Most resumes have none at all; `core/loop.py` looks a
+    # pending call up here before deciding it, so an undecided call is decided as if it were
+    # new.
+    approval_decisions: dict[str, ApprovalOutcome] = field(default_factory=dict)
 
     @property
     def is_mid_iteration(self) -> bool:
@@ -112,6 +131,19 @@ def rebuild(task_events: Sequence[TaskEvent]) -> ResumeState:
 
         elif event.type == ev.TASK_FINISHED:
             state.finished = True
+
+        elif event.type == ev.APPROVAL_GRANTED:
+            state.approval_decisions[str(payload["id"])] = ApprovalOutcome(
+                status="approved", approval_id=str(payload["approval_id"])
+            )
+
+        elif event.type == ev.APPROVAL_REJECTED:
+            note = payload.get("note")
+            state.approval_decisions[str(payload["id"])] = ApprovalOutcome(
+                status="rejected",
+                approval_id=str(payload["approval_id"]),
+                note=str(note) if note is not None else None,
+            )
 
     # Whatever is left belongs to the iteration that was cut short.
     pending = [item for item in requested if item["id"] not in executed]
