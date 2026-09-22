@@ -73,6 +73,14 @@ class Task(Base):
             "status IN (" + ", ".join(f"'{s}'" for s in TASK_STATUSES) + ")",
             name="ck_tasks_status",
         ),
+        # A QUEUED task is unclaimed by definition (nothing is running it to cooperate with
+        # a marker), so `core/cancel.py::request_cancel` cancels it outright instead of
+        # setting this column. The constraint keeps that invariant true in the database
+        # itself, not only in whichever code path happens to be the only writer today.
+        CheckConstraint(
+            "status != 'QUEUED' OR cancel_requested_at IS NULL",
+            name="ck_tasks_cancel_requested_only_after_claim",
+        ),
     )
 
     id: Mapped[uuid.UUID] = _pk()
@@ -96,6 +104,11 @@ class Task(Base):
     # a dead worker holds the task only until the lease expires, then another can claim.
     claimed_by: Mapped[str | None] = mapped_column(String(128), default=None)
     claimed_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    # Set by `core/cancel.py::request_cancel` on a RUNNING task; the loop polls it
+    # cooperatively (`core/loop.py::_check_stoppable`). NULL means no cancel is pending.
+    cancel_requested_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
