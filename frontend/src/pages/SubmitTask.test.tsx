@@ -61,6 +61,24 @@ describe("SubmitTask", () => {
     expect(JSON.parse(String(init?.body))).toMatchObject({ spec: "faz algo" });
   });
 
+  it("generates a different Idempotency-Key for each submission", async () => {
+    // A fresh Response per call: a Response body can only be read once.
+    vi.mocked(fetch).mockImplementation(async () => new Response(JSON.stringify(TASK_OUT), { status: 201 }));
+
+    renderPage();
+    await userEvent.type(screen.getByLabelText(/especificação da tarefa/i), "faz algo");
+    await userEvent.click(screen.getByRole("button", { name: /enviar tarefa/i }));
+    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(1));
+    await userEvent.click(screen.getByRole("button", { name: /enviar tarefa/i }));
+    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
+
+    const [first, second] = vi.mocked(fetch).mock.calls.map(([, init]) =>
+      new Headers(init?.headers).get("Idempotency-Key"),
+    );
+    expect(first).toBeTruthy();
+    expect(second).not.toBe(first);
+  });
+
   it("shows the server's 422 validation message", async () => {
     vi.mocked(fetch).mockResolvedValue(
       new Response(
