@@ -7,13 +7,15 @@ the control plane did with it.
 
 import pathlib
 import uuid
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
 from sqlalchemy import func, select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from tests.fake_tools import FakeWorkspace
+from warden.core import cancel
 from warden.core.events import read_events
 from warden.core.loop import Budget, run_task
 from warden.models import ModelCall, PolicyDecision, Task, ToolCall, User
@@ -420,3 +422,148 @@ async def test_finish_leaves_no_tool_requested_or_tool_executed_event(
     kinds = [event.type for event in await read_events(session, task.id)]
     assert "tool.requested" not in kinds
     assert "tool.executed" not in kinds
+
+
+# --- cancellation and the max_seconds deadline (briefing §16) ------------------------------
+
+
+async def test_a_cancel_requested_before_the_run_starts_stops_before_any_model_call(
+    session: AsyncSession, workspace: pathlib.Path
+) -> None:
+    """The check at the top of iteration 1 has to run before `provider.generate`, not after:
+    an empty `FakeProvider` blows up the instant anything calls it, so this only stays green
+    if the model is never asked for a turn at all.
+    """
+    task = await _a_task(session)
+    # `ck_tasks_cancel_requested_only_after_claim` requires status != QUEUED for this
+    # column to be set, so this stands in for "already claimed and running" rather than
+    # going through a real `queue.claim()`, which the loop itself does not need here.
+    task.status = "RUNNING"
+    task.cancel_requested_at = datetime.now(UTC)
+    await session.flush()
+
+    result = await run_task(
+        session,
+        task,
+        FakeProvider([]),
+        FakeWorkspace().registry(),
+        _allow_all(),
+        workspace=workspace,
+    )
+
+    assert result.status == "CANCELLED"
+    assert task.status == "CANCELLED"
+    kinds = [event.type for event in await read_events(session, task.id)]
+    assert "model.called" not in kinds
+    assert kinds[-1] == "task.finished"
+
+
+async def test_a_cancel_requested_mid_turn_stops_before_the_next_tool_runs(
+    session: AsyncSession,
+    session_factory: async_sessionmaker[AsyncSession],
+    workspace: pathlib.Path,
+) -> None:
+    """Cancellation arriving *between* the model call and the tool call it asked for:
+    proven with a real second session, the same way `request_cancel` would really be called
+    from an API request or a worker's cancel watcher, not by poking the ORM object in
+    process. `read_file` must be requested (the turn really happened) but never executed.
+    """
+    task = await _a_task(session)
+
+    class _CancelsAfterGenerating:
+        name = "fake"
+
+        def __init__(self, inner: FakeProvider) -> None:
+            self._inner = inner
+
+        async def generate(self, *args: object, **kwargs: object) -> Completion:
+            completion = await self._inner.generate(*args, **kwargs)  # type: ignore[arg-type]
+            async with session_factory() as other:
+                outcome = await cancel.request_cancel(other, task.id)
+                await other.commit()
+            assert outcome is cancel.CancelOutcome.MARKED
+            return completion
+
+    provider = _CancelsAfterGenerating(
+        FakeProvider([_step("read_file", path="src/app.py"), _step("finish", summary="done")])
+    )
+
+    result = await run_task(
+        session, task, provider, FakeWorkspace().registry(), _allow_all(), workspace=workspace
+    )
+
+    assert result.status == "CANCELLED"
+    kinds = [event.type for event in await read_events(session, task.id)]
+    assert kinds.count("model.called") == 1
+    assert "tool.requested" in kinds  # the batch was requested...
+    assert "tool.executed" not in kinds  # ...but the check ran before it executed
+    assert "policy.decided" not in kinds
+
+
+async def test_a_run_past_its_max_seconds_deadline_stops_before_the_next_tool(
+    session: AsyncSession, workspace: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Wall clock, not sleep: `_now` is swapped for a clock this test drives by hand, so the
+    deadline trips deterministically instead of racing a real clock in CI.
+    """
+    task = await _a_task(session)
+    clock = {"t": datetime(2026, 1, 1, tzinfo=UTC)}
+    monkeypatch.setattr("warden.core.loop._now", lambda: clock["t"])
+
+    class _SlowProvider:
+        name = "fake"
+
+        def __init__(self, inner: FakeProvider) -> None:
+            self._inner = inner
+
+        async def generate(self, *args: object, **kwargs: object) -> Completion:
+            # Each model call "takes" 20 seconds of wall clock, whatever else happens.
+            clock["t"] += timedelta(seconds=20)
+            return await self._inner.generate(*args, **kwargs)  # type: ignore[arg-type]
+
+    provider = _SlowProvider(
+        FakeProvider([_step("list_files"), _step("list_files")])  # a second call must never run
+    )
+
+    result = await run_task(
+        session,
+        task,
+        provider,
+        FakeWorkspace().registry(),
+        _allow_all(),
+        workspace=workspace,
+        budget=Budget(max_iterations=10, max_seconds=15),
+    )
+
+    assert result.status == "TIMED_OUT"
+    assert "max_seconds" in (result.reason or "")
+    kinds = [event.type for event in await read_events(session, task.id)]
+    # One model call happened (20s already exceeds the 15s budget), and the deadline caught
+    # it before the tool it asked for ran, and long before a second call was ever attempted.
+    assert kinds.count("model.called") == 1
+    assert "tool.executed" not in kinds
+
+
+async def test_max_iterations_still_ends_timed_out_when_no_deadline_is_set(
+    session: AsyncSession, workspace: pathlib.Path
+) -> None:
+    """Regression guard: adding max_seconds must not change the existing, deadline-less
+    max_iterations behaviour that `test_a_run_that_never_finishes_stops_at_max_iterations`
+    already covers, so this only pins the parts that test does not: no `max_seconds` set at
+    all, and `_check_stoppable` running every iteration without ever raising.
+    """
+    task = await _a_task(session)
+    provider = FakeProvider([_step("list_files") for _ in range(5)])
+
+    result = await run_task(
+        session,
+        task,
+        provider,
+        FakeWorkspace().registry(),
+        _allow_all(),
+        workspace=workspace,
+        budget=Budget(max_iterations=2),
+    )
+
+    assert result.status == "TIMED_OUT"
+    assert "max_iterations" in (result.reason or "")
