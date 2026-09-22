@@ -30,6 +30,7 @@ TOOL_REQUESTED = "tool.requested"
 POLICY_DECIDED = "policy.decided"
 TOOL_EXECUTED = "tool.executed"
 TASK_FINISHED = "task.finished"
+CANCEL_REQUESTED = "cancel.requested"
 
 _SENSITIVE_KEY_PARTS = ("token", "key", "secret", "password", "credential", "authorization")
 _MAX_ARG_CHARS = 2_000
