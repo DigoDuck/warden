@@ -292,6 +292,13 @@ class AuditLog(Base):
     """
 
     __tablename__ = "audit_log"
+    __table_args__ = (
+        # `api/routes_tasks.py::submit_task` looks up an existing `task.submitted` row by
+        # this pair on every submission (new task vs. idempotent replay), on a table that is
+        # append-only (ADR-007) and only ever grows. See migration 0007 and
+        # tests/test_audit.py for the covering-index proof.
+        Index("ix_audit_log_target", "target_type", "target_id"),
+    )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     # Generated in Python, not server_default=func.now(): the value has to be known
