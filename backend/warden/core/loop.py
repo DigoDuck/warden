@@ -12,7 +12,7 @@ approved or rejected, exactly the way a crash resumes one (core/replay.py's pend
 import pathlib
 import time
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from uuid import UUID
@@ -194,6 +194,11 @@ async def run_task(
 ) -> RunResult:
     budget = budget or Budget()
     spent = resume.spent if resume else Decimal("0")
+    if resume and resume.paused_seconds and budget.max_seconds is not None:
+        # The deadline is measured from `task.started_at`, which spans every pause. Time
+        # parked in WAITING_APPROVAL is the reviewer's, not the agent's (ADR-022), so the
+        # budget grows by exactly that much instead of the clock learning about pauses.
+        budget = replace(budget, max_seconds=budget.max_seconds + resume.paused_seconds)
 
     user = await session.get(User, task.user_id)
     user_ref = UserRef(id=task.user_id, role=user.role if user else "worker")
