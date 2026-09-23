@@ -6,6 +6,7 @@ and `clean_committed_rows` truncates between tests. Fixtures duplicated rather t
 matching the existing split between test_api.py and test_api_approvals.py.
 """
 
+import base64
 import uuid
 from collections.abc import AsyncIterator
 
@@ -202,6 +203,33 @@ async def test_keyset_pagination_walks_every_task_once(
 
     assert cursor is None, "pagination never terminated"
     assert seen == list(reversed(created))  # newest first, no dup, no gap
+
+
+def _forge_cursor(raw: str) -> str:
+    """Build a cursor the same way `_encode_cursor` would, but from a raw string this test
+    controls, so it can forge one carrying whatever `created_at` text it wants."""
+    return base64.urlsafe_b64encode(raw.encode()).decode()
+
+
+async def test_a_malformed_cursor_is_422(
+    client: AsyncClient, session_factory: async_sessionmaker[AsyncSession], keys: KeyPair
+) -> None:
+    token = await _user_token(session_factory, keys, await _user(session_factory), ["tasks:read"])
+    response = await client.get("/tasks", headers=_auth(token), params={"cursor": "not-base64!!"})
+    assert response.status_code == 422
+
+
+async def test_a_cursor_with_a_timezone_naive_datetime_is_422(
+    client: AsyncClient, session_factory: async_sessionmaker[AsyncSession], keys: KeyPair
+) -> None:
+    """`created_at` is `DateTime(timezone=True)`: comparing it to a naive datetime in the
+    keyset `WHERE` clause is a database-level type error, not a client mistake to 500 on. A
+    forged cursor is the only way to get a naive value in here — `_encode_cursor` always
+    serialises an aware `created_at` read back from that same column."""
+    token = await _user_token(session_factory, keys, await _user(session_factory), ["tasks:read"])
+    cursor = _forge_cursor(f"2024-01-01T00:00:00|{uuid.uuid4()}")
+    response = await client.get("/tasks", headers=_auth(token), params={"cursor": cursor})
+    assert response.status_code == 422
 
 
 async def test_missing_scope_on_list_is_403(
