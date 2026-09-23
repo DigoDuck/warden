@@ -252,7 +252,9 @@ async def test_an_ambiguous_reload_error_mid_kill_is_retried_not_trusted(
             nonlocal restarted
             # A real daemon refuses to start a container that is still running. This must
             # only ever be reached once reload() has actually seen the container stopped.
-            assert confirmed_stopped, "start() ran before reload() ever confirmed the container had stopped"
+            assert confirmed_stopped, (
+                "start() ran before reload() ever confirmed the container stopped"
+            )
             restarted = True
 
         monkeypatch.setattr(container, "kill", lambda *a, **k: None)

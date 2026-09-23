@@ -279,7 +279,7 @@ async def discard_orphaned_workspace_volumes(
         status = status_by_id.get(task_id)
         if status is not None and status not in TERMINAL_STATUSES:
             continue  # QUEUED, RUNNING or WAITING_APPROVAL: a resume still needs this volume.
-        with contextlib.suppress(_TRANSIENT_DB_ERRORS):
+        with contextlib.suppress(*_TRANSIENT_DB_ERRORS):
             await asyncio.to_thread(discard_workspace_volume, task_id)
 
 

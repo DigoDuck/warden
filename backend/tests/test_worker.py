@@ -258,13 +258,11 @@ async def test_the_janitor_discards_terminal_and_missing_tasks_but_never_a_live_
         await discard_orphaned_workspace_volumes(session_factory)
 
         def exists(task_id: uuid.UUID) -> bool:
-            return bool(
-                client.volumes.list(filters={"label": f"warden.task={task_id}"})
-            )
+            return bool(client.volumes.list(filters={"label": f"warden.task={task_id}"}))
 
         assert not exists(terminal_task.id), "a terminal task's volume must be discarded"
         assert not exists(missing_task_id), "a volume for a task that no longer exists must go"
-        assert exists(live_task.id), "a WAITING_APPROVAL task's volume must survive: it resumes onto it"
+        assert exists(live_task.id), "a WAITING_APPROVAL task's volume must survive a resume"
     finally:
         for volume in volumes:
             with contextlib.suppress(docker_sdk.errors.NotFound, docker_sdk.errors.APIError):
