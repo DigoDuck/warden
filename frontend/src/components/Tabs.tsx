@@ -10,8 +10,19 @@ export interface TabDef {
  * ArrowLeft/ArrowRight move focus and select (wrapping at the ends), Home/End jump to the
  * first/last tab. Used once, for Task Detail's Spec/Execução/Custo — kept as its own
  * component rather than inlined so the keyboard behaviour has its own test. */
-export function Tabs({ label, tabs }: { label: string; tabs: TabDef[] }) {
-  const [activeId, setActiveId] = useState(tabs[0]?.id);
+export function Tabs({
+  label,
+  tabs,
+  defaultTabId,
+}: {
+  label: string;
+  tabs: TabDef[];
+  /** Initial selected tab, by id. Defaults to the first tab (`tabs[0]`) when omitted, same
+   * as before this prop existed. Lets a caller open on, say, a live-updating tab without
+   * having to reorder the tab list itself just to change which one starts selected. */
+  defaultTabId?: string;
+}) {
+  const [activeId, setActiveId] = useState(defaultTabId ?? tabs[0]?.id);
   const tabRefs = useRef<Record<string, HTMLButtonElement | null>>({});
 
   function select(id: string, focus: boolean) {

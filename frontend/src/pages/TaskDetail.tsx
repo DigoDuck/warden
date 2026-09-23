@@ -6,7 +6,7 @@ import type { TaskOut } from "../api/types";
 import { StatusBadge } from "../components/StatusBadge";
 import { Tabs } from "../components/Tabs";
 import { Timeline } from "../components/Timeline";
-import { useTaskEventStream } from "../hooks/useTaskEventStream";
+import { useTaskEventStream, type StreamedEvent, type StreamStatus } from "../hooks/useTaskEventStream";
 
 // The state machine from warden/models.py (TASK_STATUSES): once a task reaches one of
 // these, core/worker.py never picks it up again, so polling past this point is pointless
@@ -43,11 +43,30 @@ function SpecPanel({ task }: { task: TaskOut }) {
   );
 }
 
-function ExecucaoPanel({ taskId }: { taskId: string }) {
-  const { events, status } = useTaskEventStream(taskId);
+// The stream itself is owned by TaskDetail, not this panel (see the Tabs call below): Tabs
+// unmounts an inactive panel, and mounting useTaskEventStream *inside* this component would
+// tear the connection down and reconnect from seq 0 every time Spec or Custo is shown
+// instead. This panel only ever renders whatever the page hands it.
+function ExecucaoPanel({
+  events,
+  status,
+  onRetry,
+}: {
+  events: StreamedEvent[];
+  status: StreamStatus;
+  onRetry: () => void;
+}) {
   return (
     <div className="flex flex-col gap-3">
       {status === "error" && <p role="alert">Conexão perdida, tentando reconectar…</p>}
+      {status === "failed" && (
+        <div role="alert" className="flex items-center gap-3">
+          <p>Não foi possível manter a conexão com os eventos.</p>
+          <button type="button" className="border-border-control" onClick={onRetry}>
+            Tentar de novo
+          </button>
+        </div>
+      )}
       <Timeline events={events} />
     </div>
   );
@@ -76,6 +95,10 @@ export function TaskDetail() {
   const taskPath = encodeURIComponent(id ?? "");
   const queryClient = useQueryClient();
   const [cancelMessage, setCancelMessage] = useState<string | null>(null);
+  // Owned here, not inside the Execução tab's own panel: Tabs unmounts an inactive panel,
+  // and the connection (plus everything it already received) must survive a trip through
+  // Spec or Custo instead of reconnecting from seq 0 every time Execução is reselected.
+  const stream = useTaskEventStream(id);
 
   const taskQuery = useQuery({
     queryKey: ["task", id],
@@ -154,15 +177,24 @@ export function TaskDetail() {
           <div className="mt-6">
             <Tabs
               label="Detalhe da tarefa"
+              // DESIGN.md "pronto quando" (semana 4): ver eventos chegando ao vivo sem
+              // precisar clicar em nada primeiro.
+              defaultTabId="execucao"
               tabs={[
                 { id: "spec", label: "Spec", panel: <SpecPanel task={task} /> },
                 {
                   id: "execucao",
                   label: "Execução",
-                  // Keyed by task id: a fresh mount (and fresh hook state) beats an
-                  // effect that resets state for an id change useTaskEventStream will
-                  // essentially never see in practice (the route itself changes first).
-                  panel: <ExecucaoPanel key={id} taskId={id} />,
+                  // events/status/retry come from the page-level stream above, not a hook
+                  // call inside this panel: that is what keeps the connection open and the
+                  // timeline intact while Spec or Custo is the visible tab.
+                  panel: (
+                    <ExecucaoPanel
+                      events={stream.events}
+                      status={stream.status}
+                      onRetry={stream.retry}
+                    />
+                  ),
                 },
                 { id: "custo", label: "Custo", panel: <CustoPanel task={task} /> },
               ]}
