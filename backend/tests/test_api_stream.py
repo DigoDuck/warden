@@ -270,3 +270,40 @@ async def test_stream_does_not_hold_a_transaction_open_between_polls(
         consumer.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await consumer
+
+
+async def test_stream_releases_the_request_session_before_streaming(
+    client: AsyncClient, session_factory: async_sessionmaker[AsyncSession], keys: KeyPair
+) -> None:
+    """The auth + visibility checks run on the request's SessionDep, and FastAPI (>= 0.118)
+    only exits a yield dependency after the response has been fully sent. For a stream that
+    is the life of the browser tab: left alone, that session sits "idle in transaction"
+    holding ACCESS SHARE on `tasks` (from the visibility SELECT) and a pool connection.
+
+    Caused, not simulated: an ACCESS EXCLUSIVE lock on `tasks` (what an ALTER TABLE in a
+    migration takes) must be grantable while a stream is open. A plain UPDATE, as in the test
+    above, does not conflict with ACCESS SHARE, so it cannot catch this.
+    """
+    token = await _user_token(
+        session_factory, keys, await _user(session_factory), ["tasks:write", "tasks:read"]
+    )
+    task_id = await _submit(client, token)
+
+    async def consume() -> None:
+        async with client.stream(
+            "GET", f"/tasks/{task_id}/stream", headers=_auth(token)
+        ) as response:
+            async for _ in response.aiter_lines():
+                pass
+
+    consumer = asyncio.create_task(consume())
+    try:
+        await asyncio.sleep(0.2)
+        async with session_factory() as session:
+            await session.execute(text("SET LOCAL lock_timeout = '1s'"))
+            await session.execute(text("LOCK TABLE tasks IN ACCESS EXCLUSIVE MODE"))
+            await session.rollback()
+    finally:
+        consumer.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await consumer
