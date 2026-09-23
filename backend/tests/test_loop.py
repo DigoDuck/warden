@@ -7,8 +7,10 @@ the control plane did with it.
 
 import pathlib
 import uuid
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from typing import Any
 
 import pytest
 from pydantic import BaseModel
@@ -22,7 +24,13 @@ from warden.core.loop import Budget, run_task
 from warden.core.replay import ResumeState, rebuild
 from warden.models import Approval, AuditLog, ModelCall, PolicyDecision, Task, ToolCall, User
 from warden.policy.engine import Effect, Policy, Rule, load_policy
-from warden.providers.base import Completion, Usage, UserMessage
+from warden.providers.base import (
+    Completion,
+    Message,
+    ToolResultsMessage,
+    Usage,
+    UserMessage,
+)
 from warden.providers.base import ToolCall as ProviderToolCall
 from warden.providers.fake import FakeProvider, ScriptStep
 from warden.tools.registry import ToolRegistry
@@ -548,6 +556,21 @@ class _OpenPrCounter:
         return f"opened PR: {args.title}"
 
 
+class _RecordingProvider:
+    """Wraps a FakeProvider and keeps every message list it was asked to continue, so a test
+    can assert on what the model actually received rather than on a side table."""
+
+    name = "fake"
+
+    def __init__(self, inner: FakeProvider) -> None:
+        self._inner = inner
+        self.seen: list[list[Message]] = []
+
+    async def generate(self, messages: Sequence[Message], **kwargs: Any) -> Completion:
+        self.seen.append(list(messages))
+        return await self._inner.generate(messages, **kwargs)
+
+
 def _registry_with_open_pr(counter: _OpenPrCounter) -> ToolRegistry:
     registry = FakeWorkspace().registry()
     registry.register(
@@ -731,10 +754,11 @@ async def test_rejecting_a_paused_call_injects_the_note_and_the_loop_continues(
     await session.commit()
     resume = rebuild(await read_events(session, task.id))
 
+    recording = _RecordingProvider(FakeProvider([_step("finish", summary="done")]))
     result = await run_task(
         session,
         resumed,
-        FakeProvider([_step("finish", summary="done")]),
+        recording,
         FakeWorkspace().registry(),
         _require_approval_policy(),
         workspace=workspace,
@@ -743,6 +767,16 @@ async def test_rejecting_a_paused_call_injects_the_note_and_the_loop_continues(
     )
 
     assert result.status == "SUCCEEDED"
+
+    # What the model itself was sent on the resumed turn, not just what the tool_calls row
+    # says: the whole point of rejecting (ADR-022) is that the model reads the note and
+    # takes another path, so the tool_result for the rejected call must be an error that
+    # carries it.
+    sent = recording.seen[0][-1]
+    assert isinstance(sent, ToolResultsMessage)
+    by_id = {r.tool_call_id: r for r in sent.results}
+    assert by_id["call-pr"].is_error is True
+    assert "too risky right now" in by_id["call-pr"].content
 
     pr_row = (
         await session.scalars(
