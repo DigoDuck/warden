@@ -227,6 +227,11 @@ async def test_an_ambiguous_reload_error_mid_kill_is_retried_not_trusted(
         confirmed_stopped = False
         restarted = False
 
+        def _set_running(value: bool) -> None:
+            # Only ever touch "State": the rest of `attrs` (in particular "Id") has to
+            # survive, or the real cleanup in this test's `finally` has nothing to remove.
+            container.attrs = {**container.attrs, "State": {"Running": value}}
+
         def fake_reload() -> None:
             nonlocal reload_calls, confirmed_stopped
             reload_calls += 1
@@ -235,13 +240,13 @@ async def test_an_ambiguous_reload_error_mid_kill_is_retried_not_trusted(
                 # has actually confirmed the container dead.
                 raise docker_sdk.errors.APIError("simulated transient reload failure mid-kill")
             if restarted:
-                container.attrs = {"State": {"Running": True}}
+                _set_running(True)
             elif reload_calls <= 3:
                 # Still genuinely running: the real kill has not landed yet.
-                container.attrs = {"State": {"Running": True}}
+                _set_running(True)
             else:
                 confirmed_stopped = True
-                container.attrs = {"State": {"Running": False}}
+                _set_running(False)
 
         def fake_start() -> None:
             nonlocal restarted

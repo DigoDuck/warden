@@ -440,13 +440,23 @@ class Sandbox:
         Not finding out either way is treated as "stopped": the caller already gets
         `CommandTimeout` for the command, and `destroy()` removes the container by force
         regardless, so there is nothing further to report here.
+
+        `NotFound` alone proves it: the container is gone. A plain `APIError` does not -- it
+        can be a transient daemon hiccup while the kill is still in flight, not confirmation
+        the container has actually died -- so it is retried like any other inconclusive poll
+        instead of being read as "stopped". Conflating the two used to let `start()` run on a
+        container nothing had actually confirmed dead yet: the ADR-021 `_kill_sync` flake
+        ("cannot exec in a stopped state" on the exec right after a kill-and-restart).
         """
         deadline = time.monotonic() + KILL_GRACE_SECONDS
         while time.monotonic() < deadline:
             try:
                 self._container.reload()
-            except (NotFound, docker.errors.APIError):
+            except NotFound:
                 return
+            except docker.errors.APIError:
+                time.sleep(0.05)
+                continue
             if not self._container.attrs.get("State", {}).get("Running"):
                 return
             time.sleep(0.05)
