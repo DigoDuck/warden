@@ -189,7 +189,9 @@ async def test_keyset_pagination_walks_every_task_once(
     seen: list[str] = []
     cursor: str | None = None
     for _ in range(10):  # bounded loop: a real bug here must not hang the test suite
-        params = {"limit": 2, **({"cursor": cursor} if cursor else {})}
+        params: dict[str, str | int] = {"limit": 2}
+        if cursor:
+            params["cursor"] = cursor
         page = await client.get("/tasks", headers=_auth(token), params=params)
         assert page.status_code == 200
         body = page.json()

@@ -8,6 +8,7 @@ policy engine.
 import asyncio
 import base64
 import binascii
+import time
 import uuid
 from collections.abc import AsyncIterator
 from datetime import datetime
@@ -355,11 +356,46 @@ async def stream_task_events(
 
     session_factory: async_sessionmaker[AsyncSession] = request.app.state.session_factory
 
-    # TODO(skeleton): sends nothing and closes immediately, ignoring start_after, polling
-    # and the terminal event entirely. Filled in next commit.
     async def event_source() -> AsyncIterator[str]:
-        return
-        yield  # pragma: no cover - makes this an async generator
+        last = start_after
+        last_activity = time.monotonic()
+        while True:
+            if await request.is_disconnected():
+                return
 
-    _ = session_factory  # unused until the real implementation
+            # A fresh, short-lived session per poll (never the request's own SessionDep):
+            # it is opened, used for one SELECT and closed before the sleep below, so no
+            # transaction or connection sits idle for the ~1s between polls. See ADR-019.
+            async with session_factory() as poll_session:
+                rows = (
+                    await poll_session.scalars(
+                        select(TaskEvent)
+                        .where(TaskEvent.task_id == task_id, TaskEvent.seq > last)
+                        .order_by(TaskEvent.seq)
+                        .limit(_MAX_EVENTS_PAGE)
+                    )
+                ).all()
+
+            if rows:
+                for row in rows:
+                    out = TaskEventOut(
+                        seq=row.seq, type=row.type, payload=row.payload, created_at=row.created_at
+                    )
+                    yield f"id: {out.seq}\nevent: {out.type}\ndata: {out.model_dump_json()}\n\n"
+                    last = out.seq
+                    if row.type == core_events.TASK_FINISHED:
+                        # The terminal marker: every path to a terminal status writes this
+                        # event (core/loop.py::_finish, core/cancel.py::request_cancel), so
+                        # seeing it is exactly "the task reached a terminal status and that
+                        # was the last thing it had to say".
+                        return
+                last_activity = time.monotonic()
+                continue
+
+            now = time.monotonic()
+            if now - last_activity >= _STREAM_HEARTBEAT_SECONDS:
+                yield ": heartbeat\n\n"
+                last_activity = now
+            await asyncio.sleep(_STREAM_POLL_SECONDS)
+
     return StreamingResponse(event_source(), media_type="text/event-stream")
