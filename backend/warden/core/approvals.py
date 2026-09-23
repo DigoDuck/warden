@@ -53,6 +53,18 @@ async def request_approval(
     return approval
 
 
+# Lock order: the task row first, then the approval row, the same order
+# `cancel.request_cancel` takes them (its guarded UPDATE on `tasks`, then expiring the
+# approval). Taking the approval first, as the guarded UPDATE below would on its own, lets a
+# cancel and a decision on the same paused task each hold one lock while waiting on the other,
+# and Postgres then kills one of the two requests as a deadlock. `NO KEY UPDATE`, the same
+# strength `events.append_event` takes, is enough to queue behind the cancel's UPDATE.
+_LOCK_TASK_OF_APPROVAL = text("""
+    SELECT t.id FROM tasks t JOIN approvals a ON a.task_id = t.id
+     WHERE a.id = :approval_id
+       FOR NO KEY UPDATE OF t
+""")
+
 # Guarded the same way `queue._CLAIM`/`_HEARTBEAT` are: one statement, `status = 'pending'`
 # in the WHERE, so two concurrent decisions on the same row can never both win. Whichever
 # commits first is `RETURNING`ed; the loser's UPDATE matches zero rows.
@@ -99,12 +111,12 @@ async def decide_approval(
         "user_id": user_id,
         "note": note,
     }
+    if await session.scalar(_LOCK_TASK_OF_APPROVAL, {"approval_id": approval_id}) is None:
+        raise ApprovalNotFound(str(approval_id))
     row = (await session.execute(_DECIDE, params)).one_or_none()
     if row is None:
-        exists = await session.get(Approval, approval_id)
-        if exists is None:
-            raise ApprovalNotFound(str(approval_id))
-        raise ApprovalAlreadyDecided(f"approval {approval_id} is already {exists.status}")
+        current = await session.scalar(select(Approval.status).where(Approval.id == approval_id))
+        raise ApprovalAlreadyDecided(f"approval {approval_id} is already {current}")
 
     task_id, tool_call_id, tool = row
 
