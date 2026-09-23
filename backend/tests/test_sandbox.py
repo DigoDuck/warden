@@ -196,6 +196,72 @@ async def test_a_command_past_its_deadline_is_killed_and_the_sandbox_recovers(
         await box.destroy()
 
 
+async def test_an_ambiguous_reload_error_mid_kill_is_retried_not_trusted(
+    docker_available: None, workspace: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression test for the `_kill_sync` flake documented in ADR-021: "cannot exec in a
+    stopped state" on the exec right after a kill-and-restart, seen 3 times, never
+    reproduced on demand (this PR's own attempt: 652 real kill/restart cycles across two
+    parallel-stress runs, 0 failures — see the commit body for both).
+
+    Root cause: `_wait_until_stopped` treated *any* `APIError` from `reload()` as proof the
+    container had died, exactly like `NotFound`. `NotFound` really does prove it (the
+    container is gone); a plain `APIError` does not (a daemon hiccup, not necessarily the
+    kill having landed). Taking one ambiguous error as "stopped" let `start()` run on a
+    container nothing had actually confirmed dead — which is realistic: a real daemon
+    refuses to start a container that is still running — so this test proves the exact
+    thing that must never happen: `start()` running before `reload()` ever actually observed
+    the container stopped.
+
+    Fully deterministic on purpose: `kill`/`reload`/`start` on the real container are all
+    replaced, so this does not depend on winning the real timing race against the Docker
+    daemon that nobody could win on demand in the first place (the fault injection the
+    diagnosing-bugs discipline allows once a real repro proved impractical).
+    """
+    import docker as docker_sdk
+
+    box = await Sandbox.create(SandboxProfile(), workspace)
+    try:
+        container = box._container
+        reload_calls = 0
+        confirmed_stopped = False
+        restarted = False
+
+        def fake_reload() -> None:
+            nonlocal reload_calls, confirmed_stopped
+            reload_calls += 1
+            if reload_calls == 1:
+                # The exact race: the daemon answers with an ambiguous error before anything
+                # has actually confirmed the container dead.
+                raise docker_sdk.errors.APIError("simulated transient reload failure mid-kill")
+            if restarted:
+                container.attrs = {"State": {"Running": True}}
+            elif reload_calls <= 3:
+                # Still genuinely running: the real kill has not landed yet.
+                container.attrs = {"State": {"Running": True}}
+            else:
+                confirmed_stopped = True
+                container.attrs = {"State": {"Running": False}}
+
+        def fake_start() -> None:
+            nonlocal restarted
+            # A real daemon refuses to start a container that is still running. This must
+            # only ever be reached once reload() has actually seen the container stopped.
+            assert confirmed_stopped, "start() ran before reload() ever confirmed the container had stopped"
+            restarted = True
+
+        monkeypatch.setattr(container, "kill", lambda *a, **k: None)
+        monkeypatch.setattr(container, "reload", fake_reload)
+        monkeypatch.setattr(container, "start", fake_start)
+
+        box._kill_sync()
+
+        assert confirmed_stopped, "the container was never actually confirmed stopped"
+        assert restarted, "the container was never actually restarted"
+    finally:
+        await box.destroy()
+
+
 async def test_a_missing_image_does_not_leak_the_volume(
     docker_available: None, workspace: pathlib.Path
 ) -> None:
