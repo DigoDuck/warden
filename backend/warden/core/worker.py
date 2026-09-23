@@ -22,6 +22,7 @@ from collections.abc import Callable
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from docker.errors import DockerException
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -63,6 +64,9 @@ TERMINAL_STATUSES = frozenset({"SUCCEEDED", "FAILED", "CANCELLED", "TIMED_OUT", 
 # reads it, nothing depends on it disappearing quickly), so there is no reason to check more
 # often than a claim's own idle poll.
 JANITOR_INTERVAL_SECONDS = 300.0
+# The janitor's Docker calls can fail one more way: docker-py raises a bare DockerException,
+# not an OSError, when the daemon cannot be reached at all (Docker Desktop restarting).
+_JANITOR_TRANSIENT_ERRORS = (*_TRANSIENT_DB_ERRORS, DockerException)
 
 # Resolved at import: touching the filesystem inside the async entry point would block the
 # event loop, and these never change while the process runs.
@@ -260,7 +264,7 @@ async def discard_orphaned_workspace_volumes(
     """
     try:
         task_ids = await asyncio.to_thread(list_task_ids_with_workspace_volumes)
-    except _TRANSIENT_DB_ERRORS:
+    except _JANITOR_TRANSIENT_ERRORS:
         return
     if not task_ids:
         return
@@ -279,7 +283,7 @@ async def discard_orphaned_workspace_volumes(
         status = status_by_id.get(task_id)
         if status is not None and status not in TERMINAL_STATUSES:
             continue  # QUEUED, RUNNING or WAITING_APPROVAL: a resume still needs this volume.
-        with contextlib.suppress(*_TRANSIENT_DB_ERRORS):
+        with contextlib.suppress(*_JANITOR_TRANSIENT_ERRORS):
             await asyncio.to_thread(discard_workspace_volume, task_id)
 
 
