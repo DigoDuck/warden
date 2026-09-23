@@ -39,6 +39,28 @@ async def _seed(session: AsyncSession, n: int = 1) -> list[AuditLog]:
     ]
 
 
+# --- the (target_type, target_id) index (maintenance track, item 1) -----------------------
+
+
+async def test_audit_log_has_an_index_on_target_type_and_target_id(
+    session: AsyncSession,
+) -> None:
+    """`POST /tasks` (api/routes_tasks.py) looks up an existing `task.submitted` row by
+    `(target_type, target_id)` on every single submission, to tell a genuinely new task from
+    an idempotent replay. `audit_log` is append-only (ADR-007) and only ever grows, so
+    without a covering index that lookup is a sequential scan that gets slower forever.
+    """
+    rows = (
+        await session.execute(
+            text(
+                "SELECT indexdef FROM pg_indexes WHERE tablename = 'audit_log' "
+                "AND indexdef LIKE '%target_type%' AND indexdef LIKE '%target_id%'"
+            )
+        )
+    ).all()
+    assert rows, "expected an index covering (target_type, target_id) on audit_log"
+
+
 # --- append() / verify() on a clean chain -----------------------------------------------
 
 
