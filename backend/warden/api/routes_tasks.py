@@ -15,17 +15,27 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from warden import audit
 from warden.api.deps import SessionDep, require_scope
-from warden.api.schemas import TaskCreate, TaskEventOut, TaskEventPage, TaskOut
+from warden.api.schemas import (
+    TaskCreate,
+    TaskEventOut,
+    TaskEventPage,
+    TaskListItemOut,
+    TaskListOut,
+    TaskOut,
+)
 from warden.core import cancel, queue
 from warden.core.events import ITERATION_STARTED
 from warden.identity import Claims
-from warden.models import AuditLog, ModelCall, Task, TaskEvent
+from warden.models import TASK_STATUSES, AuditLog, ModelCall, Task, TaskEvent
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
 
 # A page any bigger risks turning "read the events" into "read the whole table" for a long
 # task; 500 is generous for a UI timeline and still cheap to serialise.
 _MAX_EVENTS_PAGE = 500
+
+# Same reasoning for the task list: a page bounded well below "the whole table".
+_MAX_TASKS_PAGE = 100
 
 
 def _user_id_of(claims: Claims) -> uuid.UUID:
@@ -73,6 +83,33 @@ async def _to_task_out(session: AsyncSession, task: Task) -> TaskOut:
         finished_at=task.finished_at,
         cost_usd=Decimal(cost or 0),
         iterations=iterations or 0,
+    )
+
+
+@router.get("", response_model=TaskListOut)
+async def list_tasks(
+    session: SessionDep,
+    claims: Annotated[Claims, Depends(require_scope("tasks:read"))],
+    status: Annotated[str | None, Query()] = None,
+    cursor: Annotated[str | None, Query()] = None,
+    limit: Annotated[int, Query(gt=0, le=_MAX_TASKS_PAGE)] = 50,
+) -> TaskListOut:
+    # TODO(skeleton): ignores status/cursor/limit and caller scoping. Filled in next commit.
+    rows = (await session.scalars(select(Task))).all()
+    return TaskListOut(
+        tasks=[
+            TaskListItemOut(
+                id=row.id,
+                status=row.status,
+                spec=row.spec,
+                target_repo=row.target_repo,
+                created_at=row.created_at,
+                started_at=row.started_at,
+                finished_at=row.finished_at,
+            )
+            for row in rows
+        ],
+        next_cursor=None,
     )
 
 
