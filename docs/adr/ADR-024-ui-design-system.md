@@ -115,6 +115,39 @@ por evento, só refletir o estado atual a cada poucos segundos — por isso `use
 uma conexão dedicada: ver "policy.decided" e o resto da timeline aparecer em tempo real é o item
 "pronto quando" da semana 4 ("ver eventos chegando ao vivo").
 
+### Autenticação do stream: só no momento da conexão
+
+`GET /tasks/{id}/stream` valida o bearer token uma vez, ao abrir a conexão (`require_scope`
+na `SessionDep` da requisição, antes do `close()` manual descrito acima). Nada nesse endpoint
+revalida o token depois: um token revogado (broker marca `revoked_at`) ou que expira (`exp`)
+enquanto a aba continua aberta **não** derruba um stream já em andamento — ele segue emitindo
+eventos até o próprio `task.finished` ou até o cliente desconectar por outro motivo.
+
+É uma troca deliberada, não um descuido: fechar o stream ativamente exigiria checar o token de
+novo a cada poll (mais uma consulta por segundo só para isso) ou empurrar uma notificação de
+revogação para dentro do loop do gerador, nenhum dos dois justificado pelo risco real aqui —
+o stream só *lê* o event log de uma tarefa que a checagem inicial já confirmou visível para
+aquele usuário; não expõe nada que um GET /tasks/{id}/events subsequente (que *reautentica* a
+cada chamada) não exporia de qualquer forma a esse mesmo usuário enquanto o token dele ainda
+valia há poucos segundos.
+
+Mitigação que já existe, sem código novo:
+
+- **TTL curto.** `USER_TTL_CAP_SECONDS` (`warden/identity/jwt.py`) limita a 24h o token que
+  `make user-token`/`Settings.tsx` emitem; o expira sozinho, a checagem periódica do agente
+  (`AGENT_TTL_CAP_SECONDS`, 15 min) é ainda mais curta. A janela de exposição de um stream após
+  a revogação/expiração do token é no máximo essa TTL, nunca indefinida.
+- **O stream termina sozinho ao chegar a um status terminal** (este PR, ver a seção do
+  `_TERMINAL_TASK_STATUSES` em `routes_tasks.py`): não há uma conexão que fique aberta para
+  sempre esperando por nada, o que já limita quanto tempo um token comprometido teria mesmo
+  sem revalidação.
+
+Uma correção futura, se o risco justificar o custo: revalidar o token a cada N polls (não a
+cada um) reaproveitando a sessão curta que já existe para checar o status da tarefa, encerrando
+o stream com um evento de erro assim que o token não voltar a validar — mesmo padrão que
+`identity.jwt.verify` já usa em toda outra rota, só que reexecutado dentro do gerador em vez de
+uma única vez na entrada.
+
 ## Alternativas consideradas
 
 - **EventSource nativo para o stream.** Rejeitado: não manda `Authorization`, e o token na URL
