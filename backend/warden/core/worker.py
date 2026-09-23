@@ -253,7 +253,8 @@ async def discard_orphaned_workspace_volumes(
 
     Race safety: every candidate task's status is read in ONE query, up front, before this
     discards anything, and a task is only ever discarded if that single read already found it
-    terminal (`TERMINAL_STATUSES`) or missing a row entirely. Nothing in this state machine
+    terminal (`TERMINAL_STATUSES`); a task with no row is left alone (see the loop below).
+    Nothing in this state machine
     ever moves a task's status *out of* a terminal one (`core/queue.py`, `core/cancel.py` and
     `core/approvals.py` only ever move a row *into* one), so whatever this reads as terminal
     stays terminal forever — there is no later moment at which a volume this call decided to
@@ -269,9 +270,16 @@ async def discard_orphaned_workspace_volumes(
     if not task_ids:
         return
 
+    uuids = []
+    for task_id in task_ids:
+        # Only Warden writes this label, but a hand-made volume must not take the worker down.
+        with contextlib.suppress(ValueError):
+            uuids.append(uuid.UUID(task_id))
+    if not uuids:
+        return
+
     try:
         async with session_factory() as session:
-            uuids = [uuid.UUID(task_id) for task_id in task_ids]
             rows = (
                 await session.execute(select(Task.id, Task.status).where(Task.id.in_(uuids)))
             ).all()
@@ -280,9 +288,13 @@ async def discard_orphaned_workspace_volumes(
 
     status_by_id = {str(task_id): status for task_id, status in rows}
     for task_id in task_ids:
-        status = status_by_id.get(task_id)
-        if status is not None and status not in TERMINAL_STATUSES:
-            continue  # QUEUED, RUNNING or WAITING_APPROVAL: a resume still needs this volume.
+        # Only what this database itself sees as terminal. No row here is not "gone": one
+        # Docker daemon serves every database on the machine (dev, each WARDEN_TEST_DB), so a
+        # missing row is most likely another database's task, possibly paused and about to
+        # resume onto this volume. Leaking the volume of a task deleted from this database
+        # (nothing in Warden deletes tasks) is the cheaper mistake.
+        if status_by_id.get(task_id) not in TERMINAL_STATUSES:
+            continue
         with contextlib.suppress(*_JANITOR_TRANSIENT_ERRORS):
             await asyncio.to_thread(discard_workspace_volume, task_id)
 
