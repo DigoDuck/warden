@@ -1,7 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { ClipboardCheck, ListChecks, Menu, Plus, Settings } from "lucide-react";
-import { type ComponentType, type ReactNode } from "react";
-import { NavLink, Outlet } from "react-router-dom";
+import { type ComponentType, type ReactNode, useEffect, useRef } from "react";
+import { NavLink, Outlet, useLocation } from "react-router-dom";
 import { apiFetch } from "../api/client";
 import type { ApprovalOut } from "../api/types";
 
@@ -53,8 +53,6 @@ function NavItems({ pendingCount }: { pendingCount: number }): ReactNode {
   );
 }
 
-// TODO(skeleton): renders the shell but never moves focus to the new page's h1 on route
-// change. Filled in next commit.
 export function AppShell() {
   const approvalsQuery = useQuery({
     queryKey: ["approvals", "pending"],
@@ -62,6 +60,26 @@ export function AppShell() {
     refetchInterval: 5000,
   });
   const pendingCount = approvalsQuery.data?.length ?? 0;
+
+  const location = useLocation();
+  // Skipped on the very first render: the browser already places focus sensibly on a
+  // fresh page load, and stealing it back to the h1 there would fight the address bar /
+  // a restored scroll position. DESIGN.md's rule is about a *route change*, not the load.
+  const isFirstRender = useRef(true);
+  useEffect(() => {
+    if (isFirstRender.current) {
+      isFirstRender.current = false;
+      return;
+    }
+    // Child effects (the new page's own) run before a parent's in the same commit, so the
+    // new h1 already exists here. tabIndex -1 makes it programmatically focusable without
+    // adding a stop to the normal Tab order.
+    const heading = document.querySelector<HTMLElement>("#main-content h1");
+    if (heading) {
+      heading.tabIndex = -1;
+      heading.focus();
+    }
+  }, [location.pathname]);
 
   return (
     <div className="min-h-screen lg:flex">
