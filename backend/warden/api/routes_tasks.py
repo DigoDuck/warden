@@ -103,9 +103,17 @@ def _decode_cursor(cursor: str) -> tuple[datetime, uuid.UUID]:
     try:
         raw = base64.urlsafe_b64decode(cursor.encode()).decode()
         created_at_raw, id_raw = raw.rsplit("|", 1)
-        return datetime.fromisoformat(created_at_raw), uuid.UUID(id_raw)
+        created_at = datetime.fromisoformat(created_at_raw)
+        cursor_id = uuid.UUID(id_raw)
     except (ValueError, UnicodeDecodeError, binascii.Error) as exc:
         raise HTTPException(422, "invalid cursor") from exc
+    if created_at.tzinfo is None:
+        # Task.created_at is DateTime(timezone=True), but asyncpg does not reject a naive
+        # datetime bound against it: it silently assumes UTC instead of raising, so a forged
+        # cursor would otherwise compare against the wrong instant rather than fail loudly.
+        # Rejected here, at the same boundary as every other malformed cursor.
+        raise HTTPException(422, "invalid cursor")
+    return created_at, cursor_id
 
 
 @router.get("", response_model=TaskListOut)
