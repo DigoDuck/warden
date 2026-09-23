@@ -267,3 +267,22 @@ async def test_the_janitor_discards_terminal_and_missing_tasks_but_never_a_live_
         for volume in volumes:
             with contextlib.suppress(docker_sdk.errors.NotFound, docker_sdk.errors.APIError):
                 volume.remove(force=True)
+
+
+async def test_the_janitor_survives_an_unreachable_docker_daemon(
+    session_factory: async_sessionmaker[AsyncSession], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Docker hiccup in the janitor must not kill the worker: `run_forever` calls it at
+    start and every JANITOR_INTERVAL_SECONDS, so an idle worker that used to ride out a
+    Docker Desktop restart would otherwise die at its next sweep.
+
+    Caused, not simulated: DOCKER_HOST points at a closed port, so the daemon is really
+    unreachable. docker-py raises a bare `DockerException` there, which is not an `OSError`.
+    """
+    monkeypatch.setenv("DOCKER_HOST", "tcp://127.0.0.1:1")
+    escaped: Exception | None = None
+    try:
+        await discard_orphaned_workspace_volumes(session_factory)
+    except Exception as exc:
+        escaped = exc
+    assert escaped is None, f"the janitor let {escaped!r} escape; run_forever dies with it"
