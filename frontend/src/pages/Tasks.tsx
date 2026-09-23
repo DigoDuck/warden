@@ -76,7 +76,9 @@ export function Tasks() {
             Falha ao carregar as tarefas.{" "}
             {tasksQuery.error instanceof ApiError ? `(${tasksQuery.error.status})` : ""}
           </p>
-          <button type="button" onClick={() => tasksQuery.refetch()}>
+          {/* DESIGN.md: secondary buttons (no bg-accent/bg-danger-solid) border with
+              --border-control, same as an input/select. */}
+          <button type="button" className="border-border-control" onClick={() => tasksQuery.refetch()}>
             Tentar de novo
           </button>
         </div>
@@ -94,7 +96,8 @@ export function Tasks() {
           <div className="mt-4 overflow-x-auto">
             <table className="w-full text-left text-sm">
               <thead>
-                <tr className="h-10 border-b border-border-subtle text-fg-muted">
+                {/* DESIGN.md: table header uses --surface-raised. */}
+                <tr className="h-10 border-b border-border-subtle bg-surface-raised text-fg-muted">
                   <th scope="col">Especificação</th>
                   <th scope="col">Status</th>
                   <th scope="col">Repositório</th>
@@ -103,7 +106,8 @@ export function Tasks() {
               </thead>
               <tbody>
                 {tasks.map((task) => (
-                  <tr key={task.id} className="h-10 border-b border-border-subtle">
+                  // DESIGN.md: row hover uses --surface-raised. No transition (week 4: no animation).
+                  <tr key={task.id} className="h-10 border-b border-border-subtle hover:bg-surface-raised">
                     <td>
                       <Link to={`/tarefas/${encodeURIComponent(task.id)}`}>{task.spec}</Link>
                     </td>
@@ -121,7 +125,7 @@ export function Tasks() {
           {hasNextPage && (
             <button
               type="button"
-              className="mt-4"
+              className="mt-4 border-border-control"
               onClick={() => tasksQuery.fetchNextPage()}
               disabled={tasksQuery.isFetchingNextPage}
             >

@@ -77,8 +77,11 @@ describe("AppShell", () => {
     );
     renderShell();
 
-    const srText = await screen.findByText("2 aprovações pendentes");
-    expect(srText).toHaveClass("sr-only");
+    // Rendered twice (mobile menu copy + desktop nav copy of NavItems), same as every other
+    // nav item's accessible name in this shell.
+    const srTexts = await screen.findAllByText("2 aprovações pendentes");
+    expect(srTexts.length).toBeGreaterThan(0);
+    for (const el of srTexts) expect(el).toHaveClass("sr-only");
     // The visible numeral is a sibling, hidden from assistive tech so its text is not read
     // a second time on top of the sr-only sentence above.
     expect(screen.getAllByText("2").some((el) => el.getAttribute("aria-hidden") === "true")).toBe(

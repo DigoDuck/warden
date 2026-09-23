@@ -39,11 +39,11 @@ function NavItems({ pendingCount }: { pendingCount: number }): ReactNode {
             <Icon size={20} strokeWidth={1.5} aria-hidden={true} />
             {label}
             {badge && pendingCount > 0 && (
-              <span
-                className="ml-auto rounded-full bg-warn px-2 py-0.5 text-xs font-semibold text-bg"
-                aria-label={`${pendingCount} aprovações pendentes`}
-              >
-                {pendingCount}
+              // DESIGN.md: named via visually-hidden text, not aria-label on a bare <span>
+              // — a <span> has no ARIA role of its own to carry that label reliably.
+              <span className="ml-auto flex items-center rounded-full bg-warn px-2 py-0.5 text-xs font-semibold text-bg">
+                <span aria-hidden="true">{pendingCount}</span>
+                <span className="sr-only">{pendingCount} aprovações pendentes</span>
               </span>
             )}
           </NavLink>
@@ -81,6 +81,15 @@ export function AppShell() {
     }
   }, [location.pathname]);
 
+  // <details> has no built-in "close on navigate": a link inside it changes the route but
+  // never closes the disclosure on its own, leaving the mobile menu open over the new page.
+  const mobileMenuRef = useRef<HTMLDetailsElement>(null);
+  useEffect(() => {
+    if (mobileMenuRef.current) {
+      mobileMenuRef.current.open = false;
+    }
+  }, [location.pathname]);
+
   return (
     <div className="min-h-screen lg:flex">
       <a
@@ -90,7 +99,7 @@ export function AppShell() {
         Pular para o conteúdo
       </a>
 
-      <details className="border-b border-border-subtle bg-surface lg:hidden">
+      <details ref={mobileMenuRef} className="border-b border-border-subtle bg-surface lg:hidden">
         <summary className="flex cursor-pointer list-none items-center justify-between px-4 py-3">
           <span className="font-semibold">Warden</span>
           <Menu size={20} strokeWidth={1.5} aria-hidden={true} />

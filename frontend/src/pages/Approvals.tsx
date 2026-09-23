@@ -35,6 +35,14 @@ function ApprovalCard({ approval }: { approval: ApprovalOut }) {
 
   const rejectDisabled = decide.isPending || note.trim().length === 0;
 
+  function handleReject() {
+    // DESIGN.md: every destructive action asks for confirmation, in addition to (not
+    // instead of) whatever else it already requires — here, the mandatory note.
+    if (window.confirm("Rejeitar esta aprovação? Essa ação não pode ser desfeita.")) {
+      decide.mutate(false);
+    }
+  }
+
   return (
     <li className="border-b border-border-subtle py-4">
       <p>
@@ -75,7 +83,7 @@ function ApprovalCard({ approval }: { approval: ApprovalOut }) {
         <button
           type="button"
           className="self-start bg-danger-solid text-fg"
-          onClick={() => decide.mutate(false)}
+          onClick={handleReject}
           disabled={rejectDisabled}
         >
           Rejeitar
@@ -101,7 +109,7 @@ export function Approvals() {
       {approvalsQuery.isError && (
         <div role="alert">
           <p>Falha ao carregar as aprovações.</p>
-          <button type="button" onClick={() => approvalsQuery.refetch()}>
+          <button type="button" className="border-border-control" onClick={() => approvalsQuery.refetch()}>
             Tentar de novo
           </button>
         </div>

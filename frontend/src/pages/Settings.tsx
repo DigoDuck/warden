@@ -47,7 +47,7 @@ export function Settings() {
           <button type="submit" className="bg-accent text-bg">
             Salvar
           </button>
-          <button type="button" onClick={handleClear}>
+          <button type="button" className="border-border-control" onClick={handleClear}>
             Limpar
           </button>
         </div>

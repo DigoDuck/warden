@@ -82,6 +82,7 @@ describe("Approvals (Decision Queue)", () => {
     vi.mocked(fetch).mockResolvedValue(
       new Response(JSON.stringify([approval()]), { status: 200 }),
     );
+    vi.spyOn(window, "confirm").mockReturnValue(true);
     renderApprovals();
     await screen.findByText("github.open_pr");
 
