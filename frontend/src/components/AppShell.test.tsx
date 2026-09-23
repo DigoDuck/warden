@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -51,6 +51,39 @@ describe("AppShell", () => {
 
     const heading = await screen.findByRole("heading", { name: "Página B" });
     expect(heading).toHaveFocus();
+  });
+
+  it("closes the mobile <details> menu after navigating to a new page", async () => {
+    renderShell();
+    const details = document.querySelector("details");
+    const summary = details?.querySelector("summary");
+    if (!details || !summary) {
+      throw new Error("expected the mobile <details>/<summary> menu to be in the document");
+    }
+
+    await userEvent.click(summary); // opens the menu
+    expect(details.open).toBe(true);
+
+    const links = screen.getAllByRole("link", { name: "Nova tarefa" });
+    await userEvent.click(links[0]); // the mobile nav's own copy, inside <details>
+
+    await waitFor(() => expect(details.open).toBe(false));
+  });
+
+  it("gives the pending-approvals badge its accessible name via visually-hidden text", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(new Response(JSON.stringify([{ id: "1" }, { id: "2" }]), { status: 200 })),
+    );
+    renderShell();
+
+    const srText = await screen.findByText("2 aprovações pendentes");
+    expect(srText).toHaveClass("sr-only");
+    // The visible numeral is a sibling, hidden from assistive tech so its text is not read
+    // a second time on top of the sr-only sentence above.
+    expect(screen.getAllByText("2").some((el) => el.getAttribute("aria-hidden") === "true")).toBe(
+      true,
+    );
   });
 
   it.each([

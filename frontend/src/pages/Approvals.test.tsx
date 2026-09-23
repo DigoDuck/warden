@@ -100,6 +100,40 @@ describe("Approvals (Decision Queue)", () => {
     });
   });
 
+  it("asks for confirmation before rejecting, like every other destructive action", async () => {
+    vi.mocked(fetch).mockResolvedValue(
+      new Response(JSON.stringify([approval()]), { status: 200 }),
+    );
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
+    renderApprovals();
+    await screen.findByText("github.open_pr");
+
+    await userEvent.type(screen.getByLabelText(/nota/i), "não autorizado neste repositório");
+    await userEvent.click(screen.getByRole("button", { name: /rejeitar/i }));
+
+    expect(confirmSpy).toHaveBeenCalledOnce();
+    // Declined: the request must never go out.
+    expect(
+      vi.mocked(fetch).mock.calls.some(([input]) => String(input).includes("/reject")),
+    ).toBe(false);
+
+    confirmSpy.mockReturnValue(true);
+    await userEvent.click(screen.getByRole("button", { name: /rejeitar/i }));
+    await waitFor(() =>
+      expect(
+        vi.mocked(fetch).mock.calls.some(([input]) => String(input).includes("/reject")),
+      ).toBe(true),
+    );
+  });
+
+  it("gives the retry button a --border-control border (DESIGN.md)", async () => {
+    vi.mocked(fetch).mockResolvedValue(new Response("boom", { status: 500 }));
+    renderApprovals();
+    expect(await screen.findByRole("button", { name: /tentar de novo/i })).toHaveClass(
+      "border-border-control",
+    );
+  });
+
   it("handles a 409 (already decided by someone else) without crashing", async () => {
     vi.mocked(fetch).mockImplementation(async (input) => {
       const url = String(input);

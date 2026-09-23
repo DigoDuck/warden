@@ -91,6 +91,34 @@ describe("Tasks", () => {
     );
   });
 
+  it("uses --surface-raised for the table header and a row's hover state (DESIGN.md)", async () => {
+    vi.mocked(fetch).mockResolvedValue(
+      new Response(JSON.stringify(page([task()])), { status: 200 }),
+    );
+    renderTasks();
+
+    const row = await screen.findByRole("row", { name: /faz algo importante/i });
+    expect(row).toHaveClass("hover:bg-surface-raised");
+    const headerRow = screen.getByRole("row", { name: /especificação/i });
+    expect(headerRow).toHaveClass("bg-surface-raised");
+  });
+
+  it("gives secondary buttons a --border-control border (DESIGN.md)", async () => {
+    vi.mocked(fetch).mockResolvedValue(new Response("boom", { status: 500 }));
+    renderTasks();
+    expect(await screen.findByRole("button", { name: /tentar de novo/i })).toHaveClass(
+      "border-border-control",
+    );
+
+    vi.mocked(fetch).mockResolvedValue(
+      new Response(JSON.stringify(page([task()], "cursor-1")), { status: 200 }),
+    );
+    await userEvent.click(screen.getByRole("button", { name: /tentar de novo/i }));
+    expect(await screen.findByRole("button", { name: /carregar mais/i })).toHaveClass(
+      "border-border-control",
+    );
+  });
+
   it("keeps the status filter in the URL so the view deep-links", async () => {
     vi.mocked(fetch).mockResolvedValue(new Response(JSON.stringify(page([])), { status: 200 }));
     renderTasks();
