@@ -17,6 +17,7 @@ import yaml
 from pydantic import BaseModel, Field
 
 from warden.providers.base import (
+    AssistantMessage,
     Completion,
     Message,
     StopReason,
@@ -112,13 +113,23 @@ class FakeProvider:
         model: str | None = None,
         max_tokens: int = 16000,
     ) -> Completion:
-        if self._cursor >= len(self._script):
+        # Resume-aware: the step is the model's position in the dialogue, the number of
+        # assistant turns already in it. The Worker builds a new provider for every claim, so a
+        # task resumed after an approval or a crash meets a fresh instance; a cursor would
+        # restart at step 0 and replay tool call ids the event log already holds. Off by
+        # default because tests resume with a script of only the remaining steps.
+        index = (
+            sum(isinstance(message, AssistantMessage) for message in messages)
+            if self._resume_aware
+            else self._cursor
+        )
+        if index >= len(self._script):
             raise ScriptExhausted(
                 f"script {self._source} has {len(self._script)} step(s) and all were "
                 f"consumed; the loop asked for another turn"
             )
-        step = self._script[self._cursor]
-        self._cursor += 1
+        step = self._script[index]
+        self._cursor = index + 1
 
         return Completion(
             provider=self.name,
