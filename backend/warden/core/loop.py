@@ -17,6 +17,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from uuid import UUID
 
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from warden import audit
@@ -503,7 +504,21 @@ async def _pause_for_approval(
     resume this is setting up. The lease is released here, not merely left to expire, so a
     worker sitting idle can pick up something else immediately instead of waiting out a
     lease nobody is renewing.
+
+    A cancel can commit after `_run_tools`' last `_check_stoppable` and before this pause
+    does. On a RUNNING task it only sets the marker (MARKED: "the loop will stop"), so parking
+    the task anyway would strand the marker on a task nothing runs, and make every later
+    decision fail `ck_tasks_cancel_requested_only_after_claim` on its way back to QUEUED. So
+    the task row is locked first (the same lock every event append takes) and the marker
+    read under it: a cancel that committed before is seen here and wins; one that arrives
+    after waits on this lock, then finds WAITING_APPROVAL and takes its own immediate path.
     """
+    await session.execute(
+        text("SELECT 1 FROM tasks WHERE id = :task_id FOR NO KEY UPDATE"), {"task_id": task.id}
+    )
+    if await cancel.is_requested(session, task.id):
+        raise _RunStopped("CANCELLED", "cancel requested before the task could pause")
+
     approval = await approvals.request_approval(session, task, call, decision)
     await events.append_event(
         session,
