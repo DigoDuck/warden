@@ -64,6 +64,10 @@ class ResumeState:
     # pending call up here before deciding it, so an undecided call is decided as if it were
     # new.
     approval_decisions: dict[str, ApprovalOutcome] = field(default_factory=dict)
+    # Seconds the task spent parked waiting for a human, summed over every decided approval.
+    # `core/loop.py` subtracts it from the wall clock before comparing against max_seconds
+    # (ADR-022): the budget is the agent's time, not the reviewer's.
+    paused_seconds: float = 0.0
 
     @property
     def is_mid_iteration(self) -> bool:
