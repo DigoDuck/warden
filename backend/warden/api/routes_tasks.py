@@ -332,7 +332,9 @@ _STREAM_HEARTBEAT_SECONDS = 15.0
 # the sandbox/docker/policy stack, which this API module must never depend on — briefing
 # §10, "api does not have agent logic"). A task in one of these never runs again, so once
 # an empty poll finds one here, the stream has nothing left to ever wait for.
-_TERMINAL_TASK_STATUSES = frozenset({"SUCCEEDED", "FAILED", "CANCELLED", "TIMED_OUT", "BUDGET_EXCEEDED"})
+_TERMINAL_TASK_STATUSES = frozenset(
+    {"SUCCEEDED", "FAILED", "CANCELLED", "TIMED_OUT", "BUDGET_EXCEEDED"}
+)
 
 
 @router.get("/{task_id}/stream")
