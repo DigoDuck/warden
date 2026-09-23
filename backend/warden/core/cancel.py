@@ -38,17 +38,39 @@ class CancelOutcome(StrEnum):
 # claim committed: it now reads RUNNING and sets the marker instead. If this one goes first,
 # claim's `SKIP LOCKED` passes the row over and then finds it CANCELLED. Same shape as
 # `queue._CLAIM`/`_HEARTBEAT`.
+#
+# WAITING_APPROVAL (ADR-022) is cancelled the same instant way as QUEUED, not marked: the
+# lease was already released when the task paused (`core/loop.py::_pause_for_approval`), so
+# there is no worker left to cooperate with a marker, exactly as there is none for a QUEUED
+# task nobody has claimed yet.
 _REQUEST_CANCEL = text("""
     UPDATE tasks
-       SET status = CASE WHEN status = 'QUEUED' THEN 'CANCELLED' ELSE status END,
-           finished_at = CASE WHEN status = 'QUEUED' THEN now() ELSE finished_at END,
+       SET status = CASE
+               WHEN status IN ('QUEUED', 'WAITING_APPROVAL') THEN 'CANCELLED'
+               ELSE status
+           END,
+           finished_at = CASE
+               WHEN status IN ('QUEUED', 'WAITING_APPROVAL') THEN now()
+               ELSE finished_at
+           END,
            cancel_requested_at = CASE
                WHEN status = 'RUNNING' THEN COALESCE(cancel_requested_at, now())
                ELSE cancel_requested_at
            END
      WHERE id = :task_id
-       AND status IN ('QUEUED', 'RUNNING')
+       AND status IN ('QUEUED', 'RUNNING', 'WAITING_APPROVAL')
     RETURNING status
+""")
+
+# The counterpart for whatever pending approval the cancelled task was waiting on, if any: a
+# question nobody can answer any more (the task will not resume to see the decision) has to
+# stop looking pending, or `decide_approval`'s partial unique index would keep it from ever
+# being asked again on a task id that no longer runs. A no-op when the task was QUEUED or
+# RUNNING, since neither ever has a pending approval (the partial unique index only ever
+# pairs one with a WAITING_APPROVAL task).
+_EXPIRE_PENDING_APPROVAL = text("""
+    UPDATE approvals SET status = 'expired'
+     WHERE task_id = :task_id AND status = 'pending'
 """)
 
 
@@ -56,8 +78,9 @@ async def request_cancel(session: AsyncSession, task_id: UUID) -> CancelOutcome:
     """Ask for a task to stop. Does not commit; same convention as `queue.claim`/`enqueue`,
     the caller decides the transaction boundary.
 
-    A QUEUED task (never claimed, so nothing is running it) is cancelled immediately. A
-    RUNNING one only gets the marker: the loop checks it cooperatively (`_check_stoppable`
+    A QUEUED task (never claimed, so nothing is running it) or a WAITING_APPROVAL one (ADR-
+    022: claimed once, but the lease was released when it paused) is cancelled immediately.
+    A RUNNING one only gets the marker: the loop checks it cooperatively (`_check_stoppable`
     in `core/loop.py`), because there is no other safe way to interrupt a model call or a
     tool already in flight from outside the process running it.
     """
@@ -65,10 +88,10 @@ async def request_cancel(session: AsyncSession, task_id: UUID) -> CancelOutcome:
     await session.flush()
 
     if new_status is None:
-        # The guarded UPDATE above only tells us it did not match QUEUED or RUNNING; a plain
-        # read is what tells apart "already finished" from "no such task", and this branch
-        # is cold enough (a request that lost the race, or a bad id) that the extra round
-        # trip costs nothing worth avoiding.
+        # The guarded UPDATE above only tells us it did not match QUEUED, RUNNING or
+        # WAITING_APPROVAL; a plain read is what tells apart "already finished" from "no
+        # such task", and this branch is cold enough (a request that lost the race, or a bad
+        # id) that the extra round trip costs nothing worth avoiding.
         exists = await session.get(Task, task_id)
         return CancelOutcome.NOT_FOUND if exists is None else CancelOutcome.ALREADY_TERMINAL
 
@@ -79,6 +102,9 @@ async def request_cancel(session: AsyncSession, task_id: UUID) -> CancelOutcome:
     outcome = CancelOutcome.CANCELLED if new_status == "CANCELLED" else CancelOutcome.MARKED
     await events.append_event(session, task_id, events.CANCEL_REQUESTED, {"outcome": outcome.value})
     if outcome is CancelOutcome.CANCELLED:
+        # A no-op unless the task was WAITING_APPROVAL: closes the question nobody will ever
+        # answer now, before the task's own worker-less finish below.
+        await session.execute(_EXPIRE_PENDING_APPROVAL, {"task_id": task_id})
         # No worker is running this task, so nothing else will ever emit `task.finished` for
         # it; this is the only chance the event log gets to say the task ended.
         await events.append_event(
@@ -89,7 +115,7 @@ async def request_cancel(session: AsyncSession, task_id: UUID) -> CancelOutcome:
                 "status": "CANCELLED",
                 "iterations": 0,
                 "cost_usd": "0",
-                "reason": "cancelled before a worker claimed it",
+                "reason": "cancelled with no worker running it",
             },
         )
     return outcome
