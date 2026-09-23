@@ -3,6 +3,11 @@ import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { Approvals } from "../pages/Approvals";
+import { Settings } from "../pages/Settings";
+import { SubmitTask } from "../pages/SubmitTask";
+import { TaskDetail } from "../pages/TaskDetail";
+import { Tasks } from "../pages/Tasks";
 import { AppShell } from "./AppShell";
 
 function renderShell() {
@@ -46,5 +51,30 @@ describe("AppShell", () => {
 
     const heading = await screen.findByRole("heading", { name: "Página B" });
     expect(heading).toHaveFocus();
+  });
+
+  it.each([
+    ["/", <Tasks />],
+    ["/tarefas/nova", <SubmitTask />],
+    ["/tarefas/:id", <TaskDetail />],
+    ["/aprovacoes", <Approvals />],
+    ["/configuracoes", <Settings />],
+  ])("renders exactly one main landmark on %s", (path, page) => {
+    // Never resolves: every page stays in its first render, which is all this looks at.
+    vi.stubGlobal("fetch", vi.fn(() => new Promise(() => {})));
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <MemoryRouter initialEntries={[path.replace(":id", "abc")]}>
+          <Routes>
+            <Route element={<AppShell />}>
+              <Route path={path} element={page} />
+            </Route>
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    // AppShell owns <main id="main-content">; a page rendering its own <main> nests a
+    // second main landmark inside it (invalid HTML, two "main" stops for a screen reader).
+    expect(screen.getAllByRole("main")).toHaveLength(1);
   });
 });
