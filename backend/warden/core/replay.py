@@ -14,6 +14,7 @@ minus `tool.executed`, which are the control plane's own events.
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
@@ -103,6 +104,16 @@ def rebuild(task_events: Sequence[TaskEvent]) -> ResumeState:
         if done:
             state.messages.append(ToolResultsMessage(results=done))
 
+    # When each still-undecided approval was asked for, by tool call id. Both ends of a
+    # pause are `task_events.created_at`, stamped by the database clock, so the difference
+    # never mixes the worker's clock with the API's.
+    asked_at: dict[str, datetime] = {}
+
+    def settle_pause(event: TaskEvent, call_id: str) -> None:
+        requested_at = asked_at.pop(call_id, None)
+        if requested_at is not None and event.created_at is not None:
+            state.paused_seconds += (event.created_at - requested_at).total_seconds()
+
     for event in sorted(task_events, key=lambda e: e.seq):
         payload: dict[str, Any] = dict(event.payload or {})
 
@@ -136,12 +147,18 @@ def rebuild(task_events: Sequence[TaskEvent]) -> ResumeState:
         elif event.type == ev.TASK_FINISHED:
             state.finished = True
 
+        elif event.type == ev.APPROVAL_REQUESTED:
+            if event.created_at is not None:
+                asked_at[str(payload["id"])] = event.created_at
+
         elif event.type == ev.APPROVAL_GRANTED:
+            settle_pause(event, str(payload["id"]))
             state.approval_decisions[str(payload["id"])] = ApprovalOutcome(
                 status="approved", approval_id=str(payload["approval_id"])
             )
 
         elif event.type == ev.APPROVAL_REJECTED:
+            settle_pause(event, str(payload["id"]))
             note = payload.get("note")
             state.approval_decisions[str(payload["id"])] = ApprovalOutcome(
                 status="rejected",
