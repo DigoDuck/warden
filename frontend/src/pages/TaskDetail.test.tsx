@@ -87,4 +87,17 @@ describe("TaskDetail", () => {
     expect(await screen.findByText("SUCCEEDED", {}, { timeout: 4000 })).toBeInTheDocument();
     expect(await screen.findByText("task.finished")).toBeInTheDocument();
   });
+
+  it("keeps the route's id inside the /tasks/{id} path segment", async () => {
+    // useParams hands back the decoded id, so a crafted link like /tarefas/..%2F..%2Faudit
+    // would otherwise send the viewer's bearer token to GET /audit instead of a task.
+    routeFetch({});
+
+    renderAt("/tarefas/..%2F..%2Faudit");
+
+    expect(await screen.findByText("Tarefa não encontrada.")).toBeInTheDocument();
+    const urls = vi.mocked(fetch).mock.calls.map(([input]) => String(input));
+    expect(urls).toContain("/api/tasks/..%2F..%2Faudit");
+    expect(urls).toContain("/api/tasks/..%2F..%2Faudit/events");
+  });
 });
