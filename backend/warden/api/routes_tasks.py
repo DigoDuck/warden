@@ -155,9 +155,9 @@ async def cancel_task(
     claims: Annotated[Claims, Depends(require_scope("tasks:write"))],
 ) -> TaskOut:
     """Ask a task to stop. Maps `core.cancel.request_cancel`'s outcome enum only, never a
-    task status directly: another track is adding a WAITING_APPROVAL -> CANCELLED path
-    inside `request_cancel`, and this route must keep working unchanged whatever statuses
-    end up producing which outcome.
+    task status directly: which statuses lead to which outcome is `request_cancel`'s call
+    (a task waiting for approval, for one, has no worker to notice a marker), and this route
+    must keep working unchanged when that mapping grows.
     """
     user_id = _user_id_of(claims)
     task = await _task_or_404(session, task_id, claims, user_id)
