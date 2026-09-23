@@ -14,7 +14,7 @@ from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from warden.core import approvals, queue
+from warden.core import approvals, cancel, queue
 from warden.core.events import read_events
 from warden.models import Approval, AuditLog, Task, User
 
@@ -333,3 +333,82 @@ async def test_a_decision_writes_an_audit_entry_with_the_user_as_actor(
     assert entry.target_type == "approval"
     assert entry.details["task_id"] == str(task_id)
     assert entry.details["note"] == note
+
+
+async def _until_lock_waiters(session_factory: async_sessionmaker[AsyncSession], n: int) -> None:
+    """Wait until `n` backends in this test database are blocked on a lock, so the test can
+    order who queues first instead of hoping the scheduler does."""
+    for _ in range(200):
+        async with session_factory() as probe:
+            waiting = await probe.scalar(
+                text(
+                    "SELECT count(*) FROM pg_stat_activity"
+                    " WHERE datname = current_database() AND wait_event_type = 'Lock'"
+                )
+            )
+        if waiting is not None and waiting >= n:
+            return
+        await asyncio.sleep(0.02)
+    raise AssertionError(f"never saw {n} backend(s) waiting on a lock")
+
+
+async def test_a_cancel_racing_a_decision_on_the_same_task_never_deadlocks(
+    session: AsyncSession, session_factory: async_sessionmaker[AsyncSession]
+) -> None:
+    """`request_cancel` locks the task row, then the approval row (expiring it). A decision
+    has to take the same two locks in the same order, or a cancel and an approve landing on
+    the same paused task at the same moment each hold one lock and wait for the other, and
+    Postgres kills one of the two requests as a deadlock (a 500 for whoever clicked).
+
+    The interleaving is forced, not raced: a third session holds the task row, the cancel
+    queues on it first, then the decision; releasing the row lets them run in that order.
+    """
+    task = await _waiting_task(session)
+    row = _approval(task)
+    session.add(row)
+    await session.flush()
+    await session.commit()
+    user = await _a_user(session)
+    await session.commit()
+    user_id, task_id, approval_id = user.id, task.id, row.id
+
+    async def do_cancel() -> cancel.CancelOutcome:
+        async with session_factory() as own:
+            outcome = await cancel.request_cancel(own, task_id)
+            await own.commit()
+            return outcome
+
+    async def do_approve() -> str:
+        async with session_factory() as own:
+            try:
+                await approvals.decide_approval(
+                    own, approval_id, approve=True, user_id=user_id, note=None
+                )
+            except approvals.ApprovalAlreadyDecided:
+                return "already decided"
+            await own.commit()
+            return "approved"
+
+    async with session_factory() as blocker:
+        await blocker.execute(
+            text("SELECT 1 FROM tasks WHERE id = :id FOR NO KEY UPDATE"), {"id": task_id}
+        )
+        cancelling = asyncio.create_task(do_cancel())
+        await _until_lock_waiters(session_factory, 1)
+        approving = asyncio.create_task(do_approve())
+        # The decision's first statement may not block at all (that is the bug: it takes
+        # the approval row without the task row); give it the time to run either way.
+        await asyncio.sleep(0.3)
+        await blocker.commit()
+
+    outcome, decided = await asyncio.wait_for(asyncio.gather(cancelling, approving), timeout=15)
+
+    # The cancel queued first, so it wins: the task is cancelled, the question expired, and
+    # the decision finds nothing left to decide (a 409 at the API, not a 500).
+    assert outcome is cancel.CancelOutcome.CANCELLED
+    assert decided == "already decided"
+    async with session_factory() as probe:
+        final = await probe.get(Approval, approval_id)
+        assert final is not None and final.status == "expired"
+        refreshed = await probe.get(Task, task_id)
+        assert refreshed is not None and refreshed.status == "CANCELLED"
