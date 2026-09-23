@@ -1050,3 +1050,53 @@ async def test_a_resumed_run_keeps_the_original_clock_for_max_seconds(
     assert "max_seconds" in (result.reason or "")
     kinds = [event.type for event in await read_events(session, task.id)]
     assert kinds == ["task.finished"]
+
+
+async def test_a_cancel_landing_while_the_call_is_being_decided_wins_over_the_pause(
+    session: AsyncSession,
+    session_factory: async_sessionmaker[AsyncSession],
+    workspace: pathlib.Path,
+) -> None:
+    """The loop checks for a cancel before deciding a call, but a cancel can still commit
+    after that check and before the pause does (deciding can take a sandbox round trip for
+    `apply_patch`). While the task is still RUNNING, `request_cancel` only sets the marker
+    and answers MARKED, promising the loop will stop. If the loop then parks the task
+    WAITING_APPROVAL anyway, that promise is broken: nothing is running to see the marker,
+    and a later approve/reject would try to put a task with a cancel marker back in QUEUED,
+    which `ck_tasks_cancel_requested_only_after_claim` refuses (a 500 on every decision).
+    """
+    task = await _claimed_task(session)
+    task_id = task.id
+    registry = FakeWorkspace().registry()
+    real_touched_paths = registry.touched_paths
+
+    async def cancel_while_deciding(name: str, arguments: dict[str, Any]) -> list[str | None]:
+        if name == "github.open_pr":
+            async with session_factory() as other:
+                outcome = await cancel.request_cancel(other, task_id)
+                await other.commit()
+            assert outcome is cancel.CancelOutcome.MARKED
+        return await real_touched_paths(name, arguments)
+
+    registry.touched_paths = cancel_while_deciding  # type: ignore[method-assign]
+
+    result = await run_task(
+        session,
+        task,
+        FakeProvider([_step("github.open_pr", title="x")]),
+        registry,
+        _require_approval_policy(),
+        workspace=workspace,
+        holder=task.claimed_by,
+    )
+
+    assert result.status == "CANCELLED"
+    async with session_factory() as probe:
+        row = await probe.get(Task, task_id)
+        assert row is not None and row.status == "CANCELLED"
+        pending = await probe.scalar(
+            select(func.count())
+            .select_from(Approval)
+            .where(Approval.task_id == task_id, Approval.status == "pending")
+        )
+        assert pending == 0
