@@ -22,6 +22,7 @@ from collections.abc import Callable
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -246,9 +247,40 @@ async def discard_orphaned_workspace_volumes(
     never discarded there. This is the only other place that ever calls
     `discard_workspace_volume`.
 
-    Stub: real implementation lands once the test below has run red against this.
+    Race safety: every candidate task's status is read in ONE query, up front, before this
+    discards anything, and a task is only ever discarded if that single read already found it
+    terminal (`TERMINAL_STATUSES`) or missing a row entirely. Nothing in this state machine
+    ever moves a task's status *out of* a terminal one (`core/queue.py`, `core/cancel.py` and
+    `core/approvals.py` only ever move a row *into* one), so whatever this reads as terminal
+    stays terminal forever — there is no later moment at which a volume this call decided to
+    discard could still belong to a task that resumes onto it. A task read as QUEUED, RUNNING
+    or WAITING_APPROVAL is left alone unconditionally: even a stale read only costs one more
+    sweep before an already-terminal task's volume is noticed, never a live task's volume
+    disappearing under it.
     """
-    return None
+    try:
+        task_ids = await asyncio.to_thread(list_task_ids_with_workspace_volumes)
+    except _TRANSIENT_DB_ERRORS:
+        return
+    if not task_ids:
+        return
+
+    try:
+        async with session_factory() as session:
+            uuids = [uuid.UUID(task_id) for task_id in task_ids]
+            rows = (
+                await session.execute(select(Task.id, Task.status).where(Task.id.in_(uuids)))
+            ).all()
+    except _TRANSIENT_DB_ERRORS:
+        return
+
+    status_by_id = {str(task_id): status for task_id, status in rows}
+    for task_id in task_ids:
+        status = status_by_id.get(task_id)
+        if status is not None and status not in TERMINAL_STATUSES:
+            continue  # QUEUED, RUNNING or WAITING_APPROVAL: a resume still needs this volume.
+        with contextlib.suppress(_TRANSIENT_DB_ERRORS):
+            await asyncio.to_thread(discard_workspace_volume, task_id)
 
 
 class Worker:
@@ -349,6 +381,12 @@ class Worker:
                         await asyncio.to_thread(discard_workspace_volume, str(task_id))
 
     async def run_forever(self) -> None:
+        # Once at start (an orphan from before this process existed has been waiting
+        # regardless), then every JANITOR_INTERVAL_SECONDS. A monotonic clock, not
+        # wall-clock: immune to the system clock stepping backward or forward mid-run.
+        await discard_orphaned_workspace_volumes(self._sessions)
+        next_sweep = asyncio.get_running_loop().time() + JANITOR_INTERVAL_SECONDS
+
         while not self._stopping.is_set():
             result = await self.run_once()
             if result is None:
@@ -357,6 +395,9 @@ class Worker:
                 # submission and pickup ever shows up in the metrics.
                 with contextlib.suppress(TimeoutError):
                     await asyncio.wait_for(self._stopping.wait(), timeout=IDLE_POLL_SECONDS)
+            if asyncio.get_running_loop().time() >= next_sweep:
+                await discard_orphaned_workspace_volumes(self._sessions)
+                next_sweep = asyncio.get_running_loop().time() + JANITOR_INTERVAL_SECONDS
 
 
 async def main() -> int:  # pragma: no cover - process entry point
