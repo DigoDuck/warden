@@ -272,6 +272,73 @@ async def test_stream_does_not_hold_a_transaction_open_between_polls(
             await consumer
 
 
+async def test_stream_ends_promptly_when_resuming_at_or_after_task_finished(
+    client: AsyncClient, session_factory: async_sessionmaker[AsyncSession], keys: KeyPair
+) -> None:
+    """A client that reconnects with Last-Event-ID already at (or past) the seq of
+    task.finished has nothing left to receive, and the task is already terminal: the stream
+    must end on its very next empty poll instead of polling forever, since it will never see
+    a fresh task.finished event to trigger the old "only stop on that event" exit.
+    """
+    token = await _user_token(
+        session_factory, keys, await _user(session_factory), ["tasks:write", "tasks:read"]
+    )
+    task_id = await _submit(client, token)
+    async with session_factory() as session:
+        session.add(
+            TaskEvent(
+                task_id=uuid.UUID(task_id),
+                seq=1,
+                type=core_events.TASK_FINISHED,
+                payload={"status": "SUCCEEDED"},
+            )
+        )
+        await session.execute(
+            text("UPDATE tasks SET status = 'SUCCEEDED' WHERE id = :id"), {"id": task_id}
+        )
+        await session.commit()
+
+    async def run() -> list[dict[str, str]]:
+        async with client.stream(
+            "GET",
+            f"/tasks/{task_id}/stream",
+            headers={**_auth(token), "Last-Event-ID": "1"},
+        ) as response:
+            assert response.status_code == 200
+            return await _read_sse_events(response)
+
+    received = await asyncio.wait_for(run(), timeout=2)
+    assert received == []
+
+
+async def test_stream_of_a_terminal_task_without_a_task_finished_event_ends(
+    client: AsyncClient, session_factory: async_sessionmaker[AsyncSession], keys: KeyPair
+) -> None:
+    """A task can be terminal without task.finished ever having been written (data fixed up
+    by hand is the realistic case, but the stream must not rely on that event existing at
+    all): the stream must still end instead of polling this task forever.
+    """
+    token = await _user_token(
+        session_factory, keys, await _user(session_factory), ["tasks:write", "tasks:read"]
+    )
+    task_id = await _submit(client, token)
+    async with session_factory() as session:
+        await session.execute(
+            text("UPDATE tasks SET status = 'FAILED' WHERE id = :id"), {"id": task_id}
+        )
+        await session.commit()
+
+    async def run() -> list[dict[str, str]]:
+        async with client.stream(
+            "GET", f"/tasks/{task_id}/stream", headers=_auth(token)
+        ) as response:
+            assert response.status_code == 200
+            return await _read_sse_events(response)
+
+    received = await asyncio.wait_for(run(), timeout=2)
+    assert received == []
+
+
 async def test_stream_releases_the_request_session_before_streaming(
     client: AsyncClient, session_factory: async_sessionmaker[AsyncSession], keys: KeyPair
 ) -> None:
