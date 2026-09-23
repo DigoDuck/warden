@@ -1,9 +1,19 @@
-import { Ban, CheckCircle, Clock, Hand, Loader, TimerOff, Wallet, XCircle } from "lucide-react";
+import {
+  Ban,
+  CheckCircle,
+  Clock,
+  Hand,
+  Loader,
+  TimerOff,
+  Wallet,
+  XCircle,
+  type LucideIcon,
+} from "lucide-react";
 import { Badge, type BadgeTone } from "./Badge";
 
 interface StatusEntry {
   tone: BadgeTone;
-  icon: typeof Clock;
+  icon: LucideIcon;
   label: string;
 }
 

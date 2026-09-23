@@ -30,15 +30,16 @@ export function useTaskEventStream(taskId: string | undefined) {
 
   useEffect(() => {
     if (!taskId) return;
-    setEvents([]);
-    setStatus("connecting");
+    // Narrows to `string` once and for all: TypeScript does not carry the guard above into
+    // functions declared below it (they could, in principle, run after `taskId` changed).
+    const id = taskId;
 
     const controller = new AbortController();
     let lastSeq: number | undefined;
     let cancelled = false;
 
     async function connectOnce(): Promise<ConnectOutcome> {
-      const response = await openTaskEventStream(taskId, {
+      const response = await openTaskEventStream(id, {
         afterId: lastSeq,
         signal: controller.signal,
       });
@@ -75,7 +76,7 @@ export function useTaskEventStream(taskId: string | undefined) {
           }
           // "dropped": the server ended the stream (or the network did) before a terminal
           // event. Reconnect with Last-Event-ID = lastSeq once the delay above passes.
-        } catch (error) {
+        } catch {
           if (controller.signal.aborted) {
             return; // unmount or taskId change tore this down; not a real error
           }

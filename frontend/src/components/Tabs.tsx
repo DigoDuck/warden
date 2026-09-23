@@ -22,7 +22,7 @@ export function Tabs({ label, tabs }: { label: string; tabs: TabDef[] }) {
   }
 
   function handleKeyDown(event: KeyboardEvent<HTMLButtonElement>, index: number) {
-    let nextIndex: number | null = null;
+    let nextIndex: number;
     switch (event.key) {
       case "ArrowRight":
         nextIndex = (index + 1) % tabs.length;

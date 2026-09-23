@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
-import { ClipboardCheck, ListChecks, Menu, Plus, Settings } from "lucide-react";
-import { type ComponentType, type ReactNode, useEffect, useRef } from "react";
+import { ClipboardCheck, ListChecks, Menu, Plus, Settings, type LucideIcon } from "lucide-react";
+import { type ReactNode, useEffect, useRef } from "react";
 import { NavLink, Outlet, useLocation } from "react-router-dom";
 import { apiFetch } from "../api/client";
 import type { ApprovalOut } from "../api/types";
@@ -8,7 +8,7 @@ import type { ApprovalOut } from "../api/types";
 interface NavItem {
   to: string;
   label: string;
-  icon: ComponentType<{ size?: number; "aria-hidden"?: boolean }>;
+  icon: LucideIcon;
   end?: boolean;
   badge?: boolean;
 }

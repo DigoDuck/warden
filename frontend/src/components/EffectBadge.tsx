@@ -1,9 +1,9 @@
-import { CheckCircle, Hand, ShieldX } from "lucide-react";
+import { CheckCircle, Hand, ShieldX, type LucideIcon } from "lucide-react";
 import { Badge, type BadgeTone } from "./Badge";
 
 interface EffectEntry {
   tone: BadgeTone;
-  icon: typeof Hand;
+  icon: LucideIcon;
   label: string;
 }
 

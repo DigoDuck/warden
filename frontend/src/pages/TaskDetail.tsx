@@ -156,7 +156,14 @@ export function TaskDetail() {
               label="Detalhe da tarefa"
               tabs={[
                 { id: "spec", label: "Spec", panel: <SpecPanel task={task} /> },
-                { id: "execucao", label: "Execução", panel: <ExecucaoPanel taskId={id} /> },
+                {
+                  id: "execucao",
+                  label: "Execução",
+                  // Keyed by task id: a fresh mount (and fresh hook state) beats an
+                  // effect that resets state for an id change useTaskEventStream will
+                  // essentially never see in practice (the route itself changes first).
+                  panel: <ExecucaoPanel key={id} taskId={id} />,
+                },
                 { id: "custo", label: "Custo", panel: <CustoPanel task={task} /> },
               ]}
             />

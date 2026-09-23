@@ -1,4 +1,4 @@
-import type { ComponentType } from "react";
+import type { LucideIcon } from "lucide-react";
 
 export type BadgeTone = "muted" | "info" | "ok" | "warn" | "danger" | "caution";
 
@@ -13,14 +13,9 @@ const TONE_CLASSES: Record<BadgeTone, string> = {
   caution: "text-caution",
 };
 
-interface IconProps {
-  size?: number;
-  "aria-hidden"?: boolean | "true" | "false";
-}
-
 interface BadgeProps {
   tone: BadgeTone;
-  icon: ComponentType<IconProps>;
+  icon: LucideIcon;
   label: string;
 }
 
