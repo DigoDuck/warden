@@ -188,3 +188,43 @@ daemon caiu) seria silenciosamente relabelada como cancelamento e escondida do l
   `SUCCEEDED`; a tarefa termina `SUCCEEDED` com `cancel_requested_at` ainda setado. Não é um
   defeito, é a definição de cooperativo: o pedido só é honrado no próximo ponto de checagem,
   e às vezes esse ponto não chega a existir porque a tarefa já tinha acabado.
+
+## Adendo (2026-09-22): orçamento por tarefa, aplicado de verdade
+
+O `Budget` desta ADR sempre existiu (`max_iterations`, `max_usd`, `max_seconds`), mas até
+`feat/cancel-endpoint-and-budget` só o teto fixo passado a `Worker.__init__` valia — o
+`tasks.budget` que `POST /tasks` já aceita e valida (`BudgetIn`) nunca era lido pelo worker.
+Esta PR fecha essa lacuna e adiciona `max_seconds` a `BudgetIn` (faltava; só `max_iterations`
+e `max_usd` existiam).
+
+**Regra de segurança: `tasks.budget` só pode apertar o teto do worker, nunca afrouxar.**
+`tasks.budget` chega de um chamador da API; tratá-lo como confiável ao ponto de *substituir*
+o teto do worker deixaria qualquer usuário pedir `max_usd: 999999` e gastar o que quisesse.
+`core/worker.py::merge_budget` é uma função pura que faz `min()` campo a campo (o valor do
+worker quando a tarefa não define um) e nunca o inverso. Testada exaustivamente em
+`tests/test_worker.py` sem precisar de banco nem Docker.
+
+**Valor inválido no JSON não derruba o worker.** `tasks.budget` é `JSONB`; nada no banco
+impede outro código de escrever uma string, um negativo, `Infinity` (como texto) ou até algo
+que não seja um objeto ali, mesmo com `BudgetIn` validando a entrada da API. `merge_budget`
+trata qualquer valor que não seja um número positivo e finito exatamente como "a tarefa não
+definiu este campo": ignora e mantém o teto do worker. Alternativa descartada: falhar a
+tarefa (`FAILED`) num valor ruim. Rejeitada pelo mesmo motivo que a API devolve 422 em vez de
+500 num corpo malformado — um problema de forma do dado do lado de fora não deveria derrubar
+o controle do lado de dentro, e o teto do worker já protege igual sem o campo da tarefa.
+
+**`Decimal(str(valor))`, não `Decimal(valor)`, para `max_usd`.** O JSON decodifica número
+para `float`/`int` do Python, nunca `Decimal`. `Decimal(0.1)` carrega a imprecisão binária do
+float (`0.1000000000000000055511151231257827021181583404541015625`); `Decimal(str(0.1))` não.
+Testado explicitamente (`test_a_tighter_max_usd_wins_and_comes_back_as_a_decimal`).
+
+**`max_seconds: float | None = None` em `Budget` significa "sem teto", e uma tarefa ainda
+pode apertá-lo a partir daí.** `_tightened_seconds` trata `ceiling=None` como "nada para
+comparar, use o valor da tarefa", não como zero — do contrário nenhuma tarefa conseguiria
+pedir um deadline quando o worker roda sem um por padrão, o que inverteria a regra de
+"aperta, nunca afrouxa" para esse campo específico.
+
+**`BudgetIn.max_seconds` ganha o mesmo teto de 86 400s (um dia) que `identity
+.USER_TTL_CAP_SECONDS` já usa (ADR-020) para a validade de um token.** Não protege nada
+sozinho (`merge_budget` é quem protege o worker), é só sanidade na entrada: 422 antes de
+gravar um número absurdo em vez de deixar a coluna aceitar qualquer coisa.

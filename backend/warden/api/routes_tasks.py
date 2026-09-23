@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from warden import audit
 from warden.api.deps import SessionDep, require_scope
 from warden.api.schemas import TaskCreate, TaskEventOut, TaskEventPage, TaskOut
-from warden.core import queue
+from warden.core import cancel, queue
 from warden.core.events import ITERATION_STARTED
 from warden.identity import Claims
 from warden.models import AuditLog, ModelCall, Task, TaskEvent
@@ -145,6 +145,58 @@ async def get_task(
     user_id = _user_id_of(claims)
     task = await _task_or_404(session, task_id, claims, user_id)
     return await _to_task_out(session, task)
+
+
+@router.post("/{task_id}/cancel", response_model=TaskOut)
+async def cancel_task(
+    task_id: uuid.UUID,
+    response: Response,
+    session: SessionDep,
+    claims: Annotated[Claims, Depends(require_scope("tasks:write"))],
+) -> TaskOut:
+    """Ask a task to stop. Maps `core.cancel.request_cancel`'s outcome enum only, never a
+    task status directly: which statuses lead to which outcome is `request_cancel`'s call
+    (a task waiting for approval, for one, has no worker to notice a marker), and this route
+    must keep working unchanged when that mapping grows.
+    """
+    user_id = _user_id_of(claims)
+    task = await _task_or_404(session, task_id, claims, user_id)
+    # Peeked before the race-safe UPDATE below, purely to decide whether *this* request is
+    # the one that actually changed something. `request_cancel`'s own COALESCE makes the
+    # marker itself idempotent (a second request never moves it), but it always returns
+    # MARKED again for a still-running task, so without this peek every poll of an
+    # already-marked task would append another audit row. A genuine concurrent double
+    # request can still both read the marker as unset and both audit once each; accepted,
+    # the same kind of narrow race ADR-021 already tolerates elsewhere, and cheap to
+    # tighten later by having `request_cancel` report whether it just transitioned.
+    already_marked = task.cancel_requested_at is not None
+
+    outcome = await cancel.request_cancel(session, task_id)
+
+    if outcome is cancel.CancelOutcome.NOT_FOUND:
+        # _task_or_404 above already proved this row exists and is visible; reaching this
+        # means it vanished between the two statements, which nothing in this codebase
+        # does today. Mapped anyway because the outcome enum, not our own prior read, is
+        # what this route promises to map.
+        raise HTTPException(404, "task not found")
+    if outcome is cancel.CancelOutcome.ALREADY_TERMINAL:
+        raise HTTPException(409, "task already finished")
+
+    if outcome is cancel.CancelOutcome.CANCELLED or not already_marked:
+        await audit.append(
+            session,
+            actor_type="user",
+            actor_id=str(user_id),
+            action="task.cancel_requested",
+            target_type="task",
+            target_id=str(task_id),
+        )
+
+    await session.commit()
+    response.status_code = 200 if outcome is cancel.CancelOutcome.CANCELLED else 202
+    refreshed = await session.get(Task, task_id)
+    assert refreshed is not None
+    return await _to_task_out(session, refreshed)
 
 
 @router.get("/{task_id}/events", response_model=TaskEventPage)

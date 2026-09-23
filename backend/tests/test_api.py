@@ -22,7 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from warden import audit, identity
 from warden.api.app import create_app
-from warden.core import events
+from warden.core import events, queue
 from warden.identity.jwt import ALGORITHM, KeyPair, _kid_for
 from warden.models import AuditLog, Task, TaskEvent, User
 
@@ -226,6 +226,7 @@ async def test_an_agent_token_is_refused_even_with_a_matching_scope_name(
         ("GET", f"/tasks/{uuid.uuid4()}", ["tasks:write", "audit:read"]),
         ("GET", f"/tasks/{uuid.uuid4()}/events", ["tasks:write", "audit:read"]),
         ("GET", "/audit/verify", ["tasks:write", "tasks:read"]),
+        ("POST", f"/tasks/{uuid.uuid4()}/cancel", ["tasks:read", "audit:read"]),
     ],
 )
 async def test_each_route_demands_its_own_scope(
@@ -297,6 +298,39 @@ async def test_a_non_finite_budget_is_422_not_a_500(
         },
     )
     assert response.status_code == 422
+
+
+async def test_max_seconds_beyond_the_bound_is_422_for_that_reason(
+    client: AsyncClient, session_factory: async_sessionmaker[AsyncSession], keys: KeyPair
+) -> None:
+    """Not just "some 422": the bound (`le=`) is what has to fire, not the field being
+    unknown. Before `BudgetIn.max_seconds` exists, sending it at all is already a 422
+    (`extra_forbidden`); this pins the error to the constraint this PR adds instead.
+    """
+    token = await _user_token(session_factory, keys, await _user(session_factory), ["tasks:write"])
+    response = await client.post(
+        "/tasks",
+        json={"spec": "x", "budget": {"max_seconds": 86_401}},
+        headers={**_auth(token), "Idempotency-Key": str(uuid.uuid4())},
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["type"] == "less_than_equal"
+
+
+async def test_a_valid_max_seconds_budget_is_stored(
+    client: AsyncClient, session_factory: async_sessionmaker[AsyncSession], keys: KeyPair
+) -> None:
+    token = await _user_token(session_factory, keys, await _user(session_factory), ["tasks:write"])
+    response = await client.post(
+        "/tasks",
+        json={"spec": "x", "budget": {"max_seconds": 30}},
+        headers={**_auth(token), "Idempotency-Key": str(uuid.uuid4())},
+    )
+    assert response.status_code == 201
+    async with session_factory() as session:
+        row = await session.get(Task, uuid.UUID(response.json()["id"]))
+    assert row is not None
+    assert row.budget["max_seconds"] == 30
 
 
 # --- POST /tasks: idempotency ----------------------------------------------------------------
@@ -483,6 +517,148 @@ async def test_events_are_paginated_by_seq(
     body2 = second_page.json()
     assert [e["seq"] for e in body2["events"]] == [3]
     assert body2["next_after"] is None
+
+
+# --- POST /tasks/{id}/cancel ------------------------------------------------------------------
+
+
+async def _submit(client: AsyncClient, token: str, spec: str = "x") -> str:
+    headers = {**_auth(token), "Idempotency-Key": str(uuid.uuid4())}
+    created = await client.post("/tasks", json={"spec": spec}, headers=headers)
+    assert created.status_code == 201
+    return created.json()["id"]
+
+
+async def _claim(session_factory: async_sessionmaker[AsyncSession], task_id: str) -> None:
+    """Move a task from QUEUED to RUNNING without a real worker, same as test_cancel.py."""
+    async with session_factory() as session:
+        claimed = await queue.claim(session, "worker-a")
+        assert claimed is not None and str(claimed.id) == task_id
+        await session.commit()
+
+
+async def test_cancelling_a_queued_task_finishes_it_on_the_spot(
+    client: AsyncClient, session_factory: async_sessionmaker[AsyncSession], keys: KeyPair
+) -> None:
+    token = await _user_token(session_factory, keys, await _user(session_factory), ["tasks:write"])
+    task_id = await _submit(client, token)
+
+    response = await client.post(f"/tasks/{task_id}/cancel", headers=_auth(token))
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "CANCELLED"
+
+
+async def test_cancelling_a_running_task_only_marks_it(
+    client: AsyncClient, session_factory: async_sessionmaker[AsyncSession], keys: KeyPair
+) -> None:
+    token = await _user_token(session_factory, keys, await _user(session_factory), ["tasks:write"])
+    task_id = await _submit(client, token)
+    await _claim(session_factory, task_id)
+
+    response = await client.post(f"/tasks/{task_id}/cancel", headers=_auth(token))
+
+    assert response.status_code == 202
+    assert response.json()["status"] == "RUNNING"
+
+
+async def test_cancelling_a_running_task_twice_keeps_answering_202(
+    client: AsyncClient, session_factory: async_sessionmaker[AsyncSession], keys: KeyPair
+) -> None:
+    token = await _user_token(session_factory, keys, await _user(session_factory), ["tasks:write"])
+    task_id = await _submit(client, token)
+    await _claim(session_factory, task_id)
+
+    first = await client.post(f"/tasks/{task_id}/cancel", headers=_auth(token))
+    second = await client.post(f"/tasks/{task_id}/cancel", headers=_auth(token))
+
+    assert first.status_code == 202
+    assert second.status_code == 202
+    async with session_factory() as session:
+        count = await session.scalar(
+            select(func.count())
+            .select_from(AuditLog)
+            .where(AuditLog.action == "task.cancel_requested", AuditLog.target_id == task_id)
+        )
+    assert count == 1
+
+
+async def test_cancelling_a_terminal_task_is_409(
+    client: AsyncClient, session_factory: async_sessionmaker[AsyncSession], keys: KeyPair
+) -> None:
+    token = await _user_token(session_factory, keys, await _user(session_factory), ["tasks:write"])
+    task_id = await _submit(client, token)
+    async with session_factory() as session:
+        await session.execute(
+            text("UPDATE tasks SET status = 'SUCCEEDED' WHERE id = :id"), {"id": task_id}
+        )
+        await session.commit()
+
+    response = await client.post(f"/tasks/{task_id}/cancel", headers=_auth(token))
+
+    assert response.status_code == 409
+
+
+async def test_cancelling_an_unknown_task_is_404(
+    client: AsyncClient, session_factory: async_sessionmaker[AsyncSession], keys: KeyPair
+) -> None:
+    token = await _user_token(session_factory, keys, await _user(session_factory), ["tasks:write"])
+    response = await client.post(f"/tasks/{uuid.uuid4()}/cancel", headers=_auth(token))
+    assert response.status_code == 404
+
+
+async def test_cancelling_another_users_task_is_404_not_403(
+    client: AsyncClient, session_factory: async_sessionmaker[AsyncSession], keys: KeyPair
+) -> None:
+    owner_token = await _user_token(
+        session_factory, keys, await _user(session_factory), ["tasks:write"]
+    )
+    task_id = await _submit(client, owner_token)
+
+    stranger_token = await _user_token(
+        session_factory, keys, await _user(session_factory), ["tasks:write"]
+    )
+    response = await client.post(f"/tasks/{task_id}/cancel", headers=_auth(stranger_token))
+
+    assert response.status_code == 404
+
+
+async def test_an_admin_scope_can_cancel_another_users_task(
+    client: AsyncClient, session_factory: async_sessionmaker[AsyncSession], keys: KeyPair
+) -> None:
+    owner_token = await _user_token(
+        session_factory, keys, await _user(session_factory), ["tasks:write"]
+    )
+    task_id = await _submit(client, owner_token)
+
+    admin_token = await _user_token(
+        session_factory, keys, await _user(session_factory), ["tasks:write", "admin"]
+    )
+    response = await client.post(f"/tasks/{task_id}/cancel", headers=_auth(admin_token))
+
+    assert response.status_code == 200
+
+
+async def test_cancel_writes_an_audit_entry(
+    client: AsyncClient, session_factory: async_sessionmaker[AsyncSession], keys: KeyPair
+) -> None:
+    user = await _user(session_factory)
+    token = await _user_token(session_factory, keys, user, ["tasks:write"])
+    task_id = await _submit(client, token)
+
+    response = await client.post(f"/tasks/{task_id}/cancel", headers=_auth(token))
+    assert response.status_code == 200
+
+    async with session_factory() as session:
+        row = await session.scalar(
+            select(AuditLog).where(
+                AuditLog.action == "task.cancel_requested", AuditLog.target_id == task_id
+            )
+        )
+    assert row is not None
+    assert row.target_type == "task"
+    assert row.actor_type == "user"
+    assert row.actor_id == str(user.id)
 
 
 # --- GET /audit/verify -----------------------------------------------------------------------

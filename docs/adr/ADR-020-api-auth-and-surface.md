@@ -121,3 +121,36 @@ um seria esquecido ao mudar o outro. Um escopo mantém tudo que autoriza vindo d
   que já ordena o log (briefing §12), e evita reintroduzir um segundo critério de ordenação.
 - O que esta PR não cobre, de propósito: SSE, cancelamento, aprovações. Cada um pede um design
   próprio (streaming, ou um efeito colateral em `core`) que não cabe no "primeiro esqueleto".
+
+## Adendo (2026-09-22): `POST /tasks/{id}/cancel`
+
+`feat/cancel-endpoint-and-budget` fecha um dos itens deixados de fora acima. A rota entrega
+o escopo `tasks:write` (é uma escrita, não uma leitura) e reusa `_task_or_404`/`_visible_to`
+sem alteração: mesma regra 404-não-403 de `GET /tasks/{id}`, admin incluso.
+
+**A rota mapeia o enum `CancelOutcome`, nunca um `status` de tarefa.** `core/cancel.py` é de
+outra trilha em paralelo (`feat/cancel-and-deadline`), que está adicionando um caminho
+`WAITING_APPROVAL -> CANCELLED` dentro de `request_cancel` no mesmo ciclo. Se esta rota
+decidisse o código HTTP olhando `task.status` em vez do outcome que `request_cancel` já
+devolve pronto, ela precisaria saber de antemão quais status viram qual outcome — exatamente
+o acoplamento que seria quebrado pela outra trilha. `CANCELLED -> 200`, `MARKED -> 202`,
+`ALREADY_TERMINAL -> 409`, `NOT_FOUND -> 404` é a tradução inteira; nenhum `if task.status
+== ...` aparece na rota.
+
+**Auditoria (`task.cancel_requested`) uma vez por mudança de estado real, não uma vez por
+requisição.** `request_cancel` já grava um evento `cancel.requested` (na tarefa) a cada
+chamada, mesmo repetida — é assim que ADR-021 descreve a idempotência do marcador. A linha
+de `audit_log` desta API é uma segunda camada, voltada a "quem pediu o quê", e gravar uma a
+cada poll de um cancelamento já em andamento poluiria essa trilha sem informação nova. A
+rota resolve isso lendo `task.cancel_requested_at` **antes** de chamar `request_cancel`: se
+já vinha preenchido, esta chamada não mudou nada de novo e não audita de novo. Corrida aceita
+e documentada no código: duas requisições verdadeiramente concorrentes podem ambas ler o
+marcador como vazio e ambas auditar, produzindo duas linhas para uma única transição. Aceito
+pelo mesmo motivo que ADR-021 já aceita corridas parecidas (seção "Consequências" de lá): o
+conserto exigiria `request_cancel` devolver não só o outcome mas também "foi esta chamada que
+setou o marcador?", o que muda a assinatura de um módulo de outra trilha por um ganho que só
+importa sob um duplo-clique exatamente simultâneo.
+
+**Idempotência de fato:** cancelar duas vezes uma tarefa `RUNNING` responde 202 as duas
+vezes (`test_cancelling_a_running_task_twice_keeps_answering_202`), sem uma segunda linha de
+auditoria.

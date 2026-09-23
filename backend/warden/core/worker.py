@@ -12,12 +12,15 @@ the event log. Recovery is the normal claim path meeting a task that already has
 import argparse
 import asyncio
 import contextlib
+import math
 import os
 import pathlib
 import signal
 import socket
 import uuid
 from collections.abc import Callable
+from decimal import Decimal, InvalidOperation
+from typing import Any
 
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -60,6 +63,73 @@ DEMO_SCRIPT = REPO_ROOT / "examples" / "demo-script.yaml"
 def worker_id() -> str:
     """Identifies the holder of a lease. Host and pid make a dead one recognisable."""
     return f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
+
+
+def _tightened_int(ceiling: int, value: Any) -> int:
+    """`min(ceiling, value)`, but only when `value` is actually a usable positive int.
+    Anything else keeps `ceiling`: a task-level budget only ever narrows a limit, never
+    invents one out of garbage."""
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return ceiling
+    return min(ceiling, value)
+
+
+def _tightened_decimal(ceiling: Decimal, value: Any) -> Decimal:
+    if isinstance(value, bool) or not isinstance(value, int | float | str | Decimal):
+        return ceiling
+    try:
+        # str(value) first: Decimal(0.1) carries float's own binary imprecision
+        # (0.1000000000000000055511151231257827021181583404541015625); Decimal(str(0.1))
+        # does not. Cheap and exact for the int/str cases too.
+        parsed = value if isinstance(value, Decimal) else Decimal(str(value))
+    except InvalidOperation:
+        return ceiling
+    if not parsed.is_finite() or parsed <= 0:
+        return ceiling
+    return min(ceiling, parsed)
+
+
+def _tightened_seconds(ceiling: float | None, value: Any) -> float | None:
+    """Like the other two, except `ceiling=None` means "unbounded", not "zero": a task
+    deadline still tightens it, it just has nothing to be compared against."""
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return ceiling
+    try:
+        parsed = float(value)
+    except OverflowError:
+        # An int too large for a float (JSONB keeps any numeric): no real deadline anyway.
+        return ceiling
+    if not math.isfinite(parsed) or parsed <= 0:
+        return ceiling
+    return parsed if ceiling is None else min(ceiling, parsed)
+
+
+def merge_budget(worker_ceiling: Budget, task_budget: object) -> Budget:
+    """Tighten `worker_ceiling` with the per-task limits stored in `tasks.budget`.
+
+    SECURITY RULE: `task_budget` reflects a value an API caller chose. `api.schemas
+    .BudgetIn` validates it on the way in, but the column is JSONB and nothing at the
+    database level stops other code from writing something else into it later, so this
+    function is the one place that value gets to change what a run is allowed to spend.
+    It therefore only ever narrows a field (`min()` of the two, or the worker's own value
+    when the task did not set one), never widens one, and a value that fails to parse as a
+    positive, finite number of the right shape is treated exactly like "the task did not
+    set this field" instead of raising: a foreign write to this column, or a bug upstream,
+    degrades to "no extra limit from the task" rather than taking the whole run down. The
+    alternative (fail the task on a bad value) was rejected for the same reason `api`
+    already returns 422 instead of 500 on a malformed body elsewhere in this project: a
+    caller-shaped problem should not read as a control-plane crash. See ADR-021's addendum.
+    """
+    if not isinstance(task_budget, dict):
+        return worker_ceiling
+
+    return Budget(
+        max_iterations=_tightened_int(
+            worker_ceiling.max_iterations, task_budget.get("max_iterations")
+        ),
+        max_usd=_tightened_decimal(worker_ceiling.max_usd, task_budget.get("max_usd")),
+        max_seconds=_tightened_seconds(worker_ceiling.max_seconds, task_budget.get("max_seconds")),
+    )
 
 
 async def _beat(
@@ -210,6 +280,11 @@ class Worker:
             async with self._sessions() as session:
                 claimed = await session.get(Task, task_id)
                 assert claimed is not None
+                # `self._budget` is this worker's own ceiling (`None` means `run_task`'s
+                # default, `Budget()`); `claimed.budget` is whatever the API caller asked
+                # for on this one task. `merge_budget` decides which of the two wins per
+                # field, and only ever in the caller's favour when it is stricter.
+                budget = merge_budget(self._budget or Budget(), claimed.budget)
                 try:
                     result = await run_claimed_task(
                         session,
@@ -218,7 +293,7 @@ class Worker:
                         self._policy,
                         self._workspace,
                         build_registry(sandbox),
-                        budget=self._budget,
+                        budget=budget,
                         holder=self.id,
                     )
                 except queue.LeaseLost:

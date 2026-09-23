@@ -17,6 +17,12 @@ class BudgetIn(BaseModel):
     # allow_inf_nan=False: Python's json parser accepts a bare `Infinity`, `gt=0` passes it,
     # and JSONB then refuses it at insert time as a 500 instead of a 422 here.
     max_usd: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    # Same `allow_inf_nan=False` reasoning as `max_usd`. Bound at a day (86 400s), the same
+    # ceiling ADR-020 already uses for a user token's TTL (`identity.USER_TTL_CAP_SECONDS`):
+    # a caller can only ever tighten `core.worker`'s own deadline (see
+    # `core/worker.py::merge_budget`), so this is a sanity bound on the request body, not the
+    # thing that actually protects a run.
+    max_seconds: float | None = Field(default=None, gt=0, le=86_400, allow_inf_nan=False)
 
 
 class TaskCreate(BaseModel):
