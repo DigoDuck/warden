@@ -4,9 +4,9 @@ Every tool call passes the policy engine first. The model proposes, the control 
 decides, and the decision is deterministic, taken without reading model output as
 instruction, and recorded with the hash of the policy that produced it.
 
-This is week 2's version of briefing section 16. Still absent, arriving with the rest of the
-week: the Docker sandbox executing the calls, the queue claim with a lease, cooperative
-cancellation, checkpointing and resume.
+Week 3 (ADR-022) adds the third branch a decision can take: REQUIRE_APPROVAL no longer
+degrades to a refusal, it pauses the task for a human (WAITING_APPROVAL) and resumes it,
+approved or rejected, exactly the way a crash resumes one (core/replay.py's pending calls).
 """
 
 import pathlib
@@ -19,8 +19,9 @@ from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from warden.core import cancel, events, queue
-from warden.core.replay import ResumeState
+from warden import audit
+from warden.core import approvals, cancel, events, queue
+from warden.core.replay import ApprovalOutcome, ResumeState
 from warden.models import Task, User
 from warden.policy.engine import Decision, Effect, Policy, PolicyContext, UserRef, combine
 from warden.providers.base import (
@@ -113,17 +114,14 @@ async def _check_stoppable(session: AsyncSession, task: Task, budget: Budget) ->
 
 
 def _refusal_message(decision: Decision) -> str:
-    """What the model is told when the control plane says no.
+    """What the model is told when the control plane denies a call outright.
 
-    It names the rules that matched, because a refusal the model cannot understand is a
+    Only ever called for a DENY (`_run_tools`'s REQUIRE_APPROVAL branch returns before
+    reaching this, ADR-022: that one pauses the task instead of answering the model at
+    all). Names the rules that matched, because a refusal the model cannot understand is a
     refusal it retries verbatim, burning iterations and money.
     """
     rules = ", ".join(decision.matched_rules) or "none"
-    if decision.effect is Effect.REQUIRE_APPROVAL:
-        return (
-            f"This action requires human approval and cannot run yet: {decision.reason}. "
-            f"Matched rules: {rules}."
-        )
     return (
         f"Refused by policy: {decision.reason}. Matched rules: {rules}. "
         f"Do not retry this call; take a different approach."
@@ -260,6 +258,11 @@ async def run_task(
                 holder,
                 task,
                 budget,
+                # The one pending call (at most: `approvals`' partial unique index allows
+                # only one open question per task) a human has since decided, if any.
+                # Everything else in `resume.pending_tool_calls` is decided normally,
+                # exactly as `_run_tools` would decide a call it had never seen before.
+                approval_decisions=resume.approval_decisions,
             )
             # Results already obtained travel with the new ones: the API wants every
             # tool_use from a turn answered in a single message.
@@ -403,6 +406,18 @@ async def run_task(
             )
             messages.append(ToolResultsMessage(results=results))
     except _RunStopped as stopped:
+        if stopped.status == "WAITING_APPROVAL":
+            # Not a finish (ADR-022): `_pause_for_approval` already did everything a
+            # terminal status would (task row, event, checkpoint), except the two things
+            # that make WAITING_APPROVAL not terminal, `task.finished` and `finished_at`.
+            # Going through `_finish` here would write both, and worker.py would then have
+            # no reason to keep the workspace volume around for the resume that is coming.
+            return RunResult(
+                status=stopped.status,
+                iterations=current_iteration,
+                cost_usd=spent,
+                reason=stopped.reason,
+            )
         return await _finish(
             session, task, stopped.status, current_iteration, spent, holder, reason=stopped.reason
         )
@@ -477,6 +492,45 @@ async def _decide(
     return combine(decisions), paths
 
 
+async def _pause_for_approval(
+    session: AsyncSession, task: Task, call: ToolCall, decision: Decision, holder: str | None
+) -> None:
+    """Park the task for a human instead of running or refusing this call (ADR-022).
+
+    Everything a terminal status would checkpoint, minus `task.finished`/`finished_at`:
+    those two are what "terminal" means to `worker.py::TERMINAL_STATUSES`, and
+    WAITING_APPROVAL is deliberately not one, so the workspace volume survives for the
+    resume this is setting up. The lease is released here, not merely left to expire, so a
+    worker sitting idle can pick up something else immediately instead of waiting out a
+    lease nobody is renewing.
+    """
+    approval = await approvals.request_approval(session, task, call, decision)
+    await events.append_event(
+        session,
+        task.id,
+        events.APPROVAL_REQUESTED,
+        {"approval_id": str(approval.id), "tool": call.name, "id": call.id},
+    )
+    await audit.append(
+        session,
+        actor_type="system",
+        actor_id="loop",
+        action="approval.requested",
+        target_type="approval",
+        target_id=str(approval.id),
+        details={
+            "task_id": str(task.id),
+            "tool": call.name,
+            "matched_rules": decision.matched_rules,
+            "reason": decision.reason,
+        },
+    )
+    task.status = "WAITING_APPROVAL"
+    task.claimed_by = None
+    task.claimed_until = None
+    await _checkpoint(session, task.id, holder)
+
+
 async def _run_tools(
     session: AsyncSession,
     task_id: UUID,
@@ -489,6 +543,7 @@ async def _run_tools(
     holder: str | None,
     task: Task,
     budget: Budget,
+    approval_decisions: dict[str, ApprovalOutcome] | None = None,
 ) -> list[ToolResult]:
     """Decide on every call, execute the allowed ones, and answer all of them.
 
@@ -502,6 +557,16 @@ async def _run_tools(
     together with its `tool_calls`/`policy_decisions` rows, checkpoint (d), so a completed
     tool is never mistaken for one still pending.
 
+    `approval_decisions` (ADR-022) is only ever non-empty on a resume: it names the one
+    pending call, if any, a human has since approved or rejected (`core/replay.py`). A
+    rejected call is answered without ever reaching the policy engine again, its decision
+    already made. An approved one still goes through `_decide()`: `matched_rules`,
+    `policy_hash` and the rest of the record have to reflect the policy actually in force
+    now, not the one in force when the approval was requested, and a fresh DENY still wins
+    (an approval never overrides a deny, ADR-003's own ordering). Only ALLOW and an
+    unchanged REQUIRE_APPROVAL are satisfied by the approval, the second because that is
+    exactly the question it already answered.
+
     Two more checks bracket each call's execution, both raising `_RunStopped` straight out
     of this function rather than returning a partial result for `run_task` to notice: a call
     already mid-batch here can be the last one `_request_tools` requested, so there is no
@@ -514,11 +579,65 @@ async def _run_tools(
       make that fast, and this is what notices the kill was for a cancellation rather than
       a genuine failure and stops the batch instead of feeding a next tool a dead container.
     """
+    approval_decisions = approval_decisions or {}
     results: list[ToolResult] = []
     for call in calls:
         await _check_stoppable(session, task, budget)
 
+        outcome = approval_decisions.get(call.id)
+
+        if outcome is not None and outcome.status == "rejected":
+            # A human already answered this one. No policy re-check (nothing to re-check;
+            # rejecting is a human decision, not a policy one) and no execution, just the
+            # tool_result the turn needs, carrying the reviewer's note so the model can try
+            # a different approach. `tool.executed` still has to be written, or a third
+            # resume would find this call pending all over again.
+            output = f"Rejected by a human reviewer: {outcome.note}"
+            await events.record_tool_call(
+                session,
+                task_id,
+                iteration,
+                call,
+                decision="rejected",
+                result_summary=output[:500],
+                error=output,
+                duration_ms=0,
+            )
+            await events.append_event(
+                session,
+                task_id,
+                events.TOOL_EXECUTED,
+                {
+                    "tool": call.name,
+                    "id": call.id,
+                    "ok": False,
+                    "effect": "rejected",
+                    "duration_ms": 0,
+                    "output": output,
+                    "is_error": True,
+                    "approval_id": outcome.approval_id,
+                },
+            )
+            await _checkpoint(session, task_id, holder)
+            results.append(ToolResult(tool_call_id=call.id, content=output, is_error=True))
+            if await cancel.is_requested(session, task_id):
+                raise _RunStopped("CANCELLED", "cancel requested while a tool was running")
+            continue
+
         decision, judged_paths = await _decide(call, registry, policy, user, task_id)
+
+        if (
+            outcome is not None
+            and outcome.status == "approved"
+            and decision.effect is not Effect.DENY
+        ):
+            decision = decision.model_copy(
+                update={
+                    "effect": Effect.ALLOW,
+                    "reason": f"approved by a human reviewer (approval {outcome.approval_id})",
+                }
+            )
+
         await events.append_event(
             session,
             task_id,
@@ -533,9 +652,28 @@ async def _run_tools(
                 # single-path tool, several for a multi-path one, so a reader of the audit
                 # trail does not have to guess which of a patch's files decided the call.
                 "paths": judged_paths,
+                **({"approval_id": outcome.approval_id} if outcome is not None else {}),
             },
         )
+        if decision.effect is Effect.DENY:
+            await audit.append(
+                session,
+                actor_type="system",
+                actor_id="loop",
+                action="policy.deny",
+                target_type="task",
+                target_id=str(task_id),
+                details={
+                    "tool": call.name,
+                    "matched_rules": decision.matched_rules,
+                    "reason": decision.reason,
+                },
+            )
         await _checkpoint(session, task_id, holder)
+
+        if decision.effect is Effect.REQUIRE_APPROVAL:
+            await _pause_for_approval(session, task, call, decision, holder)
+            raise _RunStopped("WAITING_APPROVAL", decision.reason)
 
         started = time.monotonic()
         if decision.effect is Effect.ALLOW:
@@ -558,8 +696,7 @@ async def _run_tools(
                 output = "cancelled: the sandbox was killed to satisfy a cancel request"
                 error = output
         else:
-            # The tool never runs. require_approval degrades to a refusal until week 3
-            # builds the approval machinery, which errs on the restrictive side.
+            # DENY. The only other Effect, REQUIRE_APPROVAL, returned above.
             output = _refusal_message(decision)
             error = output
 
@@ -623,6 +760,15 @@ async def _finish(
         task.id,
         events.TASK_FINISHED,
         {"status": status, "iterations": iterations, "cost_usd": str(spent), "reason": reason},
+    )
+    await audit.append(
+        session,
+        actor_type="system",
+        actor_id="loop",
+        action="task.finished",
+        target_type="task",
+        target_id=str(task.id),
+        details={"status": status, "reason": reason},
     )
     # Checkpoint (e).
     await _checkpoint(session, task.id, holder)

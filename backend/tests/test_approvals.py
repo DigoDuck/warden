@@ -18,7 +18,6 @@ from warden.core import approvals, queue
 from warden.core.events import read_events
 from warden.models import Approval, Task, User
 
-
 _WIPE = text("TRUNCATE audit_log, task_events, approvals, tasks, users RESTART IDENTITY CASCADE")
 
 
