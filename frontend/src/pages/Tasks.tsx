@@ -1,35 +1,23 @@
-import { type FormEvent, useState } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { useQuery } from "@tanstack/react-query";
+import { apiFetch } from "../api/client";
+import type { TaskListOut } from "../api/types";
 
-export function Home() {
-  const navigate = useNavigate();
-  const [taskId, setTaskId] = useState("");
-
-  function handleSubmit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const trimmed = taskId.trim();
-    if (trimmed) {
-      navigate(`/tarefas/${trimmed}`);
-    }
-  }
+// TODO(skeleton): no loading/empty/error states, no status filter, no link per row (not
+// keyboard reachable). Filled in next commit.
+export function Tasks() {
+  const query = useQuery({
+    queryKey: ["tasks"],
+    queryFn: () => apiFetch<TaskListOut>("/tasks"),
+  });
 
   return (
     <main>
-      <h1>Warden</h1>
-      {/* Ainda não existe GET /tasks (listagem); dizer isso aqui em vez de fingir uma
-          tabela vazia, que pareceria um bug em vez de uma ausência conhecida. */}
-      <p>
-        Ainda não existe um endpoint de listagem de tarefas. Submeta uma tarefa nova ou cole
-        o id de uma tarefa existente para ver o detalhe.
-      </p>
-      <nav>
-        <Link to="/tarefas/nova">Submeter tarefa</Link> · <Link to="/configuracoes">Configurações</Link>
-      </nav>
-      <form onSubmit={handleSubmit}>
-        <label htmlFor="task-id">Ver tarefa por id</label>
-        <input id="task-id" value={taskId} onChange={(event) => setTaskId(event.target.value)} />
-        <button type="submit">Ver</button>
-      </form>
+      <h1>Tarefas</h1>
+      <ul>
+        {(query.data?.tasks ?? []).map((task) => (
+          <li key={task.id}>{task.spec}</li>
+        ))}
+      </ul>
     </main>
   );
 }
