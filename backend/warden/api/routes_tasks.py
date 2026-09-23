@@ -320,6 +320,12 @@ async def get_task_events(
 _STREAM_POLL_SECONDS = 1.0
 _STREAM_HEARTBEAT_SECONDS = 15.0
 
+# Mirrors core/worker.py::TERMINAL_STATUSES (kept local, not imported: worker.py pulls in
+# the sandbox/docker/policy stack, which this API module must never depend on — briefing
+# §10, "api does not have agent logic"). A task in one of these never runs again, so once
+# an empty poll finds one here, the stream has nothing left to ever wait for.
+_TERMINAL_TASK_STATUSES = frozenset({"SUCCEEDED", "FAILED", "CANCELLED", "TIMED_OUT", "BUDGET_EXCEEDED"})
+
 
 @router.get("/{task_id}/stream")
 async def stream_task_events(
@@ -371,6 +377,10 @@ async def stream_task_events(
             # A fresh, short-lived session per poll (never the request's own SessionDep):
             # it is opened, used for one SELECT and closed before the sleep below, so no
             # transaction or connection sits idle for the ~1s between polls. See ADR-019.
+            # The status is only read here, inside the same short poll session, when the
+            # event query comes back empty: no point spending a second round trip on a poll
+            # that already found rows to send.
+            status: str | None = None
             async with session_factory() as poll_session:
                 rows = (
                     await poll_session.scalars(
@@ -380,6 +390,10 @@ async def stream_task_events(
                         .limit(_MAX_EVENTS_PAGE)
                     )
                 ).all()
+                if not rows:
+                    status = await poll_session.scalar(
+                        select(Task.status).where(Task.id == task_id)
+                    )
 
             if rows:
                 for row in rows:
@@ -396,6 +410,14 @@ async def stream_task_events(
                         return
                 last_activity = time.monotonic()
                 continue
+
+            # Nothing new, and the task is already done (or gone): a client resuming with
+            # Last-Event-ID at or past task.finished's own seq never sees that event again,
+            # and a task fixed up by hand can reach a terminal status without ever writing
+            # it. Either way there is nothing left to ever arrive, so the stream ends here
+            # instead of polling and heartbeating until the client disconnects.
+            if status is None or status in _TERMINAL_TASK_STATUSES:
+                return
 
             now = time.monotonic()
             if now - last_activity >= _STREAM_HEARTBEAT_SECONDS:
