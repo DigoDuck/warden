@@ -115,6 +115,31 @@ leva: ninguém pode decidir uma pergunta sobre uma tarefa que não vai mais roda
 índice parcial (`uq_approvals_one_pending_per_task`) ficaria com uma linha pendente presa
 para sempre numa tarefa cancelada.
 
+### Ordem de locks e as duas corridas com cancel
+
+Três escritores tocam a mesma tarefa pausada: o loop (ao pausar), `request_cancel` e
+`decide_approval`. Todos pegam **primeiro a linha da tarefa, depois a da aprovação**:
+
+- `request_cancel` já fazia isso (UPDATE em `tasks`, depois expira a aprovação).
+- `decide_approval` fazia o contrário (UPDATE guardada em `approvals`, depois `tasks`), e um
+  cancel e um approve no mesmo instante podiam cada um segurar um lock esperando o outro:
+  Postgres matava um dos dois como deadlock, um 500 para quem clicou. Agora ela trava a
+  tarefa antes (`FOR NO KEY UPDATE OF t`, via join com a aprovação, que também responde
+  "não existe" na mesma consulta). Quem chegou primeiro vence; um cancel primeiro deixa a
+  aprovação `expired` e a decisão recebe `ApprovalAlreadyDecided` (409).
+- `_pause_for_approval` trava a tarefa e **relê o marcador de cancel sob esse lock** antes de
+  gravar a pergunta. Sem isso, um cancel que commitasse depois do último
+  `_check_stoppable` e antes da pausa marcava uma tarefa `RUNNING` (resposta `MARKED`, "o loop
+  vai parar") que em seguida virava `WAITING_APPROVAL` com o marcador preso: nada rodando
+  para vê-lo, e toda decisão posterior violava `ck_tasks_cancel_requested_only_after_claim`
+  ao tentar voltar para `QUEUED`. Com o lock, um cancel anterior vence (a tarefa termina
+  `CANCELLED`), e um posterior espera o commit da pausa e cai no ramo imediato de
+  `WAITING_APPROVAL`.
+
+A nota do revisor é limitada a 2.000 caracteres na API (mesmo teto de
+`events._MAX_ARG_CHARS`): ela vai literal para o evento, para o audit e, num reject, para o
+`tool_result` que o modelo lê.
+
 ### API: só mapeamento de exceção para status code
 
 `api/routes_approvals.py`: `GET /approvals?status=pending` (escopo `approvals:read`) e
@@ -174,3 +199,14 @@ sobreviver, e já sobrevive, porque `WAITING_APPROVAL` não é terminal.
   um lock consultivo transacional; feito sempre dentro do checkpoint curto que já ia commitar
   de qualquer forma (ADR-019: nenhuma transação de audit fica aberta atravessando uma chamada
   de provider ou sandbox), então o custo é o mesmo de qualquer outro passo do loop.
+- **Cancelar uma tarefa em `WAITING_APPROVAL` não descarta o volume do workspace.** Só o
+  `finally` de `Worker.run_once` descarta volume, e uma tarefa cancelada enquanto espera não
+  tem worker nenhum. O volume fica órfão até alguém removê-lo. Resolver exige uma varredura
+  (um janitor no worker, que é arquivo de outra trilha nesta semana) ou o cancel falar com o
+  Docker, o que a API não deve fazer (briefing §10). Fica registrado como pendência.
+- **O prazo `max_seconds` conta o tempo de espera humana.** Ele é medido desde
+  `task.started_at`, que um resume nunca zera; uma tarefa aprovada depois do prazo termina
+  `TIMED_OUT` logo no primeiro `_check_stoppable` do resume. Hoje nenhum caminho de produção
+  preenche `max_seconds`, então é latente; quando o budget por tarefa for ligado ao `Budget`,
+  decidir se a espera conta (e, se não contar, descontar o intervalo entre
+  `approval.requested` e a decisão).
