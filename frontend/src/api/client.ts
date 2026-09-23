@@ -30,7 +30,10 @@ export interface ApiFetchInit extends Omit<RequestInit, "body"> {
   json?: unknown;
 }
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000";
+// Same-origin on purpose: the backend has no CORS middleware, so a browser call from the dev
+// server's origin straight to :8000 dies on the preflight. `vite.config.ts` proxies /api to
+// the backend in dev; in production the reverse proxy (Caddy, week 12) plays the same role.
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "/api";
 
 export async function apiFetch<T>(path: string, init: ApiFetchInit = {}): Promise<T> {
   const { json, headers, ...rest } = init;

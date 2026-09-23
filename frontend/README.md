@@ -29,6 +29,12 @@ por `scripts/gen-api.mjs`, que roda `warden.api.openapi_export` (novo arquivo do
 rotas de `warden/api/routes_*.py`: se o backend mudar um contrato, o próximo comando já
 gera o tipo novo, e um uso incompatível quebra o `tsc --noEmit` na hora.
 
+O cliente chama a API na mesma origem, sob `/api`, e o `server.proxy` do `vite.config.ts`
+repassa para o backend em `http://127.0.0.1:8000` (o que `make api` sobe) tirando o
+prefixo. Motivo: o backend não tem CORS, então uma chamada direta de `:5173` para `:8000`
+morre no preflight do navegador. Em produção o Caddy (Semana 12) faz o mesmo papel;
+`VITE_API_BASE_URL` sobrescreve a base se precisar.
+
 `src/api/client.ts` é um wrapper fino sobre `fetch`, tipado a partir de `schema.d.ts`: anexa
 o bearer token (ver abaixo), e transforma qualquer resposta não 2xx em um `ApiError`
 tipado em vez de deixar o chamador checar `response.status` manualmente.
