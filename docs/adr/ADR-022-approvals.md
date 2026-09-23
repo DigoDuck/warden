@@ -204,9 +204,12 @@ sobreviver, e já sobrevive, porque `WAITING_APPROVAL` não é terminal.
   tem worker nenhum. O volume fica órfão até alguém removê-lo. Resolver exige uma varredura
   (um janitor no worker, que é arquivo de outra trilha nesta semana) ou o cancel falar com o
   Docker, o que a API não deve fazer (briefing §10). Fica registrado como pendência.
-- **O prazo `max_seconds` conta o tempo de espera humana.** Ele é medido desde
-  `task.started_at`, que um resume nunca zera; uma tarefa aprovada depois do prazo termina
-  `TIMED_OUT` logo no primeiro `_check_stoppable` do resume. Hoje nenhum caminho de produção
-  preenche `max_seconds`, então é latente; quando o budget por tarefa for ligado ao `Budget`,
-  decidir se a espera conta (e, se não contar, descontar o intervalo entre
-  `approval.requested` e a decisão).
+- **O tempo de espera humana não conta no `max_seconds` (decidido em 2026-09-23).** O
+  prazo mede o tempo do agente, não o do revisor. Sem isso, uma tarefa com `max_seconds: 60`
+  aprovada duas horas depois terminava `TIMED_OUT` no primeiro `_check_stoppable` do resume,
+  e a chamada aprovada nunca rodava; ficou latente até o budget por tarefa ser ligado ao
+  worker. O replay soma, para cada aprovação decidida, o intervalo entre o `created_at` do
+  `approval.requested` e o da decisão (os dois vêm do relógio do banco), e o `run_task`
+  estende o `max_seconds` por esse total. `task.started_at` continua intocado: o relógio não
+  aprende sobre pausas, o orçamento é que cresce. O tempo entre a decisão e o próximo claim
+  (fila) ainda conta, igual ao de qualquer resume; normalmente são segundos.
