@@ -89,19 +89,79 @@ describe("TaskDetail", () => {
     expect(await screen.findByText("Tarefa não encontrada.")).toBeInTheDocument();
   });
 
-  it("shows the spec tab's content by default", async () => {
+  it("defaults to the Execução tab so live events are visible without clicking", async () => {
     routeFetch({ [`/tasks/${TASK_ID}`]: [task()] });
     renderAt(`/tarefas/${TASK_ID}`);
+    await screen.findByText("Executando");
+
+    expect(screen.getByRole("tab", { name: "Execução" })).toHaveAttribute("aria-selected", "true");
+    expect(await screen.findByText(/nenhum evento ainda/i)).toBeInTheDocument();
+  });
+
+  it("shows the spec tab's content once clicked", async () => {
+    routeFetch({ [`/tasks/${TASK_ID}`]: [task()] });
+    renderAt(`/tarefas/${TASK_ID}`);
+    await screen.findByText("Executando");
+
+    await userEvent.click(screen.getByRole("tab", { name: "Spec" }));
     expect(await screen.findByText("faz algo importante")).toBeInTheDocument();
   });
 
-  it("switches to the Execução tab and mounts the live timeline", async () => {
-    routeFetch({ [`/tasks/${TASK_ID}`]: [task()] });
+  it("keeps the stream connected and the accumulated events intact when switching tabs away and back", async () => {
+    // "cancel.requested" renders a fixed, payload-independent sentence in Timeline.tsx, an
+    // easy marker to check for without needing to match a JSON-serialised default fallback.
+    const streamedLine =
+      'id: 1\nevent: cancel.requested\ndata: {"seq":1,"type":"cancel.requested","payload":{},"created_at":"2026-01-01T00:00:00Z"}\n\n';
+    let streamCalls = 0;
+    vi.mocked(fetch).mockImplementation(async (input) => {
+      const path = String(input).replace(/^\/api/, "").replace(/^http:\/\/localhost/, "");
+      if (path.endsWith("/stream")) {
+        streamCalls += 1;
+        // Never closes: an open connection that a tab switch must not tear down.
+        const body = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode(streamedLine));
+          },
+        });
+        return new Response(body, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+      }
+      if (path === `/tasks/${TASK_ID}`) {
+        return new Response(JSON.stringify(task()), { status: 200 });
+      }
+      return new Response(JSON.stringify({ detail: "not found" }), { status: 404 });
+    });
+
     renderAt(`/tarefas/${TASK_ID}`);
-    await screen.findByText("faz algo importante");
+    await screen.findByText("Executando");
+    expect(await screen.findByText("Cancelamento solicitado.")).toBeInTheDocument();
+    expect(streamCalls).toBe(1);
+
+    await userEvent.click(screen.getByRole("tab", { name: "Spec" }));
+    expect(await screen.findByText("faz algo importante")).toBeInTheDocument();
 
     await userEvent.click(screen.getByRole("tab", { name: "Execução" }));
-    expect(await screen.findByText(/nenhum evento ainda/i)).toBeInTheDocument();
+    // Still there without a re-fetch: the accumulated event survived the round trip through
+    // another tab instead of being reloaded from seq 0.
+    expect(screen.getByText("Cancelamento solicitado.")).toBeInTheDocument();
+    expect(streamCalls).toBe(1);
+  });
+
+  it("shows a retry action when the stream reports it cannot reconnect on its own", async () => {
+    vi.mocked(fetch).mockImplementation(async (input) => {
+      const path = String(input).replace(/^\/api/, "").replace(/^http:\/\/localhost/, "");
+      if (path.endsWith("/stream")) {
+        return new Response(null, { status: 404 });
+      }
+      if (path === `/tasks/${TASK_ID}`) {
+        return new Response(JSON.stringify(task()), { status: 200 });
+      }
+      return new Response(JSON.stringify({ detail: "not found" }), { status: 404 });
+    });
+
+    renderAt(`/tarefas/${TASK_ID}`);
+    await screen.findByText("Executando");
+
+    expect(await screen.findByRole("button", { name: /tentar de novo/i })).toBeInTheDocument();
   });
 
   it("does not cancel when the confirmation dialog is declined", async () => {

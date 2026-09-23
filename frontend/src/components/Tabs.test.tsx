@@ -3,10 +3,11 @@ import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vitest";
 import { Tabs } from "./Tabs";
 
-function renderTabs() {
+function renderTabs(defaultTabId?: string) {
   return render(
     <Tabs
       label="Detalhe da tarefa"
+      defaultTabId={defaultTabId}
       tabs={[
         { id: "spec", label: "Spec", panel: <p>Conteúdo da spec</p> },
         { id: "execucao", label: "Execução", panel: <p>Conteúdo da execução</p> },
@@ -28,6 +29,13 @@ describe("Tabs", () => {
     renderTabs();
     expect(screen.getByText("Conteúdo da spec")).toBeVisible();
     expect(screen.queryByText("Conteúdo da execução")).not.toBeInTheDocument();
+  });
+
+  it("selects defaultTabId's panel instead of the first tab when given", () => {
+    renderTabs("execucao");
+    expect(screen.getByRole("tab", { name: "Execução" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByText("Conteúdo da execução")).toBeVisible();
+    expect(screen.queryByText("Conteúdo da spec")).not.toBeInTheDocument();
   });
 
   it("switches panel on click and marks the clicked tab selected", async () => {
