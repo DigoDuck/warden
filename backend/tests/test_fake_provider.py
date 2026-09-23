@@ -5,7 +5,7 @@ from decimal import Decimal
 
 import pytest
 
-from warden.providers.base import AssistantMessage, UserMessage
+from warden.providers.base import AssistantMessage, Message, UserMessage
 from warden.providers.fake import FakeProvider, ScriptExhausted
 from warden.providers.pricing import cost_usd
 
@@ -92,7 +92,7 @@ async def test_a_resume_aware_provider_picks_the_step_from_the_conversation() ->
     replay tool call ids the log already holds. Resume-aware, the provider counts the
     assistant turns already in the conversation instead, which is what a real model's
     position in the dialogue is."""
-    history = [
+    history: list[Message] = [
         UserMessage(text="read the repo"),
         AssistantMessage(raw_content={"step": "zero"}),
     ]
