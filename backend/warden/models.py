@@ -20,6 +20,7 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     Numeric,
     String,
@@ -27,6 +28,7 @@ from sqlalchemy import (
     UniqueConstraint,
     Uuid,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -169,6 +171,64 @@ class PolicyDecision(Base):
     reason: Mapped[str] = mapped_column(Text)
     policy_hash: Mapped[str] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class Approval(Base):
+    """A `REQUIRE_APPROVAL` decision the loop paused on, and how a human resolved it.
+
+    See `core/approvals.py` and ADR-022. `tool_call_id` is the provider's own id for the
+    call (`providers.base.ToolCall.id`, e.g. `"fake-0-0"`), not a foreign key into
+    `tool_calls`: at request time no `tool_calls` row exists yet for a call that never ran,
+    and after a reject it never will. Replay (`core/replay.py`) matches a resumed call back
+    to its decision by this id, read straight off the event log, so this table itself is
+    never queried mid-resume (it is pure, briefing §12).
+    """
+
+    __tablename__ = "approvals"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending', 'approved', 'rejected', 'expired')",
+            name="ck_approvals_status",
+        ),
+        # At most one open question per task. `core/loop.py::_pause_for_approval` only ever
+        # creates one of these after parking the task WAITING_APPROVAL, and
+        # `core/approvals.decide_approval` resolves it before the task can run again, so two
+        # pending rows for the same task would mean two decisions in flight for a task only
+        # one worker ever held at a time.
+        Index(
+            "uq_approvals_one_pending_per_task",
+            "task_id",
+            unique=True,
+            postgresql_where=text("status = 'pending'"),
+        ),
+        # A given call is asked about at most once, ever, whatever the outcome: replay
+        # builds "which pending call was this" from the event log by id (ADR-022), so a
+        # second approval row for the same call would be a second question replay cannot
+        # tell apart from the first.
+        UniqueConstraint("task_id", "tool_call_id", name="uq_approvals_task_tool_call"),
+    )
+
+    id: Mapped[uuid.UUID] = _pk()
+    task_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("tasks.id", ondelete="CASCADE"), index=True
+    )
+    tool_call_id: Mapped[str] = mapped_column(String(128))
+    tool: Mapped[str] = mapped_column(String(128))
+    # Redacted the same way as `tool_calls.args_safe` (`core/events.py::redact_args`): raw
+    # arguments never reach a table a reviewer's dashboard reads from.
+    args_safe: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
+    matched_rules: Mapped[list[str]] = mapped_column(JSONB, default=list)
+    reason: Mapped[str] = mapped_column(Text)
+    scopes: Mapped[list[str]] = mapped_column(JSONB, default=list)
+    status: Mapped[str] = mapped_column(String(32), default="pending")
+    requested_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    decided_by: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT"), default=None
+    )
+    note: Mapped[str | None] = mapped_column(Text, default=None)
 
 
 class ModelCall(Base):

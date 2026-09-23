@@ -5,6 +5,7 @@
 """
 
 import uuid
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -186,6 +187,83 @@ def test_events_out_of_order_are_sorted_before_replay() -> None:
     )
     shuffled = [ordered[2], ordered[0], ordered[1]]
     assert rebuild(shuffled).messages[0].text == "x"  # type: ignore[union-attr]
+
+
+# --- approval decisions (ADR-022): read off the event log, never off `approvals` ------------
+
+
+def test_a_pending_call_with_no_decision_yet_has_none_recorded() -> None:
+    state = rebuild(
+        _events(
+            (ev.TASK_CREATED, {"spec": "x"}),
+            (ev.ITERATION_STARTED, {"n": 1}),
+            _model_called([{"type": "tool_use"}]),
+            _requested("t1", "github.open_pr", title="x"),
+            (ev.APPROVAL_REQUESTED, {"approval_id": "a1", "tool": "github.open_pr", "id": "t1"}),
+        )
+    )
+    assert state.is_mid_iteration
+    assert [c.id for c in state.pending_tool_calls] == ["t1"]
+    assert state.approval_decisions == {}
+
+
+def test_a_granted_approval_is_recorded_by_call_id() -> None:
+    state = rebuild(
+        _events(
+            (ev.TASK_CREATED, {"spec": "x"}),
+            (ev.ITERATION_STARTED, {"n": 1}),
+            _model_called([{"type": "tool_use"}]),
+            _requested("t1", "github.open_pr", title="x"),
+            (ev.APPROVAL_REQUESTED, {"approval_id": "a1", "tool": "github.open_pr", "id": "t1"}),
+            (ev.APPROVAL_GRANTED, {"approval_id": "a1", "id": "t1"}),
+        )
+    )
+    outcome = state.approval_decisions["t1"]
+    assert outcome.status == "approved"
+    assert outcome.approval_id == "a1"
+    assert outcome.note is None
+
+
+def test_a_rejected_approval_carries_the_reviewers_note() -> None:
+    state = rebuild(
+        _events(
+            (ev.TASK_CREATED, {"spec": "x"}),
+            (ev.ITERATION_STARTED, {"n": 1}),
+            _model_called([{"type": "tool_use"}]),
+            _requested("t1", "github.open_pr", title="x"),
+            (ev.APPROVAL_REQUESTED, {"approval_id": "a1", "tool": "github.open_pr", "id": "t1"}),
+            (ev.APPROVAL_REJECTED, {"approval_id": "a1", "id": "t1", "note": "too risky"}),
+        )
+    )
+    outcome = state.approval_decisions["t1"]
+    assert outcome.status == "rejected"
+    assert outcome.note == "too risky"
+
+
+def test_time_spent_waiting_for_a_decision_is_summed_from_the_event_timestamps() -> None:
+    """ADR-022: a human's thinking time is not the agent's. Two pauses, one hour and ten
+    minutes, add up; a request still waiting for its decision adds nothing yet."""
+    t0 = datetime(2026, 9, 23, 12, 0, tzinfo=UTC)
+    events = _events(
+        (ev.TASK_CREATED, {"spec": "x"}),
+        (ev.APPROVAL_REQUESTED, {"approval_id": "a1", "tool": "github.open_pr", "id": "t1"}),
+        (ev.APPROVAL_GRANTED, {"approval_id": "a1", "id": "t1"}),
+        (ev.APPROVAL_REQUESTED, {"approval_id": "a2", "tool": "github.open_pr", "id": "t2"}),
+        (ev.APPROVAL_REJECTED, {"approval_id": "a2", "id": "t2", "note": "no"}),
+        (ev.APPROVAL_REQUESTED, {"approval_id": "a3", "tool": "github.open_pr", "id": "t3"}),
+    )
+    stamps = [
+        t0,
+        t0,
+        t0 + timedelta(hours=1),
+        t0 + timedelta(hours=2),
+        t0 + timedelta(hours=2, minutes=10),
+        t0 + timedelta(hours=3),
+    ]
+    for event, stamp in zip(events, stamps, strict=True):
+        event.created_at = stamp
+
+    assert rebuild(events).paused_seconds == 3600 + 600
 
 
 def test_raw_content_is_never_inspected() -> None:

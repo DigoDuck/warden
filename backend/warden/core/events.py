@@ -31,6 +31,13 @@ POLICY_DECIDED = "policy.decided"
 TOOL_EXECUTED = "tool.executed"
 TASK_FINISHED = "task.finished"
 CANCEL_REQUESTED = "cancel.requested"
+# Week 3 (ADR-022): a REQUIRE_APPROVAL decision pauses the task instead of refusing the
+# call, and the decision it is waiting on is recorded as its own event so replay can rebuild
+# the outcome without querying the `approvals` table (this module stays pure, see
+# core/replay.py's own docstring).
+APPROVAL_REQUESTED = "approval.requested"
+APPROVAL_GRANTED = "approval.granted"
+APPROVAL_REJECTED = "approval.rejected"
 
 _SENSITIVE_KEY_PARTS = ("token", "key", "secret", "password", "credential", "authorization")
 _MAX_ARG_CHARS = 2_000

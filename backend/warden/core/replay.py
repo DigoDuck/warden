@@ -14,6 +14,7 @@ minus `tool.executed`, which are the control plane's own events.
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
@@ -27,6 +28,20 @@ from warden.providers.base import (
     ToolResultsMessage,
     UserMessage,
 )
+
+
+@dataclass(frozen=True)
+class ApprovalOutcome:
+    """How a human resolved one pending call's `REQUIRE_APPROVAL` decision (ADR-022).
+
+    Read off `approval.granted`/`approval.rejected`, never off the `approvals` table: this
+    module stays pure (see the module docstring), and the event log is already the record
+    `core/approvals.py::decide_approval` writes in the same transaction as the decision.
+    """
+
+    status: str  # "approved" or "rejected"
+    approval_id: str
+    note: str | None = None
 
 
 @dataclass
@@ -45,6 +60,15 @@ class ResumeState:
     # message as the pending ones, because the API wants every tool_use answered at once.
     partial_results: list[ToolResult] = field(default_factory=list)
     finished: bool = False
+    # Keyed by the provider's tool call id (`ToolCall.id`), one entry for whichever pending
+    # call a human has since decided. Most resumes have none at all; `core/loop.py` looks a
+    # pending call up here before deciding it, so an undecided call is decided as if it were
+    # new.
+    approval_decisions: dict[str, ApprovalOutcome] = field(default_factory=dict)
+    # Seconds the task spent parked waiting for a human, summed over every decided approval.
+    # `core/loop.py` subtracts it from the wall clock before comparing against max_seconds
+    # (ADR-022): the budget is the agent's time, not the reviewer's.
+    paused_seconds: float = 0.0
 
     @property
     def is_mid_iteration(self) -> bool:
@@ -80,6 +104,16 @@ def rebuild(task_events: Sequence[TaskEvent]) -> ResumeState:
         if done:
             state.messages.append(ToolResultsMessage(results=done))
 
+    # When each still-undecided approval was asked for, by tool call id. Both ends of a
+    # pause are `task_events.created_at`, stamped by the database clock, so the difference
+    # never mixes the worker's clock with the API's.
+    asked_at: dict[str, datetime] = {}
+
+    def settle_pause(event: TaskEvent, call_id: str) -> None:
+        requested_at = asked_at.pop(call_id, None)
+        if requested_at is not None and event.created_at is not None:
+            state.paused_seconds += (event.created_at - requested_at).total_seconds()
+
     for event in sorted(task_events, key=lambda e: e.seq):
         payload: dict[str, Any] = dict(event.payload or {})
 
@@ -112,6 +146,25 @@ def rebuild(task_events: Sequence[TaskEvent]) -> ResumeState:
 
         elif event.type == ev.TASK_FINISHED:
             state.finished = True
+
+        elif event.type == ev.APPROVAL_REQUESTED:
+            if event.created_at is not None:
+                asked_at[str(payload["id"])] = event.created_at
+
+        elif event.type == ev.APPROVAL_GRANTED:
+            settle_pause(event, str(payload["id"]))
+            state.approval_decisions[str(payload["id"])] = ApprovalOutcome(
+                status="approved", approval_id=str(payload["approval_id"])
+            )
+
+        elif event.type == ev.APPROVAL_REJECTED:
+            settle_pause(event, str(payload["id"]))
+            note = payload.get("note")
+            state.approval_decisions[str(payload["id"])] = ApprovalOutcome(
+                status="rejected",
+                approval_id=str(payload["approval_id"]),
+                note=str(note) if note is not None else None,
+            )
 
     # Whatever is left belongs to the iteration that was cut short.
     pending = [item for item in requested if item["id"] not in executed]

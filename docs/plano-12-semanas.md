@@ -76,7 +76,7 @@
 
 **Pronto quando:**
 - [ ] tool executada por token expirado ou sem scope falha com 401/403 e gera evento de audit
-- [ ] round trip de aprovação via API: tarefa pausa, aprovar retoma do checkpoint, rejeitar injeta erro e o loop continua
+- [x] round trip de aprovação via API: tarefa pausa, aprovar retoma do checkpoint, rejeitar injeta erro e o loop continua
 - [ ] `UPDATE audit_log SET ...` como `warden_app` falha por permissão (teste de integração)
 - [ ] teste adultera uma linha via superuser e `/audit/verify` aponta o índice quebrado
 - [ ] `grep` em logs e em `task_events` não encontra o token do GitHub

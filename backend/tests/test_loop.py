@@ -7,23 +7,42 @@ the control plane did with it.
 
 import pathlib
 import uuid
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from typing import Any
 
 import pytest
-from sqlalchemy import func, select
+from pydantic import BaseModel
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from tests.fake_tools import FakeWorkspace
-from warden.core import cancel
+from warden.core import approvals, cancel, queue
 from warden.core.events import read_events
 from warden.core.loop import Budget, run_task
-from warden.core.replay import ResumeState
-from warden.models import ModelCall, PolicyDecision, Task, ToolCall, User
+from warden.core.replay import ResumeState, rebuild
+from warden.models import (
+    Approval,
+    AuditLog,
+    ModelCall,
+    PolicyDecision,
+    Task,
+    TaskEvent,
+    ToolCall,
+    User,
+)
 from warden.policy.engine import Effect, Policy, Rule, load_policy
-from warden.providers.base import Completion, Usage, UserMessage
+from warden.providers.base import (
+    Completion,
+    Message,
+    ToolResultsMessage,
+    Usage,
+    UserMessage,
+)
 from warden.providers.base import ToolCall as ProviderToolCall
 from warden.providers.fake import FakeProvider, ScriptStep
+from warden.tools.registry import ToolRegistry
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 DEFAULT_POLICY = REPO_ROOT / "policies" / "default.yaml"
@@ -326,29 +345,531 @@ async def test_an_allowed_call_still_runs(session: AsyncSession, workspace: path
     assert row.error is None
 
 
-async def test_require_approval_degrades_to_a_refusal_until_week_3(
-    session: AsyncSession, workspace: pathlib.Path
-) -> None:
-    """Without the approval machinery, the loop errs on the restrictive side."""
-    task = await _a_task(session)
-    policy = Policy(
-        [Rule(id="needs-human", effect=Effect.REQUIRE_APPROVAL, when={"tool": "read_file"})],
+async def _claimed_task(session: AsyncSession) -> Task:
+    """A task actually claimed by a worker, so pausing it can meaningfully assert the lease
+    was released (`_a_task` above builds a bare, unclaimed Task, which has no lease to
+    release in the first place)."""
+    user = User(email=f"{uuid.uuid4()}@warden.test", password_hash="x", role="worker")
+    session.add(user)
+    await session.flush()
+    await queue.enqueue(
+        session, user_id=user.id, spec="open a pull request", idempotency_key=str(uuid.uuid4())
+    )
+    await session.commit()
+    claimed = await queue.claim(session, "worker-a")
+    assert claimed is not None
+    await session.commit()
+    return claimed
+
+
+def _require_approval_policy(tool: str = "github.open_pr") -> Policy:
+    return Policy(
+        [
+            Rule(id="allow-read", effect=Effect.ALLOW, when={"tool": "read_file"}),
+            Rule(
+                id="needs-human",
+                effect=Effect.REQUIRE_APPROVAL,
+                reason="opening a pull request is visible outside the control plane",
+                scopes=["github:pr:open"],
+                when={"tool": tool},
+            ),
+        ],
         default=Effect.DENY,
         policy_hash="test",
     )
-    provider = FakeProvider(
-        [_step("read_file", path="src/app.py"), _step("finish", summary="could not")]
+
+
+async def test_require_approval_pauses_the_task_and_releases_the_lease(
+    session: AsyncSession, workspace: pathlib.Path
+) -> None:
+    """ADR-022: a REQUIRE_APPROVAL decision used to degrade to a refusal (week 2). Now it
+    parks the task for a human instead, with the lease released so a worker can pick up
+    something else while it waits.
+    """
+    task = await _claimed_task(session)
+    holder = task.claimed_by
+    provider = FakeProvider([_step("github.open_pr", title="x")])
+
+    result = await run_task(
+        session,
+        task,
+        provider,
+        FakeWorkspace().registry(),
+        _require_approval_policy(),
+        workspace=workspace,
+        holder=holder,
     )
 
-    await run_task(session, task, provider, FakeWorkspace().registry(), policy, workspace=workspace)
+    assert result.status == "WAITING_APPROVAL"
+    assert task.status == "WAITING_APPROVAL"
+    assert task.claimed_by is None
+    assert task.claimed_until is None
 
-    row = (
+    rows = list(await session.scalars(select(Approval).where(Approval.task_id == task.id)))
+    assert len(rows) == 1
+    assert rows[0].status == "pending"
+    assert rows[0].tool == "github.open_pr"
+    assert rows[0].matched_rules == ["needs-human"]
+
+    kinds = [event.type for event in await read_events(session, task.id)]
+    assert "approval.requested" in kinds
+    assert "tool.executed" not in kinds
+    # WAITING_APPROVAL is not terminal (worker.py's TERMINAL_STATUSES excludes it): no
+    # task.finished, and finished_at stays unset.
+    assert "task.finished" not in kinds
+    assert task.finished_at is None
+
+
+async def test_calls_before_the_paused_one_still_ran_and_calls_after_stay_pending(
+    session: AsyncSession, workspace: pathlib.Path
+) -> None:
+    task = await _claimed_task(session)
+    provider = FakeProvider(
+        [
+            ScriptStep(
+                tool_calls=[
+                    ProviderToolCall(
+                        id="call-read", name="read_file", arguments={"path": "src/app.py"}
+                    ),
+                    ProviderToolCall(id="call-pr", name="github.open_pr", arguments={"title": "x"}),
+                    ProviderToolCall(id="call-list", name="list_files", arguments={}),
+                ]
+            )
+        ]
+    )
+
+    result = await run_task(
+        session,
+        task,
+        provider,
+        FakeWorkspace().registry(),
+        _require_approval_policy(),
+        workspace=workspace,
+        holder=task.claimed_by,
+    )
+
+    assert result.status == "WAITING_APPROVAL"
+    events_by_type: dict[str, list[str]] = {}
+    for event in await read_events(session, task.id):
+        events_by_type.setdefault(event.type, []).append(str(event.payload.get("tool")))
+
+    # requested: all three, in one batch, before any of them ran (ADR-019 checkpoint b).
+    assert events_by_type["tool.requested"] == ["read_file", "github.open_pr", "list_files"]
+    # decided: read_file (allowed) and github.open_pr (paused); list_files never even got a
+    # policy decision, because the loop stopped at the call before it.
+    assert events_by_type["policy.decided"] == ["read_file", "github.open_pr"]
+    # executed: only the call before the pause.
+    assert events_by_type["tool.executed"] == ["read_file"]
+    assert events_by_type["approval.requested"] == ["github.open_pr"]
+
+
+# --- audit log entries the loop itself writes (ADR-022 / week 3 list) -----------------------
+
+
+async def test_a_policy_deny_writes_an_audit_entry(
+    session: AsyncSession, workspace: pathlib.Path
+) -> None:
+    (workspace / ".env").write_text("SECRET=x\n", encoding="utf-8", newline="\n")
+    task = await _a_task(session)
+    provider = FakeProvider([_step("read_file", path=".env"), _step("finish", summary="done")])
+
+    await run_task(
+        session,
+        task,
+        provider,
+        FakeWorkspace().registry(),
+        load_policy(DEFAULT_POLICY),
+        workspace=workspace,
+    )
+
+    rows = list(
         await session.scalars(
-            select(ToolCall).where(ToolCall.task_id == task.id, ToolCall.tool_name == "read_file")
+            select(AuditLog).where(
+                AuditLog.action == "policy.deny", AuditLog.target_id == str(task.id)
+            )
+        )
+    )
+    assert len(rows) == 1
+    assert rows[0].details["tool"] == "read_file"
+    assert "never-read-secrets" in rows[0].details["matched_rules"]
+
+
+async def test_an_approval_request_writes_an_audit_entry(
+    session: AsyncSession, workspace: pathlib.Path
+) -> None:
+    task = await _claimed_task(session)
+    provider = FakeProvider([_step("github.open_pr", title="x")])
+
+    await run_task(
+        session,
+        task,
+        provider,
+        FakeWorkspace().registry(),
+        _require_approval_policy(),
+        workspace=workspace,
+        holder=task.claimed_by,
+    )
+
+    approval = (await session.scalars(select(Approval).where(Approval.task_id == task.id))).one()
+    rows = list(
+        await session.scalars(
+            select(AuditLog).where(
+                AuditLog.action == "approval.requested",
+                AuditLog.target_id == str(approval.id),
+            )
+        )
+    )
+    assert len(rows) == 1
+    assert rows[0].details["tool"] == "github.open_pr"
+
+
+async def test_a_finished_task_writes_an_audit_entry(
+    session: AsyncSession, workspace: pathlib.Path
+) -> None:
+    task = await _a_task(session)
+    provider = FakeProvider([_step("finish", summary="done")])
+
+    await run_task(
+        session, task, provider, FakeWorkspace().registry(), _allow_all(), workspace=workspace
+    )
+
+    rows = list(
+        await session.scalars(
+            select(AuditLog).where(
+                AuditLog.action == "task.finished", AuditLog.target_id == str(task.id)
+            )
+        )
+    )
+    assert len(rows) == 1
+    assert rows[0].details["status"] == "SUCCEEDED"
+
+
+# --- resuming after a human decides (ADR-022) -----------------------------------------------
+
+
+class _OpenPrArgs(BaseModel):
+    title: str
+
+
+class _OpenPrCounter:
+    """A fake `github.open_pr` with an execution count, the same technique
+    `tests/fake_tools.py::FakeWorkspace` uses: the `tool_calls` row proves no duplicate was
+    *recorded*, this proves the side effect itself did not happen twice.
+    """
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def open_pr(self, args: _OpenPrArgs) -> str:
+        self.calls += 1
+        return f"opened PR: {args.title}"
+
+
+class _RecordingProvider:
+    """Wraps a FakeProvider and keeps every message list it was asked to continue, so a test
+    can assert on what the model actually received rather than on a side table."""
+
+    name = "fake"
+
+    def __init__(self, inner: FakeProvider) -> None:
+        self._inner = inner
+        self.seen: list[list[Message]] = []
+
+    async def generate(self, messages: Sequence[Message], **kwargs: Any) -> Completion:
+        self.seen.append(list(messages))
+        return await self._inner.generate(messages, **kwargs)
+
+
+def _registry_with_open_pr(counter: _OpenPrCounter) -> ToolRegistry:
+    registry = FakeWorkspace().registry()
+    registry.register(
+        name="github.open_pr",
+        description="Open a pull request.",
+        args_model=_OpenPrArgs,
+        execute=counter.open_pr,
+    )
+    return registry
+
+
+async def _pending_approval(session: AsyncSession, task_id: object) -> Approval:
+    return (await session.scalars(select(Approval).where(Approval.task_id == task_id))).one()
+
+
+async def test_approving_a_paused_call_resumes_and_executes_it_exactly_once(
+    session: AsyncSession, workspace: pathlib.Path
+) -> None:
+    task = await _claimed_task(session)
+    counter = _OpenPrCounter()
+    registry = _registry_with_open_pr(counter)
+    paused = await run_task(
+        session,
+        task,
+        FakeProvider([_step("github.open_pr", title="x")]),
+        registry,
+        _require_approval_policy(),
+        workspace=workspace,
+        holder=task.claimed_by,
+    )
+    assert paused.status == "WAITING_APPROVAL"
+    assert counter.calls == 0  # paused, not executed
+
+    approval = await _pending_approval(session, task.id)
+    approval_id, tool_call_id = approval.id, approval.tool_call_id  # before expire_all() runs
+    decided = await approvals.decide_approval(
+        session, approval_id, approve=True, user_id=task.user_id, note=None
+    )
+    await session.commit()
+    assert decided.status == "approved"
+
+    resumed = await queue.claim(session, "worker-b")
+    assert resumed is not None and resumed.id == task.id
+    await session.commit()
+    resume = rebuild(await read_events(session, task.id))
+    assert resume.approval_decisions[tool_call_id].status == "approved"
+
+    result = await run_task(
+        session,
+        resumed,
+        FakeProvider([_step("finish", summary="pr opened")]),
+        registry,
+        _require_approval_policy(),
+        workspace=workspace,
+        resume=resume,
+        holder=resumed.claimed_by,
+    )
+
+    assert result.status == "SUCCEEDED"
+    assert counter.calls == 1  # the approved call ran exactly once, never re-executed
+
+    pr_calls = list(
+        await session.scalars(
+            select(ToolCall).where(
+                ToolCall.task_id == task.id, ToolCall.tool_name == "github.open_pr"
+            )
+        )
+    )
+    assert len(pr_calls) == 1
+    assert pr_calls[0].decision == "allow"
+
+    policy_decision = (
+        await session.scalars(
+            select(PolicyDecision).where(PolicyDecision.tool_call_id == pr_calls[0].id)
         )
     ).one()
-    assert row.decision == "require_approval"
-    assert "human approval" in (row.error or "")
+    assert str(approval_id) in policy_decision.reason
+
+
+async def test_time_waiting_for_a_human_does_not_count_against_max_seconds(
+    session: AsyncSession, workspace: pathlib.Path
+) -> None:
+    """ADR-022: max_seconds budgets the agent's own time. A reviewer who takes two hours to
+    approve must not turn a 60 second budget into an instant TIMED_OUT on resume, with the
+    call they just approved never running. The two hours are made real rather than mocked:
+    `started_at` and the `approval.requested` row are moved back, which is exactly what the
+    database would hold after a genuinely slow reviewer."""
+    task = await _claimed_task(session)
+    counter = _OpenPrCounter()
+    registry = _registry_with_open_pr(counter)
+    budget = Budget(max_iterations=10, max_seconds=60)
+    paused = await run_task(
+        session,
+        task,
+        FakeProvider([_step("github.open_pr", title="x")]),
+        registry,
+        _require_approval_policy(),
+        workspace=workspace,
+        budget=budget,
+        holder=task.claimed_by,
+    )
+    assert paused.status == "WAITING_APPROVAL"
+
+    two_hours = timedelta(hours=2)
+    await session.execute(
+        update(Task).where(Task.id == task.id).values(started_at=Task.started_at - two_hours)
+    )
+    await session.execute(
+        update(TaskEvent)
+        .where(TaskEvent.task_id == task.id, TaskEvent.type == "approval.requested")
+        .values(created_at=TaskEvent.created_at - two_hours)
+    )
+    await session.commit()
+
+    approval = await _pending_approval(session, task.id)
+    await approvals.decide_approval(
+        session, approval.id, approve=True, user_id=task.user_id, note=None
+    )
+    await session.commit()
+    resumed = await queue.claim(session, "worker-b")
+    assert resumed is not None and resumed.id == task.id
+    await session.commit()
+
+    result = await run_task(
+        session,
+        resumed,
+        FakeProvider([_step("finish", summary="pr opened")]),
+        registry,
+        _require_approval_policy(),
+        workspace=workspace,
+        budget=budget,
+        resume=rebuild(await read_events(session, task.id)),
+        holder=resumed.claimed_by,
+    )
+
+    assert result.status == "SUCCEEDED", result.reason
+    assert counter.calls == 1
+
+
+async def test_an_approval_never_overrides_a_deny_added_after_the_request(
+    session: AsyncSession, workspace: pathlib.Path
+) -> None:
+    """ADR-003's ordering still holds after ADR-022: the most restrictive effect wins, and an
+    approval is not a way around a deny the policy grows later."""
+    task = await _claimed_task(session)
+    paused = await run_task(
+        session,
+        task,
+        FakeProvider([_step("github.open_pr", title="x")]),
+        FakeWorkspace().registry(),
+        _require_approval_policy(),
+        workspace=workspace,
+        holder=task.claimed_by,
+    )
+    assert paused.status == "WAITING_APPROVAL"
+
+    approval = await _pending_approval(session, task.id)
+    await approvals.decide_approval(
+        session, approval.id, approve=True, user_id=task.user_id, note=None
+    )
+    await session.commit()
+
+    resumed = await queue.claim(session, "worker-b")
+    assert resumed is not None
+    await session.commit()
+    resume = rebuild(await read_events(session, task.id))
+
+    # An incident closed this off after the approval was requested: a plain DENY now.
+    stricter_policy = Policy(
+        [
+            Rule(
+                id="now-denied",
+                effect=Effect.DENY,
+                reason="a new incident closed this off",
+                when={"tool": "github.open_pr"},
+            )
+        ],
+        default=Effect.DENY,
+        policy_hash="test-stricter",
+    )
+
+    result = await run_task(
+        session,
+        resumed,
+        FakeProvider([_step("finish", summary="blocked")]),
+        FakeWorkspace().registry(),
+        stricter_policy,
+        workspace=workspace,
+        resume=resume,
+        holder=resumed.claimed_by,
+    )
+
+    assert result.status == "SUCCEEDED"
+    row = (
+        await session.scalars(
+            select(ToolCall).where(
+                ToolCall.task_id == task.id, ToolCall.tool_name == "github.open_pr"
+            )
+        )
+    ).one()
+    assert row.decision == "deny"
+    assert "now-denied" in (row.error or "")
+
+
+async def test_rejecting_a_paused_call_injects_the_note_and_the_loop_continues(
+    session: AsyncSession, workspace: pathlib.Path
+) -> None:
+    task = await _claimed_task(session)
+    provider = FakeProvider(
+        [
+            ScriptStep(
+                tool_calls=[
+                    ProviderToolCall(
+                        id="call-read", name="read_file", arguments={"path": "src/app.py"}
+                    ),
+                    ProviderToolCall(id="call-pr", name="github.open_pr", arguments={"title": "x"}),
+                    ProviderToolCall(id="call-list", name="list_files", arguments={}),
+                ]
+            )
+        ]
+    )
+    paused = await run_task(
+        session,
+        task,
+        provider,
+        FakeWorkspace().registry(),
+        _require_approval_policy(),
+        workspace=workspace,
+        holder=task.claimed_by,
+    )
+    assert paused.status == "WAITING_APPROVAL"
+
+    approval = await _pending_approval(session, task.id)
+    await approvals.decide_approval(
+        session, approval.id, approve=False, user_id=task.user_id, note="too risky right now"
+    )
+    await session.commit()
+
+    resumed = await queue.claim(session, "worker-b")
+    assert resumed is not None
+    await session.commit()
+    resume = rebuild(await read_events(session, task.id))
+
+    recording = _RecordingProvider(FakeProvider([_step("finish", summary="done")]))
+    result = await run_task(
+        session,
+        resumed,
+        recording,
+        FakeWorkspace().registry(),
+        _require_approval_policy(),
+        workspace=workspace,
+        resume=resume,
+        holder=resumed.claimed_by,
+    )
+
+    assert result.status == "SUCCEEDED"
+
+    # What the model itself was sent on the resumed turn, not just what the tool_calls row
+    # says: the whole point of rejecting (ADR-022) is that the model reads the note and
+    # takes another path, so the tool_result for the rejected call must be an error that
+    # carries it.
+    sent = recording.seen[0][-1]
+    assert isinstance(sent, ToolResultsMessage)
+    by_id = {r.tool_call_id: r for r in sent.results}
+    assert by_id["call-pr"].is_error is True
+    assert "too risky right now" in by_id["call-pr"].content
+
+    pr_row = (
+        await session.scalars(
+            select(ToolCall).where(
+                ToolCall.task_id == task.id, ToolCall.tool_name == "github.open_pr"
+            )
+        )
+    ).one()
+    assert pr_row.decision == "rejected"
+    assert pr_row.error is not None and "too risky right now" in pr_row.error
+
+    # The other pending call (list_files) is decided normally: no rule allows it, so the
+    # default deny applies, exactly as it would for a call the model had just made.
+    list_row = (
+        await session.scalars(
+            select(ToolCall).where(ToolCall.task_id == task.id, ToolCall.tool_name == "list_files")
+        )
+    ).one()
+    assert list_row.decision == "deny"
+
+    kinds = [event.type for event in await read_events(session, task.id)]
+    # read_file (before the pause) + github.open_pr (rejected, resumed) + list_files
+    # (decided normally, resumed).
+    assert kinds.count("tool.executed") == 3
 
 
 async def test_a_path_escaping_the_workspace_is_denied_by_policy_too(
@@ -598,3 +1119,53 @@ async def test_a_resumed_run_keeps_the_original_clock_for_max_seconds(
     assert "max_seconds" in (result.reason or "")
     kinds = [event.type for event in await read_events(session, task.id)]
     assert kinds == ["task.finished"]
+
+
+async def test_a_cancel_landing_while_the_call_is_being_decided_wins_over_the_pause(
+    session: AsyncSession,
+    session_factory: async_sessionmaker[AsyncSession],
+    workspace: pathlib.Path,
+) -> None:
+    """The loop checks for a cancel before deciding a call, but a cancel can still commit
+    after that check and before the pause does (deciding can take a sandbox round trip for
+    `apply_patch`). While the task is still RUNNING, `request_cancel` only sets the marker
+    and answers MARKED, promising the loop will stop. If the loop then parks the task
+    WAITING_APPROVAL anyway, that promise is broken: nothing is running to see the marker,
+    and a later approve/reject would try to put a task with a cancel marker back in QUEUED,
+    which `ck_tasks_cancel_requested_only_after_claim` refuses (a 500 on every decision).
+    """
+    task = await _claimed_task(session)
+    task_id = task.id
+    registry = FakeWorkspace().registry()
+    real_touched_paths = registry.touched_paths
+
+    async def cancel_while_deciding(name: str, arguments: dict[str, Any]) -> list[str | None]:
+        if name == "github.open_pr":
+            async with session_factory() as other:
+                outcome = await cancel.request_cancel(other, task_id)
+                await other.commit()
+            assert outcome is cancel.CancelOutcome.MARKED
+        return await real_touched_paths(name, arguments)
+
+    registry.touched_paths = cancel_while_deciding  # type: ignore[method-assign]
+
+    result = await run_task(
+        session,
+        task,
+        FakeProvider([_step("github.open_pr", title="x")]),
+        registry,
+        _require_approval_policy(),
+        workspace=workspace,
+        holder=task.claimed_by,
+    )
+
+    assert result.status == "CANCELLED"
+    async with session_factory() as probe:
+        row = await probe.get(Task, task_id)
+        assert row is not None and row.status == "CANCELLED"
+        pending = await probe.scalar(
+            select(func.count())
+            .select_from(Approval)
+            .where(Approval.task_id == task_id, Approval.status == "pending")
+        )
+        assert pending == 0

@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from warden.core import cancel, events, queue, worker
 from warden.core.events import read_events
-from warden.models import Task, User
+from warden.models import Approval, Task, User
 
 
 @pytest.fixture(autouse=True)
@@ -86,6 +86,56 @@ async def test_a_running_task_only_gets_the_marker(session: AsyncSession) -> Non
 
     kinds = [event.type for event in await read_events(session, task_id)]
     assert kinds == ["cancel.requested"]
+
+
+async def test_a_waiting_approval_task_is_cancelled_immediately_and_expires_its_approval(
+    session: AsyncSession,
+) -> None:
+    """ADR-022: WAITING_APPROVAL has no worker to notice a marker (the whole point of
+    `_pause_for_approval` releasing the lease), so it is cancelled outright, the same as an
+    unclaimed QUEUED task, and the question nobody will ever answer now is closed too."""
+    user = await _a_user(session)
+    task = await queue.enqueue(
+        session, user_id=user.id, spec="x", idempotency_key=str(uuid.uuid4())
+    )
+    await session.commit()
+    claimed = await queue.claim(session, "worker-a")
+    assert claimed is not None
+    await session.commit()
+    task_id = task.id
+
+    claimed.status = "WAITING_APPROVAL"
+    claimed.claimed_by = None
+    claimed.claimed_until = None
+    approval = Approval(
+        task_id=task_id,
+        tool_call_id="call-a",
+        tool="github.open_pr",
+        args_safe={"title": "x"},
+        matched_rules=["needs-human"],
+        reason="opening a pull request is visible outside the control plane",
+        scopes=["github:pr:open"],
+        status="pending",
+    )
+    session.add(approval)
+    await session.flush()
+    await session.commit()
+    approval_id = approval.id
+
+    outcome = await cancel.request_cancel(session, task_id)
+    await session.commit()
+
+    assert outcome is cancel.CancelOutcome.CANCELLED
+    row = await session.get(Task, task_id)
+    assert row is not None
+    assert row.status == "CANCELLED"
+    assert row.finished_at is not None
+
+    refreshed = await session.get(Approval, approval_id)
+    assert refreshed is not None and refreshed.status == "expired"
+
+    kinds = [event.type for event in await read_events(session, task_id)]
+    assert kinds == ["cancel.requested", "task.finished"]
 
 
 async def test_a_second_request_on_a_running_task_keeps_the_first_timestamp(
