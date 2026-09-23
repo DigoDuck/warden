@@ -36,7 +36,7 @@ function NavItems({ pendingCount }: { pendingCount: number }): ReactNode {
               }`
             }
           >
-            <Icon size={20} aria-hidden={true} />
+            <Icon size={20} strokeWidth={1.5} aria-hidden={true} />
             {label}
             {badge && pendingCount > 0 && (
               <span
@@ -93,7 +93,7 @@ export function AppShell() {
       <details className="border-b border-border-subtle bg-surface lg:hidden">
         <summary className="flex cursor-pointer list-none items-center justify-between px-4 py-3">
           <span className="font-semibold">Warden</span>
-          <Menu size={20} aria-hidden={true} />
+          <Menu size={20} strokeWidth={1.5} aria-hidden={true} />
         </summary>
         <nav aria-label="Principal" className="px-2 pb-2">
           <NavItems pendingCount={pendingCount} />

@@ -15,6 +15,12 @@
 @import "@fontsource/fira-code/400.css";
 
 @theme {
+  /* Drop Tailwind's default palette: a color utility that is not a DESIGN.md token below
+     (bg-red-500, text-white...) then generates nothing instead of slipping in unnoticed. */
+  --color-*: initial;
+  /* DESIGN.md "Tipografia": technical data (Fira Code) and labels are 13px, not 12px. */
+  --text-xs: 0.8125rem;
+
   --color-bg: #0f172a;
   --color-surface: #1e293b;
   --color-surface-raised: #272f42;

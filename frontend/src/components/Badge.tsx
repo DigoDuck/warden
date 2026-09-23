@@ -26,7 +26,7 @@ interface BadgeProps {
 export function Badge({ tone, icon: Icon, label }: BadgeProps) {
   return (
     <span className={`inline-flex items-center gap-1 text-sm font-medium ${TONE_CLASSES[tone]}`}>
-      <Icon size={16} aria-hidden="true" />
+      <Icon size={16} strokeWidth={1.5} aria-hidden="true" />
       {label}
     </span>
   );

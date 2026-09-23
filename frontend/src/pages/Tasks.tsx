@@ -90,30 +90,33 @@ export function Tasks() {
 
       {tasks.length > 0 && (
         <>
-          <table className="mt-4 w-full text-left text-sm">
-            <thead>
-              <tr className="h-10 border-b border-border-subtle text-fg-muted">
-                <th scope="col">Especificação</th>
-                <th scope="col">Status</th>
-                <th scope="col">Repositório</th>
-                <th scope="col">Criada em</th>
-              </tr>
-            </thead>
-            <tbody>
-              {tasks.map((task) => (
-                <tr key={task.id} className="h-10 border-b border-border-subtle">
-                  <td>
-                    <Link to={`/tarefas/${encodeURIComponent(task.id)}`}>{task.spec}</Link>
-                  </td>
-                  <td>
-                    <StatusBadge status={task.status} />
-                  </td>
-                  <td className="font-mono text-xs">{task.target_repo ?? "—"}</td>
-                  <td className="tabular-nums">{formatDate(task.created_at)}</td>
+          {/* DESIGN.md: never a horizontal page scroll; a wide table scrolls in its own box. */}
+          <div className="mt-4 overflow-x-auto">
+            <table className="w-full text-left text-sm">
+              <thead>
+                <tr className="h-10 border-b border-border-subtle text-fg-muted">
+                  <th scope="col">Especificação</th>
+                  <th scope="col">Status</th>
+                  <th scope="col">Repositório</th>
+                  <th scope="col">Criada em</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {tasks.map((task) => (
+                  <tr key={task.id} className="h-10 border-b border-border-subtle">
+                    <td>
+                      <Link to={`/tarefas/${encodeURIComponent(task.id)}`}>{task.spec}</Link>
+                    </td>
+                    <td>
+                      <StatusBadge status={task.status} />
+                    </td>
+                    <td className="font-mono text-xs">{task.target_repo ?? "—"}</td>
+                    <td className="tabular-nums">{formatDate(task.created_at)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
 
           {hasNextPage && (
             <button
