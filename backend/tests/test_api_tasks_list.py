@@ -210,3 +210,32 @@ async def test_missing_scope_on_list_is_403(
     token = await _user_token(session_factory, keys, await _user(session_factory), ["tasks:write"])
     response = await client.get("/tasks", headers=_auth(token))
     assert response.status_code == 403
+
+
+async def test_keyset_pagination_breaks_created_at_ties_by_id(
+    client: AsyncClient, session_factory: async_sessionmaker[AsyncSession], keys: KeyPair
+) -> None:
+    """Tasks sharing one `created_at` (same-microsecond submits, a bulk insert) must still
+    be walked exactly once: a cursor over `created_at` alone would skip the rest of a tie."""
+    token = await _user_token(
+        session_factory, keys, await _user(session_factory), ["tasks:write", "tasks:read"]
+    )
+    created = [await _submit(client, token, f"tie {n}") for n in range(3)]
+    async with session_factory() as session:
+        await session.execute(text("UPDATE tasks SET created_at = '2026-01-01T00:00:00Z'"))
+        await session.commit()
+
+    seen: list[str] = []
+    cursor: str | None = None
+    for _ in range(10):
+        params: dict[str, str | int] = {"limit": 1}
+        if cursor:
+            params["cursor"] = cursor
+        body = (await client.get("/tasks", headers=_auth(token), params=params)).json()
+        seen.extend(t["id"] for t in body["tasks"])
+        cursor = body["next_cursor"]
+        if cursor is None:
+            break
+
+    assert sorted(seen) == sorted(created)
+    assert len(seen) == len(created)
