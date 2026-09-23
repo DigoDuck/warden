@@ -444,9 +444,10 @@ class Sandbox:
         `NotFound` alone proves it: the container is gone. A plain `APIError` does not -- it
         can be a transient daemon hiccup while the kill is still in flight, not confirmation
         the container has actually died -- so it is retried like any other inconclusive poll
-        instead of being read as "stopped". Conflating the two used to let `start()` run on a
-        container nothing had actually confirmed dead yet: the ADR-021 `_kill_sync` flake
-        ("cannot exec in a stopped state" on the exec right after a kill-and-restart).
+        instead of being read as "stopped". Conflating the two let `start()` run on a
+        container nothing had actually confirmed dead yet, the most plausible cause of the
+        ADR-021 `_kill_sync` flake ("cannot exec in a stopped state" right after a
+        kill-and-restart). Plausible, not confirmed: the real flake was never reproduced.
         """
         deadline = time.monotonic() + KILL_GRACE_SECONDS
         while time.monotonic() < deadline:
