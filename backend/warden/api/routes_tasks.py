@@ -332,12 +332,13 @@ async def stream_task_events(
     """Server-Sent Events of `task_events` for one task, newest-appended-first is not a
     thing here: it is always in `seq` order, the same order the event log is written in.
 
-    Visibility and the `after` param are resolved with the request's own short-lived
-    `SessionDep` before the generator below ever runs (FastAPI closes that dependency once
-    this function returns the `StreamingResponse`, before any of it is sent), so nothing
-    from this session leaks into the polling loop. See ADR-019: no transaction may sit open
-    for the life of a connection that waits on something external, and a browser holding
-    this connection open is exactly that.
+    Visibility and the `after` param are resolved with the request's `SessionDep`, which
+    is then closed by hand below. FastAPI (>= 0.118) only exits a yield dependency after the
+    response has been fully sent, which for a stream is the life of the browser tab: left
+    open, that session would sit "idle in transaction" holding a pool connection and an
+    ACCESS SHARE lock on `tasks`. See ADR-019: no transaction may sit open for the life of a
+    connection that waits on something external, and a browser holding this one open is
+    exactly that.
     """
     user_id = _user_id_of(claims)
     await _task_or_404(session, task_id, claims, user_id)
@@ -353,6 +354,10 @@ async def stream_task_events(
             raise HTTPException(422, "Last-Event-ID must be an integer") from exc
     else:
         start_after = after
+
+    # Ends the checks' transaction and returns the connection to the pool now, not when the
+    # stream ends. The dependency's own `async with` closes it again later: a no-op.
+    await session.close()
 
     session_factory: async_sessionmaker[AsyncSession] = request.app.state.session_factory
 
