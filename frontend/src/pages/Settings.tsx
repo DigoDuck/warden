@@ -22,7 +22,7 @@ export function Settings() {
   }
 
   return (
-    <main>
+    <div>
       <h1>Configurações</h1>
       <p>
         Ainda não existe <code>/auth/login</code>. Gere um token no backend com{" "}
@@ -53,6 +53,6 @@ export function Settings() {
         </div>
       </form>
       {saved && <p role="status">Token salvo nesta aba.</p>}
-    </main>
+    </div>
   );
 }

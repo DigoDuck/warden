@@ -93,7 +93,7 @@ export function Approvals() {
   });
 
   return (
-    <main>
+    <div>
       <h1>Aprovações</h1>
 
       {approvalsQuery.isLoading && <p>Carregando aprovações…</p>}
@@ -118,6 +118,6 @@ export function Approvals() {
           ))}
         </ul>
       )}
-    </main>
+    </div>
   );
 }

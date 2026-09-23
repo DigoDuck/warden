@@ -49,7 +49,7 @@ export function SubmitTask() {
   const isUnexpectedError = error !== null && !(error instanceof ApiError && error.status === 422);
 
   return (
-    <main>
+    <div>
       <h1>Submeter tarefa</h1>
       <form onSubmit={handleSubmit} noValidate className="mt-4 flex max-w-[72ch] flex-col gap-4">
         <div className="flex flex-col gap-1">
@@ -88,6 +88,6 @@ export function SubmitTask() {
           {isPending ? "Enviando…" : "Enviar tarefa"}
         </button>
       </form>
-    </main>
+    </div>
   );
 }

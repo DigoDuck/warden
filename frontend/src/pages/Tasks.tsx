@@ -42,7 +42,7 @@ export function Tasks() {
   const hasNextPage = Boolean(tasksQuery.data?.pages.at(-1)?.next_cursor);
 
   return (
-    <main>
+    <div>
       <h1>Tarefas</h1>
 
       <div className="mt-4 flex items-center gap-3">
@@ -127,6 +127,6 @@ export function Tasks() {
           )}
         </>
       )}
-    </main>
+    </div>
   );
 }

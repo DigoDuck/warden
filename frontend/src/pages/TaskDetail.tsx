@@ -110,9 +110,9 @@ export function TaskDetail() {
 
   if (!id) {
     return (
-      <main>
+      <div>
         <p role="alert">Id de tarefa inválido.</p>
-      </main>
+      </div>
     );
   }
 
@@ -120,7 +120,7 @@ export function TaskDetail() {
   const cancelDisabled = cancelMutation.isPending || (task ? TERMINAL_STATUSES.has(task.status) : true);
 
   return (
-    <main>
+    <div>
       <p>
         <Link to="/">Tarefas</Link>
       </p>
@@ -170,6 +170,6 @@ export function TaskDetail() {
           </div>
         </>
       )}
-    </main>
+    </div>
   );
 }
