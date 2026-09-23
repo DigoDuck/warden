@@ -33,7 +33,12 @@ from warden.db import make_engine, make_session_factory
 from warden.models import Task
 from warden.policy.engine import Policy, load_policy, never_readable
 from warden.providers.base import ModelProvider
-from warden.sandbox.docker import Sandbox, SandboxProfile, discard_workspace_volume
+from warden.sandbox.docker import (
+    Sandbox,
+    SandboxProfile,
+    discard_workspace_volume,
+    list_task_ids_with_workspace_volumes,
+)
 from warden.tools.registry import ToolRegistry
 from warden.tools.sandboxed import build_registry
 
@@ -51,6 +56,12 @@ _TRANSIENT_DB_ERRORS = (OSError, SQLAlchemyError)
 # States a task does not come back from. Only then is its workspace thrown away: a task
 # merely between workers still needs whatever it changed before it was interrupted.
 TERMINAL_STATUSES = frozenset({"SUCCEEDED", "FAILED", "CANCELLED", "TIMED_OUT", "BUDGET_EXCEEDED"})
+
+# How often run_forever sweeps for orphaned workspace volumes, on top of the one sweep at
+# worker start. Modest on purpose: an orphaned volume costs disk, not correctness (nothing
+# reads it, nothing depends on it disappearing quickly), so there is no reason to check more
+# often than a claim's own idle poll.
+JANITOR_INTERVAL_SECONDS = 300.0
 
 # Resolved at import: touching the filesystem inside the async entry point would block the
 # event loop, and these never change while the process runs.
@@ -223,6 +234,21 @@ async def run_claimed_task(
         resume=resume,
         holder=holder,
     )
+
+
+async def discard_orphaned_workspace_volumes(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Throw away every task-scoped workspace volume nothing will ever resume onto again.
+
+    ADR-022's open item: cancelling a WAITING_APPROVAL task marks it CANCELLED with no
+    worker behind it to run `Worker.run_once`'s own `finally`, so that task's volume is
+    never discarded there. This is the only other place that ever calls
+    `discard_workspace_volume`.
+
+    Stub: real implementation lands once the test below has run red against this.
+    """
+    return None
 
 
 class Worker:

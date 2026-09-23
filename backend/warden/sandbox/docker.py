@@ -197,6 +197,20 @@ def discard_workspace_volume(task_id: str, *, client: docker.DockerClient | None
         client.volumes.get(workspace_volume_name(task_id)).remove(force=True)
 
 
+def list_task_ids_with_workspace_volumes(client: docker.DockerClient | None = None) -> set[str]:
+    """Every task id that still owns a workspace volume (labelled `warden.task`, see
+    `_workspace_volume`). An anonymous volume (no such label; the one-off case in tests) never
+    appears here: nobody can ever re-attach to it, so there is nothing to decide about it.
+
+    For `core/worker.py`'s janitor to find discard candidates. This module only lists them;
+    whether a given one should actually be thrown away is a question about *task* state, which
+    lives in `core`, not here (briefing §10: `sandbox` creates/destroys, it does not decide).
+    """
+    client = client or docker.from_env()
+    volumes = client.volumes.list(filters={"label": "warden.task"})
+    return {v.attrs["Labels"]["warden.task"] for v in volumes}
+
+
 def _remove_orphan_container(client: docker.DockerClient, task_id: str) -> None:
     """Force-remove whatever container still carries this task's `warden.task` label.
 

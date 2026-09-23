@@ -8,6 +8,7 @@ RULE from the spec: a task can only ever tighten the worker's own ceiling, never
 and a value that does not parse as a sane positive number must not crash the worker.
 """
 
+import contextlib
 import os
 import pathlib
 import uuid
@@ -20,11 +21,12 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from warden.core import queue
 from warden.core.loop import Budget
-from warden.core.worker import Worker, merge_budget
-from warden.models import User
+from warden.core.worker import Worker, discard_orphaned_workspace_volumes, merge_budget
+from warden.models import Task, User
 from warden.policy.engine import Effect, Policy, Rule
 from warden.providers.base import ToolCall as ProviderToolCall
 from warden.providers.fake import FakeProvider, ScriptStep
+from warden.sandbox.docker import workspace_volume_name
 
 DEFAULT = Budget(max_iterations=10, max_usd=Decimal("0.25"), max_seconds=None)
 
@@ -208,3 +210,62 @@ async def test_run_once_applies_the_tightened_per_task_budget(
     assert result is not None
     assert result.status == "TIMED_OUT"
     assert result.iterations == 1
+
+
+# --- the orphaned-workspace-volume janitor (maintenance track, item 2) ----------------------
+#
+# ADR-022's open item: cancelling a WAITING_APPROVAL task never runs Worker.run_once's own
+# `finally` (there is no worker holding it), so its workspace volume is never discarded. Real
+# Docker volumes, not a mock: whether a volume with a given label still exists afterward is
+# exactly the fact this janitor exists to get right.
+
+
+@pytest.mark.sandbox
+async def test_the_janitor_discards_terminal_and_missing_tasks_but_never_a_live_one(
+    docker_available: None,
+    _empty_tasks_and_users: None,
+    session: AsyncSession,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    import docker as docker_sdk
+
+    client = docker_sdk.from_env()
+    user = User(email=f"{uuid.uuid4()}@warden.test", password_hash="x", role="worker")
+    session.add(user)
+    await session.flush()
+
+    def _task(status: str) -> Task:
+        task = Task(
+            user_id=user.id, spec="janitor probe", idempotency_key=str(uuid.uuid4()), status=status
+        )
+        session.add(task)
+        return task
+
+    terminal_task = _task("SUCCEEDED")
+    live_task = _task("WAITING_APPROVAL")
+    await session.commit()
+    missing_task_id = uuid.uuid4()
+
+    task_ids = [terminal_task.id, live_task.id, missing_task_id]
+    volumes = [
+        client.volumes.create(
+            name=workspace_volume_name(str(tid)),
+            labels={"warden.sandbox": "1", "warden.task": str(tid)},
+        )
+        for tid in task_ids
+    ]
+    try:
+        await discard_orphaned_workspace_volumes(session_factory)
+
+        def exists(task_id: uuid.UUID) -> bool:
+            return bool(
+                client.volumes.list(filters={"label": f"warden.task={task_id}"})
+            )
+
+        assert not exists(terminal_task.id), "a terminal task's volume must be discarded"
+        assert not exists(missing_task_id), "a volume for a task that no longer exists must go"
+        assert exists(live_task.id), "a WAITING_APPROVAL task's volume must survive: it resumes onto it"
+    finally:
+        for volume in volumes:
+            with contextlib.suppress(docker_sdk.errors.NotFound, docker_sdk.errors.APIError):
+                volume.remove(force=True)
