@@ -271,3 +271,24 @@ async def test_deciding_an_already_decided_approval_is_409(
         f"/approvals/{approval_id}/approve", json={"note": None}, headers=_auth(token)
     )
     assert second.status_code == 409
+
+
+async def test_a_note_past_the_bound_is_422_and_decides_nothing(
+    client: AsyncClient, session_factory: async_sessionmaker[AsyncSession], keys: KeyPair
+) -> None:
+    """The note is copied verbatim into the task event, the audit entry and, on a reject,
+    the tool_result the model reads next turn: an unbounded field at this trust boundary
+    would let one request put an arbitrarily large blob in all three."""
+    _, approval_id = await _waiting_task_with_pending_approval(session_factory)
+    token = await _user_token(
+        session_factory, keys, await _user(session_factory), ["approvals:decide"]
+    )
+
+    response = await client.post(
+        f"/approvals/{approval_id}/reject", json={"note": "x" * 2_001}, headers=_auth(token)
+    )
+
+    assert response.status_code == 422
+    async with session_factory() as session:
+        approval = await session.get(Approval, approval_id)
+        assert approval is not None and approval.status == "pending"
