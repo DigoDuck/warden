@@ -14,7 +14,7 @@ from typing import Any
 
 import pytest
 from pydantic import BaseModel
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from tests.fake_tools import FakeWorkspace
@@ -22,7 +22,16 @@ from warden.core import approvals, cancel, queue
 from warden.core.events import read_events
 from warden.core.loop import Budget, run_task
 from warden.core.replay import ResumeState, rebuild
-from warden.models import Approval, AuditLog, ModelCall, PolicyDecision, Task, ToolCall, User
+from warden.models import (
+    Approval,
+    AuditLog,
+    ModelCall,
+    PolicyDecision,
+    Task,
+    TaskEvent,
+    ToolCall,
+    User,
+)
 from warden.policy.engine import Effect, Policy, Rule, load_policy
 from warden.providers.base import (
     Completion,
@@ -648,6 +657,66 @@ async def test_approving_a_paused_call_resumes_and_executes_it_exactly_once(
         )
     ).one()
     assert str(approval_id) in policy_decision.reason
+
+
+async def test_time_waiting_for_a_human_does_not_count_against_max_seconds(
+    session: AsyncSession, workspace: pathlib.Path
+) -> None:
+    """ADR-022: max_seconds budgets the agent's own time. A reviewer who takes two hours to
+    approve must not turn a 60 second budget into an instant TIMED_OUT on resume, with the
+    call they just approved never running. The two hours are made real rather than mocked:
+    `started_at` and the `approval.requested` row are moved back, which is exactly what the
+    database would hold after a genuinely slow reviewer."""
+    task = await _claimed_task(session)
+    counter = _OpenPrCounter()
+    registry = _registry_with_open_pr(counter)
+    budget = Budget(max_iterations=10, max_seconds=60)
+    paused = await run_task(
+        session,
+        task,
+        FakeProvider([_step("github.open_pr", title="x")]),
+        registry,
+        _require_approval_policy(),
+        workspace=workspace,
+        budget=budget,
+        holder=task.claimed_by,
+    )
+    assert paused.status == "WAITING_APPROVAL"
+
+    two_hours = timedelta(hours=2)
+    await session.execute(
+        update(Task).where(Task.id == task.id).values(started_at=Task.started_at - two_hours)
+    )
+    await session.execute(
+        update(TaskEvent)
+        .where(TaskEvent.task_id == task.id, TaskEvent.type == "approval.requested")
+        .values(created_at=TaskEvent.created_at - two_hours)
+    )
+    await session.commit()
+
+    approval = await _pending_approval(session, task.id)
+    await approvals.decide_approval(
+        session, approval.id, approve=True, user_id=task.user_id, note=None
+    )
+    await session.commit()
+    resumed = await queue.claim(session, "worker-b")
+    assert resumed is not None and resumed.id == task.id
+    await session.commit()
+
+    result = await run_task(
+        session,
+        resumed,
+        FakeProvider([_step("finish", summary="pr opened")]),
+        registry,
+        _require_approval_policy(),
+        workspace=workspace,
+        budget=budget,
+        resume=rebuild(await read_events(session, task.id)),
+        holder=resumed.claimed_by,
+    )
+
+    assert result.status == "SUCCEEDED", result.reason
+    assert counter.calls == 1
 
 
 async def test_an_approval_never_overrides_a_deny_added_after_the_request(
