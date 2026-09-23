@@ -140,7 +140,12 @@ export function TaskDetail() {
           <div className="mt-2 flex flex-wrap items-center gap-4">
             <StatusBadge status={task.status} />
             <span className="tabular-nums text-sm text-fg-muted">{formatCost(task.cost_usd)}</span>
-            <button type="button" onClick={handleCancel} disabled={cancelDisabled}>
+            <button
+              type="button"
+              className="bg-danger-solid text-fg"
+              onClick={handleCancel}
+              disabled={cancelDisabled}
+            >
               {cancelMutation.isPending ? "Cancelando…" : "Cancelar tarefa"}
             </button>
           </div>

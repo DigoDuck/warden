@@ -52,7 +52,12 @@ function ApprovalCard({ approval }: { approval: ApprovalOut }) {
       {conflict && <p role="alert">Esta aprovação já foi decidida por outra pessoa.</p>}
 
       <div className="mt-3 flex flex-col gap-2">
-        <button type="button" onClick={() => decide.mutate(true)} disabled={decide.isPending}>
+        <button
+          type="button"
+          className="self-start bg-accent text-bg"
+          onClick={() => decide.mutate(true)}
+          disabled={decide.isPending}
+        >
           Aprovar
         </button>
 
@@ -69,7 +74,7 @@ function ApprovalCard({ approval }: { approval: ApprovalOut }) {
         )}
         <button
           type="button"
-          className="text-danger"
+          className="self-start bg-danger-solid text-fg"
           onClick={() => decide.mutate(false)}
           disabled={rejectDisabled}
         >

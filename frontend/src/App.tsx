@@ -2,10 +2,12 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { useEffect } from "react";
 import { BrowserRouter, Route, Routes, useNavigate } from "react-router-dom";
 import { onUnauthorized } from "./api/client";
-import { Home } from "./pages/Home";
+import { AppShell } from "./components/AppShell";
+import { Approvals } from "./pages/Approvals";
 import { Settings } from "./pages/Settings";
 import { SubmitTask } from "./pages/SubmitTask";
 import { TaskDetail } from "./pages/TaskDetail";
+import { Tasks } from "./pages/Tasks";
 
 const queryClient = new QueryClient();
 
@@ -25,10 +27,13 @@ export function App() {
       <BrowserRouter>
         <UnauthorizedRedirect />
         <Routes>
-          <Route path="/" element={<Home />} />
-          <Route path="/tarefas/nova" element={<SubmitTask />} />
-          <Route path="/tarefas/:id" element={<TaskDetail />} />
-          <Route path="/configuracoes" element={<Settings />} />
+          <Route element={<AppShell />}>
+            <Route path="/" element={<Tasks />} />
+            <Route path="/tarefas/nova" element={<SubmitTask />} />
+            <Route path="/tarefas/:id" element={<TaskDetail />} />
+            <Route path="/aprovacoes" element={<Approvals />} />
+            <Route path="/configuracoes" element={<Settings />} />
+          </Route>
         </Routes>
       </BrowserRouter>
     </QueryClientProvider>
