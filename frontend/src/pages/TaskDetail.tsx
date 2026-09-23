@@ -25,10 +25,13 @@ function stopPollingWhenTerminal(status: string | undefined): number | false {
 
 export function TaskDetail() {
   const { id } = useParams<{ id: string }>();
+  // The id comes decoded from a URL anyone can craft: encoded, a "../audit" stays one path
+  // segment of /tasks/{id} instead of steering the bearer token to another endpoint.
+  const taskPath = encodeURIComponent(id ?? "");
 
   const taskQuery = useQuery({
     queryKey: ["task", id],
-    queryFn: () => apiFetch<TaskOut>(`/tasks/${id}`),
+    queryFn: () => apiFetch<TaskOut>(`/tasks/${taskPath}`),
     enabled: Boolean(id),
     refetchInterval: (query) => stopPollingWhenTerminal(query.state.data?.status),
   });
@@ -37,7 +40,7 @@ export function TaskDetail() {
     // ponytail: only the first page (backend default limit=100). A "carregar mais" control
     // for TaskEventPage.next_after can wait for a task long enough to need it.
     queryKey: ["task", id, "events"],
-    queryFn: () => apiFetch<TaskEventPage>(`/tasks/${id}/events`),
+    queryFn: () => apiFetch<TaskEventPage>(`/tasks/${taskPath}/events`),
     enabled: Boolean(id),
     refetchInterval: () => stopPollingWhenTerminal(taskQuery.data?.status),
   });
