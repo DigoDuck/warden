@@ -1,17 +1,23 @@
-"""POST /tasks, GET /tasks/{id}, GET /tasks/{id}/events.
+"""POST /tasks, GET /tasks, GET /tasks/{id}, GET /tasks/{id}/events, GET /tasks/{id}/stream.
 
 No agent logic here (briefing §10): this module validates input, calls
 `core.queue.enqueue`, and reads rows back. It never touches a provider, a sandbox or the
 policy engine.
 """
 
+import asyncio
+import base64
+import binascii
 import uuid
+from collections.abc import AsyncIterator
+from datetime import datetime
 from decimal import Decimal
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response
-from sqlalchemy import func, select
-from sqlalchemy.ext.asyncio import AsyncSession
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
+from fastapi.responses import StreamingResponse
+from sqlalchemy import func, select, tuple_
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from warden import audit
 from warden.api.deps import SessionDep, require_scope
@@ -24,6 +30,7 @@ from warden.api.schemas import (
     TaskOut,
 )
 from warden.core import cancel, queue
+from warden.core import events as core_events
 from warden.core.events import ITERATION_STARTED
 from warden.identity import Claims
 from warden.models import TASK_STATUSES, AuditLog, ModelCall, Task, TaskEvent
@@ -86,6 +93,20 @@ async def _to_task_out(session: AsyncSession, task: Task) -> TaskOut:
     )
 
 
+def _encode_cursor(created_at: datetime, task_id: uuid.UUID) -> str:
+    raw = f"{created_at.isoformat()}|{task_id}"
+    return base64.urlsafe_b64encode(raw.encode()).decode()
+
+
+def _decode_cursor(cursor: str) -> tuple[datetime, uuid.UUID]:
+    try:
+        raw = base64.urlsafe_b64decode(cursor.encode()).decode()
+        created_at_raw, id_raw = raw.rsplit("|", 1)
+        return datetime.fromisoformat(created_at_raw), uuid.UUID(id_raw)
+    except (ValueError, UnicodeDecodeError, binascii.Error) as exc:
+        raise HTTPException(422, "invalid cursor") from exc
+
+
 @router.get("", response_model=TaskListOut)
 async def list_tasks(
     session: SessionDep,
@@ -94,8 +115,31 @@ async def list_tasks(
     cursor: Annotated[str | None, Query()] = None,
     limit: Annotated[int, Query(gt=0, le=_MAX_TASKS_PAGE)] = 50,
 ) -> TaskListOut:
-    # TODO(skeleton): ignores status/cursor/limit and caller scoping. Filled in next commit.
-    rows = (await session.scalars(select(Task))).all()
+    if status is not None and status not in TASK_STATUSES:
+        raise HTTPException(422, f"status must be one of {TASK_STATUSES}")
+
+    conditions = []
+    if "admin" not in claims.scopes:
+        conditions.append(Task.user_id == _user_id_of(claims))
+    if status is not None:
+        conditions.append(Task.status == status)
+    if cursor is not None:
+        cursor_created_at, cursor_id = _decode_cursor(cursor)
+        # Row-value comparison: matches the (created_at DESC, id DESC) order below, so
+        # "strictly after the cursor" means exactly the rows the previous page did not
+        # already return, whatever ties `created_at` alone would have left ambiguous.
+        conditions.append(tuple_(Task.created_at, Task.id) < (cursor_created_at, cursor_id))
+
+    rows = (
+        await session.scalars(
+            select(Task)
+            .where(*conditions)
+            .order_by(Task.created_at.desc(), Task.id.desc())
+            .limit(limit)
+        )
+    ).all()
+
+    next_cursor = _encode_cursor(rows[-1].created_at, rows[-1].id) if len(rows) == limit else None
     return TaskListOut(
         tasks=[
             TaskListItemOut(
@@ -109,7 +153,7 @@ async def list_tasks(
             )
             for row in rows
         ],
-        next_cursor=None,
+        next_cursor=next_cursor,
     )
 
 
@@ -267,3 +311,55 @@ async def get_task_events(
     # changed. See ADR-020.
     next_after = events[-1].seq if len(events) == limit else None
     return TaskEventPage(events=events, next_after=next_after)
+
+
+# How often the stream polls the database for new events, and how often it sends a
+# comment-line heartbeat when nothing new shows up. Module-level so tests can monkeypatch
+# them down instead of waiting on real wall-clock seconds.
+_STREAM_POLL_SECONDS = 1.0
+_STREAM_HEARTBEAT_SECONDS = 15.0
+
+
+@router.get("/{task_id}/stream")
+async def stream_task_events(
+    task_id: uuid.UUID,
+    request: Request,
+    session: SessionDep,
+    claims: Annotated[Claims, Depends(require_scope("tasks:read"))],
+    after: Annotated[int, Query(ge=0)] = 0,
+) -> StreamingResponse:
+    """Server-Sent Events of `task_events` for one task, newest-appended-first is not a
+    thing here: it is always in `seq` order, the same order the event log is written in.
+
+    Visibility and the `after` param are resolved with the request's own short-lived
+    `SessionDep` before the generator below ever runs (FastAPI closes that dependency once
+    this function returns the `StreamingResponse`, before any of it is sent), so nothing
+    from this session leaks into the polling loop. See ADR-019: no transaction may sit open
+    for the life of a connection that waits on something external, and a browser holding
+    this connection open is exactly that.
+    """
+    user_id = _user_id_of(claims)
+    await _task_or_404(session, task_id, claims, user_id)
+
+    # EventSource cannot set a custom Authorization header, which is why the frontend uses
+    # fetch + ReadableStream instead and can set Last-Event-ID by hand on a reconnect; ?after
+    # covers the very first connection, before there is any last event id to send.
+    last_event_id = request.headers.get("last-event-id")
+    if last_event_id is not None:
+        try:
+            start_after = int(last_event_id)
+        except ValueError as exc:
+            raise HTTPException(422, "Last-Event-ID must be an integer") from exc
+    else:
+        start_after = after
+
+    session_factory: async_sessionmaker[AsyncSession] = request.app.state.session_factory
+
+    # TODO(skeleton): sends nothing and closes immediately, ignoring start_after, polling
+    # and the terminal event entirely. Filled in next commit.
+    async def event_source() -> AsyncIterator[str]:
+        return
+        yield  # pragma: no cover - makes this an async generator
+
+    _ = session_factory  # unused until the real implementation
+    return StreamingResponse(event_source(), media_type="text/event-stream")
