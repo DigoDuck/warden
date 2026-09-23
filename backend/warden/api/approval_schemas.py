@@ -9,7 +9,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class ApprovalOut(BaseModel):
@@ -30,5 +30,6 @@ class ApprovalDecisionIn(BaseModel):
 
     # Required for a reject (core/approvals.py::decide_approval enforces the non-empty
     # check), optional for an approve. Bounded for the same reason TaskCreate.spec is: every
-    # audit entry and event this produces carries it verbatim.
-    note: str | None = None
+    # audit entry and event this produces carries it verbatim, and on a reject so does the
+    # tool_result the model reads next. 2,000 matches events._MAX_ARG_CHARS.
+    note: str | None = Field(default=None, max_length=2_000)
