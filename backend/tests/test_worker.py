@@ -221,7 +221,7 @@ async def test_run_once_applies_the_tightened_per_task_budget(
 
 
 @pytest.mark.sandbox
-async def test_the_janitor_discards_terminal_and_missing_tasks_but_never_a_live_one(
+async def test_the_janitor_discards_only_tasks_it_sees_terminal(
     docker_available: None,
     _empty_tasks_and_users: None,
     session: AsyncSession,
@@ -254,6 +254,14 @@ async def test_the_janitor_discards_terminal_and_missing_tasks_but_never_a_live_
         )
         for tid in task_ids
     ]
+    # Hand-made, or written by something that is not Warden: must neither crash the sweep
+    # nor be touched by it.
+    volumes.append(
+        client.volumes.create(
+            name=f"warden-janitor-probe-{uuid.uuid4().hex[:8]}",
+            labels={"warden.sandbox": "1", "warden.task": "not-a-uuid"},
+        )
+    )
     try:
         await discard_orphaned_workspace_volumes(session_factory)
 
@@ -261,8 +269,11 @@ async def test_the_janitor_discards_terminal_and_missing_tasks_but_never_a_live_
             return bool(client.volumes.list(filters={"label": f"warden.task={task_id}"}))
 
         assert not exists(terminal_task.id), "a terminal task's volume must be discarded"
-        assert not exists(missing_task_id), "a volume for a task that no longer exists must go"
+        # One Docker daemon serves every database on the machine (dev, each WARDEN_TEST_DB):
+        # "no row here" usually means "another database's task", maybe a paused one.
+        assert exists(missing_task_id), "a task this database does not know is not ours"
         assert exists(live_task.id), "a WAITING_APPROVAL task's volume must survive a resume"
+        assert client.volumes.list(filters={"label": "warden.task=not-a-uuid"})
     finally:
         for volume in volumes:
             with contextlib.suppress(docker_sdk.errors.NotFound, docker_sdk.errors.APIError):
