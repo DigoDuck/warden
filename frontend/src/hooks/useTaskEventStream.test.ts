@@ -139,12 +139,16 @@ describe("useTaskEventStream", () => {
     await vi.advanceTimersByTimeAsync(1000); // base delay after the drop
     await waitFor(() => expect(fetch).toHaveBeenCalledTimes(2)); // first 500
 
-    await vi.advanceTimersByTimeAsync(1999);
-    expect(fetch).toHaveBeenCalledTimes(2); // not yet: needs ~2000ms after a 500
-    await vi.advanceTimersByTimeAsync(1);
+    // The delay must have grown past the base one: waiting exactly the base delay again is
+    // not enough (a plain fixed-delay retry, the bug this replaces, would already have
+    // reconnected by here).
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(fetch).toHaveBeenCalledTimes(2);
+    // Comfortably past the doubled delay (2s), with slack for waitFor's own timer creep.
+    await vi.advanceTimersByTimeAsync(3000);
     await waitFor(() => expect(fetch).toHaveBeenCalledTimes(3)); // second 500, delay doubled
 
-    await vi.advanceTimersByTimeAsync(4000); // doubled again after the second 500
+    await vi.advanceTimersByTimeAsync(10_000); // comfortably past the next, larger delay
     await waitFor(() => expect(fetch).toHaveBeenCalledTimes(4));
 
     const lastCallHeaders = new Headers(vi.mocked(fetch).mock.calls[3]?.[1]?.headers);

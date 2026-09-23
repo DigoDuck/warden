@@ -4,6 +4,19 @@ import { getToken } from "./token";
 // through the dev proxy / same-origin reverse proxy, never straight to the backend's port.
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "/api";
 
+/** A non-OK response from the stream endpoint, carrying the status so the caller
+ * (useTaskEventStream) can tell a 401 or another 4xx apart from a 5xx/network failure
+ * instead of treating every failure the same way. */
+export class StreamError extends Error {
+  readonly status: number;
+
+  constructor(status: number) {
+    super(`stream request failed with status ${status}`);
+    this.name = "StreamError";
+    this.status = status;
+  }
+}
+
 export interface OpenTaskEventStreamOptions {
   /** Resume after this event id (`Last-Event-ID`), omitted on the very first connection. */
   afterId?: number;
@@ -33,7 +46,7 @@ export async function openTaskEventStream(
     signal: options.signal,
   });
   if (!response.ok || !response.body) {
-    throw new Error(`stream request failed with status ${response.status}`);
+    throw new StreamError(response.status);
   }
   return response;
 }
