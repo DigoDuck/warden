@@ -199,11 +199,15 @@ sobreviver, e já sobrevive, porque `WAITING_APPROVAL` não é terminal.
   um lock consultivo transacional; feito sempre dentro do checkpoint curto que já ia commitar
   de qualquer forma (ADR-019: nenhuma transação de audit fica aberta atravessando uma chamada
   de provider ou sandbox), então o custo é o mesmo de qualquer outro passo do loop.
-- **Cancelar uma tarefa em `WAITING_APPROVAL` não descarta o volume do workspace.** Só o
-  `finally` de `Worker.run_once` descarta volume, e uma tarefa cancelada enquanto espera não
-  tem worker nenhum. O volume fica órfão até alguém removê-lo. Resolver exige uma varredura
-  (um janitor no worker, que é arquivo de outra trilha nesta semana) ou o cancel falar com o
-  Docker, o que a API não deve fazer (briefing §10). Fica registrado como pendência.
+- **Cancelar uma tarefa em `WAITING_APPROVAL` não descarta o volume do workspace na hora.**
+  Só o `finally` de `Worker.run_once` descarta volume, e uma tarefa cancelada enquanto espera
+  não tem worker nenhum. **Resolvido na trilha de manutenção** (`core/worker.py::discard_
+  orphaned_workspace_volumes`): um janitor varre os volumes rotulados `warden.task`, lê o
+  status de cada tarefa candidata numa única consulta e descarta os que já estão terminais ou
+  sem linha nenhuma, deixando intocado qualquer um em `QUEUED`/`RUNNING`/`WAITING_APPROVAL`.
+  Roda uma vez ao iniciar o worker e depois a cada `JANITOR_INTERVAL_SECONDS` dentro de
+  `run_forever`; até a próxima varredura (no máximo esse intervalo), o volume de uma tarefa
+  recém-cancelada ainda fica órfão, o que é aceitável porque o custo é disco, não corretude.
 - **O tempo de espera humana não conta no `max_seconds` (decidido em 2026-09-23).** O
   prazo mede o tempo do agente, não o do revisor. Sem isso, uma tarefa com `max_seconds: 60`
   aprovada duas horas depois terminava `TIMED_OUT` no primeiro `_check_stoppable` do resume,
