@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from "react";
+import { useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 
 export interface TabDef {
   id: string;
@@ -6,22 +6,90 @@ export interface TabDef {
   panel: ReactNode;
 }
 
-// TODO(skeleton): plain buttons, no tablist/tab/tabpanel roles, no arrow-key navigation,
-// no roving tabindex. Filled in next commit.
+/** WAI-ARIA APG "tabs" pattern: roving tabindex (only the selected tab is a Tab stop),
+ * ArrowLeft/ArrowRight move focus and select (wrapping at the ends), Home/End jump to the
+ * first/last tab. Used once, for Task Detail's Spec/Execução/Custo — kept as its own
+ * component rather than inlined so the keyboard behaviour has its own test. */
 export function Tabs({ label, tabs }: { label: string; tabs: TabDef[] }) {
   const [activeId, setActiveId] = useState(tabs[0]?.id);
-  const active = tabs.find((tab) => tab.id === activeId);
+  const tabRefs = useRef<Record<string, HTMLButtonElement | null>>({});
+
+  function select(id: string, focus: boolean) {
+    setActiveId(id);
+    if (focus) {
+      tabRefs.current[id]?.focus();
+    }
+  }
+
+  function handleKeyDown(event: KeyboardEvent<HTMLButtonElement>, index: number) {
+    let nextIndex: number | null = null;
+    switch (event.key) {
+      case "ArrowRight":
+        nextIndex = (index + 1) % tabs.length;
+        break;
+      case "ArrowLeft":
+        nextIndex = (index - 1 + tabs.length) % tabs.length;
+        break;
+      case "Home":
+        nextIndex = 0;
+        break;
+      case "End":
+        nextIndex = tabs.length - 1;
+        break;
+      default:
+        return;
+    }
+    event.preventDefault();
+    const next = tabs[nextIndex];
+    if (next) {
+      select(next.id, true);
+    }
+  }
 
   return (
-    <div aria-label={label}>
-      <div>
-        {tabs.map((tab) => (
-          <button key={tab.id} onClick={() => setActiveId(tab.id)}>
-            {tab.label}
-          </button>
-        ))}
+    <div>
+      <div role="tablist" aria-label={label} className="flex gap-1 border-b border-border-subtle">
+        {tabs.map((tab, index) => {
+          const isSelected = tab.id === activeId;
+          return (
+            <button
+              key={tab.id}
+              ref={(el) => {
+                tabRefs.current[tab.id] = el;
+              }}
+              type="button"
+              role="tab"
+              id={`tab-${tab.id}`}
+              aria-selected={isSelected}
+              aria-controls={`panel-${tab.id}`}
+              tabIndex={isSelected ? 0 : -1}
+              className={`border-b-2 px-3 py-2 text-sm ${
+                isSelected ? "border-accent text-fg" : "border-transparent text-fg-muted"
+              }`}
+              onClick={() => select(tab.id, false)}
+              onKeyDown={(event) => handleKeyDown(event, index)}
+            >
+              {tab.label}
+            </button>
+          );
+        })}
       </div>
-      <div>{active?.panel}</div>
+      {tabs
+        .filter((tab) => tab.id === activeId)
+        .map((tab) => (
+          // Only the active panel is mounted: the alternative (mount all, `hidden` on the
+          // rest) would keep an idle SSE-driven Execução tab subscribed in the background
+          // for no reason while Spec or Custo is showing.
+          <div
+            key={tab.id}
+            role="tabpanel"
+            id={`panel-${tab.id}`}
+            aria-labelledby={`tab-${tab.id}`}
+            className="pt-4"
+          >
+            {tab.panel}
+          </div>
+        ))}
     </div>
   );
 }
