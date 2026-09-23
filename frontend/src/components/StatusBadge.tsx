@@ -9,7 +9,9 @@ interface StatusEntry {
 
 // warden/models.py's TASK_STATUSES, DESIGN.md's status table. RUNNING uses a static
 // Loader icon, never a spinning one: week 4 forbids animation entirely.
-const STATUS: Record<string, StatusEntry> = {
+// Exported (not module-private) so the task list's status filter can reuse the exact same
+// Portuguese labels instead of a second, driftable copy of this table.
+export const TASK_STATUS_ENTRIES: Record<string, StatusEntry> = {
   QUEUED: { tone: "muted", icon: Clock, label: "Na fila" },
   RUNNING: { tone: "info", icon: Loader, label: "Executando" },
   WAITING_APPROVAL: { tone: "warn", icon: Hand, label: "Aguardando aprovação" },
@@ -24,6 +26,6 @@ const STATUS: Record<string, StatusEntry> = {
  * table). An unrecognised value still renders its own text instead of throwing: a status
  * shown as raw text is a smaller problem than a page that will not render at all. */
 export function StatusBadge({ status }: { status: string }) {
-  const entry = STATUS[status] ?? { tone: "muted" as const, icon: Clock, label: status };
+  const entry = TASK_STATUS_ENTRIES[status] ?? { tone: "muted" as const, icon: Clock, label: status };
   return <Badge tone={entry.tone} icon={entry.icon} label={entry.label} />;
 }
