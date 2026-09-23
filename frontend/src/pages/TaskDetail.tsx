@@ -1,0 +1,112 @@
+import { useQuery } from "@tanstack/react-query";
+import { useEffect } from "react";
+import { Link, useParams } from "react-router-dom";
+import { ApiError, apiFetch } from "../api/client";
+import type { TaskEventPage, TaskOut } from "../api/types";
+
+// The state machine from warden/models.py (TASK_STATUSES): once a task reaches one of
+// these, core/worker.py never picks it up again, so polling past this point would just
+// hit the same row forever.
+const TERMINAL_STATUSES = new Set([
+  "SUCCEEDED",
+  "FAILED",
+  "CANCELLED",
+  "TIMED_OUT",
+  "BUDGET_EXCEEDED",
+]);
+
+// SSE lands in week 5 (docs/plano-12-semanas.md); 2s polling is the interim mechanism the
+// task explicitly asks for.
+const POLL_INTERVAL_MS = 2000;
+
+function stopPollingWhenTerminal(status: string | undefined): number | false {
+  return status && TERMINAL_STATUSES.has(status) ? false : POLL_INTERVAL_MS;
+}
+
+export function TaskDetail() {
+  const { id } = useParams<{ id: string }>();
+  // The id comes decoded from a URL anyone can craft: encoded, a "../audit" stays one path
+  // segment of /tasks/{id} instead of steering the bearer token to another endpoint.
+  const taskPath = encodeURIComponent(id ?? "");
+
+  const taskQuery = useQuery({
+    queryKey: ["task", id],
+    queryFn: () => apiFetch<TaskOut>(`/tasks/${taskPath}`),
+    enabled: Boolean(id),
+    refetchInterval: (query) => stopPollingWhenTerminal(query.state.data?.status),
+  });
+
+  const eventsQuery = useQuery({
+    // ponytail: only the first page (backend default limit=100). A "carregar mais" control
+    // for TaskEventPage.next_after can wait for a task long enough to need it.
+    queryKey: ["task", id, "events"],
+    queryFn: () => apiFetch<TaskEventPage>(`/tasks/${taskPath}/events`),
+    enabled: Boolean(id),
+    refetchInterval: () => stopPollingWhenTerminal(taskQuery.data?.status),
+  });
+
+  // Both polls stop on the same render, but the events poll that ran alongside the first
+  // terminal task poll may have read the table just before the worker's final commit (status
+  // and `task.finished` land together). One fetch after the flip closes that window for good.
+  const isTerminal = stopPollingWhenTerminal(taskQuery.data?.status) === false;
+  const { refetch: refetchEvents } = eventsQuery;
+  useEffect(() => {
+    if (isTerminal) {
+      void refetchEvents();
+    }
+  }, [isTerminal, refetchEvents]);
+
+  if (!id) {
+    return (
+      <main>
+        <p role="alert">Id de tarefa inválido.</p>
+      </main>
+    );
+  }
+
+  return (
+    <main>
+      <p>
+        <Link to="/">Início</Link>
+      </p>
+      <h1>Tarefa {id}</h1>
+
+      {taskQuery.isLoading && <p>Carregando tarefa…</p>}
+      {taskQuery.isError && (
+        <p role="alert">
+          {taskQuery.error instanceof ApiError && taskQuery.error.status === 404
+            ? "Tarefa não encontrada."
+            : "Falha ao carregar a tarefa."}
+        </p>
+      )}
+      {taskQuery.data && (
+        <dl>
+          <dt>Status</dt>
+          <dd>{taskQuery.data.status}</dd>
+          <dt>Especificação</dt>
+          <dd>{taskQuery.data.spec}</dd>
+          <dt>Repositório alvo</dt>
+          <dd>{taskQuery.data.target_repo ?? "—"}</dd>
+          <dt>Custo (USD)</dt>
+          <dd>{taskQuery.data.cost_usd}</dd>
+          <dt>Iterações</dt>
+          <dd>{taskQuery.data.iterations}</dd>
+        </dl>
+      )}
+
+      <h2>Eventos</h2>
+      {eventsQuery.isLoading && <p>Carregando eventos…</p>}
+      {eventsQuery.isError && <p role="alert">Falha ao carregar os eventos.</p>}
+      {eventsQuery.data && eventsQuery.data.events.length === 0 && <p>Nenhum evento ainda.</p>}
+      {eventsQuery.data && eventsQuery.data.events.length > 0 && (
+        <ul>
+          {eventsQuery.data.events.map((event) => (
+            <li key={event.seq}>
+              <strong>{event.type}</strong> — {event.created_at}
+            </li>
+          ))}
+        </ul>
+      )}
+    </main>
+  );
+}

@@ -1,0 +1,8 @@
+/* Tailwind without Preflight, its CSS reset: with no classes on the pages yet, the reset strips
+   every input, textarea and button down to borderless transparent boxes, and the form fields
+   become invisible. Browser defaults keep these unstyled pages usable until the design wave,
+   which decides whether to bring the reset back (add `@import "tailwindcss/preflight.css"
+   layer(base);`) together with the classes that restyle the fields. */
+@layer theme, base, components, utilities;
+@import "tailwindcss/theme.css" layer(theme);
+@import "tailwindcss/utilities.css" layer(utilities);

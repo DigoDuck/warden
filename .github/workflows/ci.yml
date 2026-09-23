@@ -58,3 +58,32 @@ jobs:
       - run: docker build -t warden-sandbox:dev sandbox-images/python
 
       - run: uv run --directory backend pytest
+
+  frontend:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      # gen:api (npm's pre* hooks) shells out to the backend to build its live OpenAPI
+      # schema, no Postgres needed for that: openapi_export.py never opens a DB session.
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: backend/uv.lock
+
+      - run: uv sync --directory backend --locked
+
+      - run: npm ci --prefix frontend
+
+      - run: npm run --prefix frontend typecheck
+
+      - run: npm run --prefix frontend lint
+
+      - run: npm test --prefix frontend -- --run
