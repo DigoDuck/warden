@@ -1,4 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
+import { useEffect } from "react";
 import { Link, useParams } from "react-router-dom";
 import { ApiError, apiFetch } from "../api/client";
 import type { TaskEventPage, TaskOut } from "../api/types";
@@ -40,6 +41,17 @@ export function TaskDetail() {
     enabled: Boolean(id),
     refetchInterval: () => stopPollingWhenTerminal(taskQuery.data?.status),
   });
+
+  // Both polls stop on the same render, but the events poll that ran alongside the first
+  // terminal task poll may have read the table just before the worker's final commit (status
+  // and `task.finished` land together). One fetch after the flip closes that window for good.
+  const isTerminal = stopPollingWhenTerminal(taskQuery.data?.status) === false;
+  const { refetch: refetchEvents } = eventsQuery;
+  useEffect(() => {
+    if (isTerminal) {
+      void refetchEvents();
+    }
+  }, [isTerminal, refetchEvents]);
 
   if (!id) {
     return (
