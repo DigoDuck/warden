@@ -130,7 +130,9 @@ async def decide_approval(
         session,
         actor_type="user",
         actor_id=str(user_id),
-        action=f"approval.{new_status}",
+        # Same name as the task event, so the audit log and the event log agree on what
+        # happened (`approval.granted`, not `approval.approved`).
+        action=event_type,
         target_type="approval",
         target_id=str(approval_id),
         details={"task_id": str(task_id), "tool": tool, "note": note},
