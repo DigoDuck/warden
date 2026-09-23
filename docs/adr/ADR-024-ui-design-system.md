@@ -88,9 +88,17 @@ O endpoint faz *polling* do banco a cada ~1s, mas cada poll abre e fecha sua pr�
 regra ("nenhuma transação aberta enquanto o processo espera algo de fora"); uma conexão SSE que um
 navegador mantém aberta por minutos é exatamente esse "esperar algo de fora", e segurar uma
 transação (ou só uma conexão do pool) por esse tempo bloquearia o worker que precisa escrever
-naquela mesma linha de tarefa. Um teste (`test_stream_does_not_hold_a_transaction_open_between_polls`)
-prova isso causando a falha, não simulando: um `UPDATE` concorrente na linha da tarefa tem que
-terminar rápido com o stream ainda aberto.
+naquela mesma linha de tarefa.
+
+A `SessionDep` da requisição (usada pela autenticação e pela checagem de visibilidade) é fechada
+**à mão** antes de devolver o `StreamingResponse`. Motivo: desde a 0.118 o FastAPI só executa a
+saída de uma dependência com `yield` depois que a resposta termina de ser enviada, o que num stream
+é a vida inteira da aba. Sem o `close()` explícito, essa sessão ficava *idle in transaction*
+segurando uma conexão do pool e um lock `ACCESS SHARE` em `tasks` enquanto o navegador estivesse
+aberto. Um `UPDATE` concorrente não conflita com `ACCESS SHARE`, então o teste original
+(`test_stream_does_not_hold_a_transaction_open_between_polls`) não pegava isso; quem pega é
+`test_stream_releases_the_request_session_before_streaming`, que pede `ACCESS EXCLUSIVE` em `tasks`
+(o lock de um `ALTER TABLE` numa migração) com o stream aberto.
 
 O stream honra `Last-Event-ID` (cabeçalho) com `?after=` como alternativa: o navegador não permite
 que `EventSource` mande um cabeçalho `Authorization`, então o frontend nunca usa `EventSource` de
