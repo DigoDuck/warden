@@ -10,13 +10,13 @@ import uuid
 from collections.abc import AsyncIterator
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from warden.core import approvals, queue
 from warden.core.events import read_events
-from warden.models import Approval, Task, User
+from warden.models import Approval, AuditLog, Task, User
 
 _WIPE = text("TRUNCATE audit_log, task_events, approvals, tasks, users RESTART IDENTITY CASCADE")
 
@@ -298,3 +298,38 @@ async def test_concurrent_approve_and_reject_only_one_wins(
         assert final is not None and final.status == winners[0]
         refreshed = await probe.get(Task, task_id)
         assert refreshed is not None and refreshed.status == "QUEUED"
+
+
+@pytest.mark.parametrize(
+    ("approve", "note", "action"),
+    [(True, None, "approval.granted"), (False, "too risky right now", "approval.rejected")],
+    ids=["approve", "reject"],
+)
+async def test_a_decision_writes_an_audit_entry_with_the_user_as_actor(
+    session: AsyncSession, approve: bool, note: str | None, action: str
+) -> None:
+    """Week 3 audit list and ADR-022: the decision is on the tamper-evident log under the
+    same name as its task event (`approval.granted`/`approval.rejected`), attributed to the
+    human who made it, not to the system."""
+    task = await _waiting_task(session)
+    row = _approval(task)
+    session.add(row)
+    await session.flush()
+    await session.commit()
+    user = await _a_user(session)
+    await session.commit()
+    user_id, task_id, approval_id = user.id, task.id, row.id
+
+    await approvals.decide_approval(
+        session, approval_id, approve=approve, user_id=user_id, note=note
+    )
+    await session.commit()
+
+    entry = (
+        await session.scalars(select(AuditLog).where(AuditLog.target_id == str(approval_id)))
+    ).one()
+    assert entry.action == action
+    assert (entry.actor_type, entry.actor_id) == ("user", str(user_id))
+    assert entry.target_type == "approval"
+    assert entry.details["task_id"] == str(task_id)
+    assert entry.details["note"] == note
