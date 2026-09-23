@@ -203,16 +203,19 @@ sobreviver, e já sobrevive, porque `WAITING_APPROVAL` não é terminal.
   Só o `finally` de `Worker.run_once` descarta volume, e uma tarefa cancelada enquanto espera
   não tem worker nenhum. **Resolvido na trilha de manutenção** (`core/worker.py::discard_
   orphaned_workspace_volumes`): um janitor varre os volumes rotulados `warden.task`, lê o
-  status de cada tarefa candidata numa única consulta e descarta os que já estão terminais ou
-  sem linha nenhuma, deixando intocado qualquer um em `QUEUED`/`RUNNING`/`WAITING_APPROVAL`.
+  status de cada tarefa candidata numa única consulta e descarta **só** os que o próprio banco
+  vê como terminais, deixando intocado qualquer um em `QUEUED`/`RUNNING`/`WAITING_APPROVAL`.
   Roda uma vez ao iniciar o worker e depois a cada `JANITOR_INTERVAL_SECONDS` dentro de
   `run_forever`; até a próxima varredura (no máximo esse intervalo), o volume de uma tarefa
   recém-cancelada ainda fica órfão, o que é aceitável porque o custo é disco, não corretude.
-  **Limite conhecido:** "sem linha" é relativo ao banco do worker, mas o Docker é um só por
-  máquina. Numa máquina com mais de um banco (o `warden` de dev e um `WARDEN_TEST_DB`, ou
-  trilhas paralelas), o janitor de um banco descarta o volume de uma tarefa pausada do outro.
-  Em produção (um banco, um daemon) isso não acontece. Corrigir exige rotular o volume com a
-  identidade do banco; fica para quando houver mais de um ambiente por daemon fora de dev.
+  **Tarefa sem linha no banco não é descartada (decidido em 2026-09-23).** O Docker é um só
+  por máquina e atende todos os bancos (o `warden` de dev, cada `WARDEN_TEST_DB`, trilhas
+  paralelas), então "sem linha aqui" quase sempre é "tarefa de outro banco", às vezes pausada
+  e prestes a retomar sobre esse volume. A primeira versão descartava esses volumes, e rodar a
+  suíte de testes apagaria o workspace de uma tarefa pausada do banco de dev. UUIDs aleatórios
+  garantem que um id terminal num banco nunca é uma tarefa viva em outro. O custo é vazar o
+  volume de uma tarefa apagada do banco, e nada no Warden apaga tarefa. Rotular o volume com a
+  identidade do banco resolveria as duas coisas; fica para quando isso valer o custo.
 - **O tempo de espera humana não conta no `max_seconds` (decidido em 2026-09-23).** O
   prazo mede o tempo do agente, não o do revisor. Sem isso, uma tarefa com `max_seconds: 60`
   aprovada duas horas depois terminava `TIMED_OUT` no primeiro `_check_stoppable` do resume,
