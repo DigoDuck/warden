@@ -208,6 +208,11 @@ sobreviver, e já sobrevive, porque `WAITING_APPROVAL` não é terminal.
   Roda uma vez ao iniciar o worker e depois a cada `JANITOR_INTERVAL_SECONDS` dentro de
   `run_forever`; até a próxima varredura (no máximo esse intervalo), o volume de uma tarefa
   recém-cancelada ainda fica órfão, o que é aceitável porque o custo é disco, não corretude.
+  **Limite conhecido:** "sem linha" é relativo ao banco do worker, mas o Docker é um só por
+  máquina. Numa máquina com mais de um banco (o `warden` de dev e um `WARDEN_TEST_DB`, ou
+  trilhas paralelas), o janitor de um banco descarta o volume de uma tarefa pausada do outro.
+  Em produção (um banco, um daemon) isso não acontece. Corrigir exige rotular o volume com a
+  identidade do banco; fica para quando houver mais de um ambiente por daemon fora de dev.
 - **O tempo de espera humana não conta no `max_seconds` (decidido em 2026-09-23).** O
   prazo mede o tempo do agente, não o do revisor. Sem isso, uma tarefa com `max_seconds: 60`
   aprovada duas horas depois terminava `TIMED_OUT` no primeiro `_check_stoppable` do resume,
