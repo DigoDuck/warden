@@ -83,21 +83,25 @@ class FakeProvider:
         *,
         source: str = "<inline>",
         model: str = "fake-model",
+        resume_aware: bool = False,
     ) -> None:
         self._script = list(script)
         self._source = source
         self._model = model
         self._cursor = 0
+        self._resume_aware = resume_aware
 
     @classmethod
-    def from_yaml(cls, path: str | pathlib.Path, *, model: str = "fake-model") -> "FakeProvider":
+    def from_yaml(
+        cls, path: str | pathlib.Path, *, model: str = "fake-model", resume_aware: bool = False
+    ) -> "FakeProvider":
         path = pathlib.Path(path)
         document = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
         raw_steps = document.get("script")
         if not raw_steps:
             raise ValueError(f"{path}: no 'script' key, or it is empty")
         steps = [_parse_step(raw, index) for index, raw in enumerate(raw_steps)]
-        return cls(steps, source=str(path), model=model)
+        return cls(steps, source=str(path), model=model, resume_aware=resume_aware)
 
     async def generate(
         self,
