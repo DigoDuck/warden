@@ -22,6 +22,8 @@ from collections.abc import Callable
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from docker.errors import DockerException
+from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -33,7 +35,12 @@ from warden.db import make_engine, make_session_factory
 from warden.models import Task
 from warden.policy.engine import Policy, load_policy, never_readable
 from warden.providers.base import ModelProvider
-from warden.sandbox.docker import Sandbox, SandboxProfile, discard_workspace_volume
+from warden.sandbox.docker import (
+    Sandbox,
+    SandboxProfile,
+    discard_workspace_volume,
+    list_task_ids_with_workspace_volumes,
+)
 from warden.tools.registry import ToolRegistry
 from warden.tools.sandboxed import build_registry
 
@@ -51,6 +58,15 @@ _TRANSIENT_DB_ERRORS = (OSError, SQLAlchemyError)
 # States a task does not come back from. Only then is its workspace thrown away: a task
 # merely between workers still needs whatever it changed before it was interrupted.
 TERMINAL_STATUSES = frozenset({"SUCCEEDED", "FAILED", "CANCELLED", "TIMED_OUT", "BUDGET_EXCEEDED"})
+
+# How often run_forever sweeps for orphaned workspace volumes, on top of the one sweep at
+# worker start. Modest on purpose: an orphaned volume costs disk, not correctness (nothing
+# reads it, nothing depends on it disappearing quickly), so there is no reason to check more
+# often than a claim's own idle poll.
+JANITOR_INTERVAL_SECONDS = 300.0
+# The janitor's Docker calls can fail one more way: docker-py raises a bare DockerException,
+# not an OSError, when the daemon cannot be reached at all (Docker Desktop restarting).
+_JANITOR_TRANSIENT_ERRORS = (*_TRANSIENT_DB_ERRORS, DockerException)
 
 # Resolved at import: touching the filesystem inside the async entry point would block the
 # event loop, and these never change while the process runs.
@@ -225,6 +241,64 @@ async def run_claimed_task(
     )
 
 
+async def discard_orphaned_workspace_volumes(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Throw away every task-scoped workspace volume nothing will ever resume onto again.
+
+    ADR-022's open item: cancelling a WAITING_APPROVAL task marks it CANCELLED with no
+    worker behind it to run `Worker.run_once`'s own `finally`, so that task's volume is
+    never discarded there. This is the only other place that ever calls
+    `discard_workspace_volume`.
+
+    Race safety: every candidate task's status is read in ONE query, up front, before this
+    discards anything, and a task is only ever discarded if that single read already found it
+    terminal (`TERMINAL_STATUSES`); a task with no row is left alone (see the loop below).
+    Nothing in this state machine
+    ever moves a task's status *out of* a terminal one (`core/queue.py`, `core/cancel.py` and
+    `core/approvals.py` only ever move a row *into* one), so whatever this reads as terminal
+    stays terminal forever — there is no later moment at which a volume this call decided to
+    discard could still belong to a task that resumes onto it. A task read as QUEUED, RUNNING
+    or WAITING_APPROVAL is left alone unconditionally: even a stale read only costs one more
+    sweep before an already-terminal task's volume is noticed, never a live task's volume
+    disappearing under it.
+    """
+    try:
+        task_ids = await asyncio.to_thread(list_task_ids_with_workspace_volumes)
+    except _JANITOR_TRANSIENT_ERRORS:
+        return
+    if not task_ids:
+        return
+
+    uuids = []
+    for task_id in task_ids:
+        # Only Warden writes this label, but a hand-made volume must not take the worker down.
+        with contextlib.suppress(ValueError):
+            uuids.append(uuid.UUID(task_id))
+    if not uuids:
+        return
+
+    try:
+        async with session_factory() as session:
+            rows = (
+                await session.execute(select(Task.id, Task.status).where(Task.id.in_(uuids)))
+            ).all()
+    except _TRANSIENT_DB_ERRORS:
+        return
+
+    status_by_id = {str(task_id): status for task_id, status in rows}
+    for task_id in task_ids:
+        # Only what this database itself sees as terminal. No row here is not "gone": one
+        # Docker daemon serves every database on the machine (dev, each WARDEN_TEST_DB), so a
+        # missing row is most likely another database's task, possibly paused and about to
+        # resume onto this volume. Leaking the volume of a task deleted from this database
+        # (nothing in Warden deletes tasks) is the cheaper mistake.
+        if status_by_id.get(task_id) not in TERMINAL_STATUSES:
+            continue
+        with contextlib.suppress(*_JANITOR_TRANSIENT_ERRORS):
+            await asyncio.to_thread(discard_workspace_volume, task_id)
+
+
 class Worker:
     def __init__(
         self,
@@ -323,6 +397,12 @@ class Worker:
                         await asyncio.to_thread(discard_workspace_volume, str(task_id))
 
     async def run_forever(self) -> None:
+        # Once at start (an orphan from before this process existed has been waiting
+        # regardless), then every JANITOR_INTERVAL_SECONDS. A monotonic clock, not
+        # wall-clock: immune to the system clock stepping backward or forward mid-run.
+        await discard_orphaned_workspace_volumes(self._sessions)
+        next_sweep = asyncio.get_running_loop().time() + JANITOR_INTERVAL_SECONDS
+
         while not self._stopping.is_set():
             result = await self.run_once()
             if result is None:
@@ -331,6 +411,9 @@ class Worker:
                 # submission and pickup ever shows up in the metrics.
                 with contextlib.suppress(TimeoutError):
                     await asyncio.wait_for(self._stopping.wait(), timeout=IDLE_POLL_SECONDS)
+            if asyncio.get_running_loop().time() >= next_sweep:
+                await discard_orphaned_workspace_volumes(self._sessions)
+                next_sweep = asyncio.get_running_loop().time() + JANITOR_INTERVAL_SECONDS
 
 
 async def main() -> int:  # pragma: no cover - process entry point

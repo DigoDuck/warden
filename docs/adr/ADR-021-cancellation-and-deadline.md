@@ -144,6 +144,28 @@ recovers` ("cannot exec in a stopped state", visto uma vez em uma execução com
 `_wait_until_started`, que este PR não toca; o suspeito, se voltar a aparecer, continua
 sendo uma corrida ali, não algo que este trabalho poderia ter introduzido.
 
+**Causa provável corrigida na trilha de manutenção (2026-09-23), não confirmada no daemon
+real.** Ocorreu 3 vezes no total, nunca sob demanda. Uma tentativa real de reprodução (652
+ciclos de kill-and-restart, 8 depois 16 sandboxes em paralelo mais carga de CPU, contra Docker
+de verdade) deu 0 falhas: a taxa real é baixa demais para uma sessão de trabalho reproduzir.
+Causa provável: em `sandbox/docker.py::_wait_until_stopped`, um `APIError` vindo de `reload()`
+era tratado exatamente como `NotFound` (container confirmado morto). `NotFound` prova mesmo;
+`APIError` não, um erro ambíguo do daemon durante o kill não é a mesma coisa que o container
+ter efetivamente morrido. Um `APIError` isolado bastava para `_wait_until_stopped` devolver
+"parado" cedo demais, `start()` rodava (sem efeito real) num container que um daemon de
+verdade recusa reiniciar por ainda estar rodando, e `_wait_until_started` via `Running=True`
+desse mesmo container nunca reiniciado e declarava sucesso. O kill de verdade, pedido
+instantes antes, terminava de derrubar o container mais tarde, e o próximo `exec` encontrava
+um container que já não existia mais. O defeito de código foi provado por injeção de falha
+determinística na fronteira do `reload()` (o real não era alcançável em tempo hábil):
+`tests/test_sandbox.py::test_an_ambiguous_reload_error_mid_kill_is_retried_not_trusted`.
+Correção: `_wait_until_stopped` agora só aceita `NotFound` como prova de morte; um `APIError`
+é reexperimentado dentro do mesmo prazo (`KILL_GRACE_SECONDS`), igual a qualquer outro poll
+inconclusivo, em vez de virar "parado" na primeira resposta ambígua. O que a injeção **não**
+prova é que o daemon de verdade devolveu esse `APIError` nas 3 ocorrências: nenhuma deixou log
+do `reload()`. Se o flake voltar com esta correção, a hipótese cai e a próxima candidata é o
+fallback de `KILL_GRACE_SECONDS` esgotado sob carga (H2 do commit `d82442f`).
+
 **Do lado do loop:** `registry.execute()` matado no meio nem sempre levanta `ToolError` (o
 container pode simplesmente devolver um resultado esquisito, ou uma exceção do docker-py que
 não é `ToolError`). `_run_tools` cobre os dois casos: um `except Exception` mais amplo em

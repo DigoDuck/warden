@@ -197,6 +197,20 @@ def discard_workspace_volume(task_id: str, *, client: docker.DockerClient | None
         client.volumes.get(workspace_volume_name(task_id)).remove(force=True)
 
 
+def list_task_ids_with_workspace_volumes(client: docker.DockerClient | None = None) -> set[str]:
+    """Every task id that still owns a workspace volume (labelled `warden.task`, see
+    `_workspace_volume`). An anonymous volume (no such label; the one-off case in tests) never
+    appears here: nobody can ever re-attach to it, so there is nothing to decide about it.
+
+    For `core/worker.py`'s janitor to find discard candidates. This module only lists them;
+    whether a given one should actually be thrown away is a question about *task* state, which
+    lives in `core`, not here (briefing §10: `sandbox` creates/destroys, it does not decide).
+    """
+    client = client or docker.from_env()
+    volumes = client.volumes.list(filters={"label": "warden.task"})
+    return {v.attrs["Labels"]["warden.task"] for v in volumes}
+
+
 def _remove_orphan_container(client: docker.DockerClient, task_id: str) -> None:
     """Force-remove whatever container still carries this task's `warden.task` label.
 
@@ -426,13 +440,24 @@ class Sandbox:
         Not finding out either way is treated as "stopped": the caller already gets
         `CommandTimeout` for the command, and `destroy()` removes the container by force
         regardless, so there is nothing further to report here.
+
+        `NotFound` alone proves it: the container is gone. A plain `APIError` does not -- it
+        can be a transient daemon hiccup while the kill is still in flight, not confirmation
+        the container has actually died -- so it is retried like any other inconclusive poll
+        instead of being read as "stopped". Conflating the two let `start()` run on a
+        container nothing had actually confirmed dead yet, the most plausible cause of the
+        ADR-021 `_kill_sync` flake ("cannot exec in a stopped state" right after a
+        kill-and-restart). Plausible, not confirmed: the real flake was never reproduced.
         """
         deadline = time.monotonic() + KILL_GRACE_SECONDS
         while time.monotonic() < deadline:
             try:
                 self._container.reload()
-            except (NotFound, docker.errors.APIError):
+            except NotFound:
                 return
+            except docker.errors.APIError:
+                time.sleep(0.05)
+                continue
             if not self._container.attrs.get("State", {}).get("Running"):
                 return
             time.sleep(0.05)
