@@ -443,7 +443,9 @@ async def main() -> int:  # pragma: no cover - process entry point
     def provider_factory() -> ModelProvider:
         from warden.providers.fake import FakeProvider
 
-        return FakeProvider.from_yaml(args.script)
+        # resume_aware: every claim gets a fresh provider, and a resumed task (after an
+        # approval or a crash) must continue the script, not replay it from step 0.
+        return FakeProvider.from_yaml(args.script, resume_aware=True)
 
     worker = Worker(sessions, provider_factory, load_policy(args.policy), WORKSPACE)
 

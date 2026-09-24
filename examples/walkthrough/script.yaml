@@ -1,0 +1,21 @@
+# Walkthrough for the UI (week 4): one task that shows every decision the control plane
+# makes. Run the worker with this script and examples/walkthrough/policy.yaml (see README).
+#
+#   step 1  list_files          -> allow
+#   step 2  read_file .env      -> deny (never-read-secrets); the model gets the refusal
+#   step 3  write_file NOTES.md -> require_approval; the task pauses in the Decision Queue
+#   step 4  finish              -> only reached after a human approves or rejects step 3
+script:
+  - tool_call: { name: list_files, args: { pattern: "**/*.py" } }
+  - tool_call: { name: read_file, args: { path: ".env" } }
+  - tool_call:
+      name: write_file
+      args:
+        path: NOTES.md
+        content: "Notes written by the agent after a human approved it.\n"
+  - tool_call:
+      name: finish
+      args:
+        summary: >-
+          Listed the Python files, was refused .env by policy, and wrote NOTES.md once a human
+          decided on it.

@@ -5,7 +5,7 @@ from decimal import Decimal
 
 import pytest
 
-from warden.providers.base import UserMessage
+from warden.providers.base import AssistantMessage, Message, UserMessage
 from warden.providers.fake import FakeProvider, ScriptExhausted
 from warden.providers.pricing import cost_usd
 
@@ -84,3 +84,21 @@ def test_step_with_neither_tool_call_nor_text_is_rejected(tmp_path: pathlib.Path
     bad.write_text("script:\n  - {}\n", encoding="utf-8")
     with pytest.raises(ValueError):
         FakeProvider.from_yaml(bad)
+
+
+async def test_a_resume_aware_provider_picks_the_step_from_the_conversation() -> None:
+    """The Worker builds a new provider for every claim, so a task resumed after an approval
+    or a crash meets a fresh FakeProvider. A cursor would restart the script at step 0 and
+    replay tool call ids the log already holds. Resume-aware, the provider counts the
+    assistant turns already in the conversation instead, which is what a real model's
+    position in the dialogue is."""
+    history: list[Message] = [
+        UserMessage(text="read the repo"),
+        AssistantMessage(raw_content={"step": "zero"}),
+    ]
+    fresh = FakeProvider.from_yaml(FIXTURE, resume_aware=True)
+
+    completion = await fresh.generate(history)
+
+    assert [call.id for call in completion.tool_calls] == ["fake-1-0", "fake-1-1"]
+    assert [call.name for call in completion.tool_calls] == ["read_file", "list_files"]
