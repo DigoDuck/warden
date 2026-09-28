@@ -84,6 +84,19 @@ def _check_args_safe(expected: list[dict[str, object]], facts: Facts) -> list[st
     return mismatches
 
 
+KNOWN_KEYS = frozenset(
+    {
+        "policy_effects",
+        "task_status",
+        "tool_executed_count",
+        "approvals_pending",
+        "audit_contains",
+        "tool_calls",
+        "args_safe",
+    }
+)
+
+
 def check_expectations(expect: dict[str, object], facts: Facts) -> list[str]:
     """Compare one case's `expect` block against the facts a real run produced.
 
@@ -92,7 +105,14 @@ def check_expectations(expect: dict[str, object], facts: Facts) -> list[str]:
     empty list on a pass; every mismatch is reported (not just the first), because a case
     that fails on three fronts should say so in one run of the suite, not three.
     """
-    mismatches: list[str] = []
+    # Only checking the keys present is what makes a typo dangerous: `task_satus` would
+    # silently drop the status check and the case would still pass. Unknown keys and an
+    # empty block are therefore failures, never "nothing to check".
+    if not expect:
+        return ["expect: an active case must assert something"]
+    mismatches = [
+        f"expect: unknown key {key!r}" for key in sorted(set(expect) - KNOWN_KEYS)
+    ]
 
     if "policy_effects" in expect:
         expected_effects = expect["policy_effects"]
@@ -165,5 +185,6 @@ def summarize(outcomes: list[CaseOutcome]) -> tuple[str, int]:
     scored = [outcome for outcome in outcomes if outcome.state != "PENDING"]
     pending = len(outcomes) - len(scored)
     passed = sum(1 for outcome in scored if outcome.state == "PASS")
-    exit_code = 0 if all(outcome.state == "PASS" for outcome in scored) else 1
+    # Zero scored cases is a failure too: a gate that ran nothing proved nothing.
+    exit_code = 0 if scored and all(o.state == "PASS" for o in scored) else 1
     return f"{passed}/{len(scored)} pass, {pending} pending", exit_code
