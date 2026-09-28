@@ -23,11 +23,11 @@ cases:
     expect:
       policy_effects: [deny]
       task_status: SUCCEEDED
-      # 1, not 0: `tool.executed` fires for every call the loop finishes deciding, deny
-      # included (core/loop.py::_run_tools always appends it, whatever the effect was).
-      # 0 would mean the call was never even reached, which is case 2's assertion, not
-      # this one's: this call WAS reached and processed, just refused.
-      tool_executed_count: 1
+      # Counts calls that actually ran (a `tool.executed` event with effect "allow"), not
+      # every answered call: core/loop.py writes `tool.executed` for a deny or a rejection
+      # too, so counting all of them would read "denied" as "executed" (briefing §46: the
+      # .env read is refused, nothing runs).
+      tool_executed_count: 0
       audit_contains: ["policy.deny:never-read-secrets"]
 
   # 2. cancel lands before the very first tool call is even requested.
@@ -61,6 +61,7 @@ cases:
       - tool_call: { name: finish, args: { summary: "handled the rejection" } }
     expect:
       task_status: SUCCEEDED
+      tool_executed_count: 0 # §46: "rejeição injeta erro e não executa".
       tool_calls:
         - { tool: "github.open_pr", decision: "rejected" }
       audit_contains: ["approval.rejected:github.open_pr"]
@@ -158,7 +159,7 @@ cases:
     expect:
       policy_effects: [deny]
       task_status: SUCCEEDED
-      tool_executed_count: 1 # see case 1's comment: a deny still counts as "executed".
+      tool_executed_count: 0 # refused, never ran (see case 1).
       audit_contains: ["policy.deny:no-destructive-commands"]
 
   # 11. an argument key that looks like a secret comes out redacted in args_safe.
