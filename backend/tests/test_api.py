@@ -23,15 +23,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from warden import audit, identity
 from warden.api.app import create_app
 from warden.core import events, queue
-from warden.identity.jwt import ALGORITHM, KeyPair, _kid_for
+from warden.identity.jwt import ALGORITHM, KeyPair
 from warden.models import AuditLog, Task, TaskEvent, User
-
-
-@pytest.fixture(scope="session")
-def keys() -> KeyPair:
-    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    public_key = private_key.public_key()
-    return KeyPair(private_key=private_key, public_key=public_key, kid=_kid_for(public_key))
 
 
 @pytest.fixture

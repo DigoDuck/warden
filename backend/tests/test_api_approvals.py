@@ -12,7 +12,6 @@ import uuid
 from collections.abc import AsyncIterator
 
 import pytest
-from cryptography.hazmat.primitives.asymmetric import rsa
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -20,15 +19,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from warden import identity
 from warden.api.app import create_app
 from warden.core import queue
-from warden.identity.jwt import KeyPair, _kid_for
+from warden.identity.jwt import KeyPair
 from warden.models import Approval, Task, User
-
-
-@pytest.fixture(scope="session")
-def keys() -> KeyPair:
-    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    public_key = private_key.public_key()
-    return KeyPair(private_key=private_key, public_key=public_key, kid=_kid_for(public_key))
 
 
 @pytest.fixture

@@ -13,7 +13,6 @@ from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from cryptography.hazmat.primitives.asymmetric import rsa
 from pydantic import SecretStr
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -21,7 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from warden import audit, identity
 from warden.config import Settings
 from warden.identity import broker
-from warden.identity.jwt import Claims, KeyPair, _kid_for
+from warden.identity.jwt import Claims, KeyPair
 from warden.models import AuditLog, IssuedToken, Task, User
 
 # Deliberately not GitHub- or OpenAI-token-shaped (no "ghp_"/"sk-" prefix): a string a secret
@@ -44,13 +43,6 @@ def _settings_with(token: str) -> Settings:
 
 _CONFIGURED = _settings_with(FAKE_TOKEN)
 _UNCONFIGURED = _settings_with("")
-
-
-@pytest.fixture(scope="module")
-def keys() -> KeyPair:
-    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    public_key = private_key.public_key()
-    return KeyPair(private_key=private_key, public_key=public_key, kid=_kid_for(public_key))
 
 
 async def _user(session: AsyncSession) -> User:

@@ -5,12 +5,14 @@ from collections.abc import AsyncIterator
 
 import pytest
 from alembic.config import Config
+from cryptography.hazmat.primitives.asymmetric import rsa
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from alembic import command
 from warden.config import get_settings
 from warden.db import make_engine, make_session_factory, with_database
+from warden.identity.jwt import KeyPair, _kid_for
 
 BACKEND = pathlib.Path(__file__).resolve().parents[1]
 # Overridable so two checkouts can run the suite against one Postgres at the same time.
@@ -64,3 +66,16 @@ async def session(
     async with session_factory() as s:
         yield s
         await s.rollback()
+
+
+@pytest.fixture(scope="session")
+def keys() -> KeyPair:
+    """An ephemeral RSA pair, shared by every test that signs or verifies a token.
+
+    Never `identity.load_keys()` reading a file: neither this suite nor CI needs a key on
+    disk. Session-scoped because generating a 2048-bit RSA key costs real time, and every
+    test signing with it wants the same key `run_task`'s `keys` parameter can be pointed at.
+    """
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    public_key = private_key.public_key()
+    return KeyPair(private_key=private_key, public_key=public_key, kid=_kid_for(public_key))
