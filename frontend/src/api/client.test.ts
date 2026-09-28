@@ -47,6 +47,23 @@ describe("apiFetch", () => {
     expect(proxy.rewrite?.("/api/tasks/1/events")).toBe("/tasks/1/events");
   });
 
+  it("points the dev proxy at WARDEN_API_PORT when it is set", async () => {
+    // Port 8000 is often taken on a dev machine by another project's container; `make api`
+    // and the proxy read the same variable, so both move together.
+    vi.stubEnv("WARDEN_API_PORT", "8010");
+    vi.resetModules();
+    try {
+      const { default: config } = await import("../../vite.config");
+      const proxy = config.server?.proxy?.["/api"];
+      if (proxy === undefined || typeof proxy === "string") {
+        throw new Error(`expected an /api proxy object, got ${String(proxy)}`);
+      }
+      expect(proxy.target).toBe("http://127.0.0.1:8010");
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
   it("sends no Authorization header when no token is stored", async () => {
     vi.mocked(fetch).mockResolvedValue(new Response("{}", { status: 200 }));
 
