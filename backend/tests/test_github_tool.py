@@ -16,13 +16,20 @@ from collections.abc import AsyncIterator
 import httpx
 import pytest
 from pydantic import SecretStr
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from warden import identity
 from warden.config import Settings
+from warden.core import approvals, queue
+from warden.core.events import read_events
+from warden.core.loop import run_task
+from warden.core.replay import rebuild
 from warden.identity.jwt import KeyPair
-from warden.models import Task, User
+from warden.models import Approval, AuditLog, Task, ToolCall, User
 from warden.policy.engine import Effect, PolicyContext, UserRef, combine, load_policy
+from warden.providers.base import ToolCall as ProviderToolCall
+from warden.providers.fake import FakeProvider, ScriptStep
 from warden.sandbox.docker import Sandbox, SandboxProfile
 from warden.tools.github import OpenPrArgs, open_pr, open_pr_paths
 from warden.tools.registry import ToolContext, ToolError
@@ -301,3 +308,144 @@ def test_build_registry_only_offers_github_open_pr_when_configured(
 
     monkeypatch.setattr("warden.config.get_settings", _settings)
     assert build_registry(sandbox).has("github.open_pr")
+
+
+# --- end to end: nothing secret ever reaches the log (ADR-025, deliverable 5) -----------------
+
+
+async def _claimed_task(session: AsyncSession) -> Task:
+    user = User(email=f"{uuid.uuid4()}@warden.test", password_hash="x", role="worker")
+    session.add(user)
+    await session.flush()
+    await queue.enqueue(
+        session, user_id=user.id, spec="open a pr", idempotency_key=str(uuid.uuid4())
+    )
+    await session.commit()
+    claimed = await queue.claim(session, "worker-e2e")
+    assert claimed is not None
+    return claimed
+
+
+def _open_pr_step() -> ScriptStep:
+    return ScriptStep(
+        tool_calls=[
+            ProviderToolCall(
+                id="call-open-pr",
+                name="github.open_pr",
+                arguments={
+                    "title": "Add a feature",
+                    "body": "Closes the ticket.",
+                    "branch_slug": "e2e",
+                    "paths": ["src/app.py"],
+                },
+            )
+        ]
+    )
+
+
+def _finish_step(summary: str = "opened the PR") -> ScriptStep:
+    return ScriptStep(
+        tool_calls=[
+            ProviderToolCall(id="call-finish", name="finish", arguments={"summary": summary})
+        ]
+    )
+
+
+async def test_no_secret_or_agent_token_ever_reaches_the_log(
+    sandbox: Sandbox, session: AsyncSession, keys: KeyPair, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Runs a real task through github.open_pr end to end (approval requested, granted,
+    resumed, finished), against the real default policy and a fake GitHub, then scans every
+    task_events payload, every tool_calls row and every audit_log row this run produced for
+    the configured GitHub token and for every agent JWT the loop minted along the way.
+    Neither may appear anywhere: task_events/tool_calls go through core/events.py's
+    broker.redact() choke point, and the GitHub token itself is only ever read into an HTTP
+    header this module builds, never into a string this module raises or logs itself.
+    """
+    fake = FakeGitHub()
+    monkeypatch.setattr(
+        "warden.config.get_settings",
+        lambda: Settings(github_token=SecretStr(FAKE_TOKEN), github_repo="acme/widgets"),
+    )
+    # Captured before patching: the lambda below must build a *real* client, not recurse into
+    # itself through the module-global `httpx.AsyncClient` name it is about to replace.
+    real_async_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        "warden.tools.github.httpx.AsyncClient",
+        lambda *a, **k: real_async_client(transport=httpx.MockTransport(fake.handler)),
+    )
+
+    # A spy, not a mock: the real issue_agent_token still runs, its return value (the actual
+    # JWT string this task's tool calls were authorised with) is just also captured here, so
+    # the scan at the bottom has something concrete to look for.
+    minted_tokens: list[str] = []
+    original_issue = identity.issue_agent_token
+
+    async def _spy_issue(*args: object, **kwargs: object) -> str:
+        token = await original_issue(*args, **kwargs)  # type: ignore[arg-type]
+        minted_tokens.append(token)
+        return token
+
+    monkeypatch.setattr(identity, "issue_agent_token", _spy_issue)
+
+    audit_baseline = await session.scalar(select(func.max(AuditLog.id))) or 0
+    task = await _claimed_task(session)
+    policy = load_policy(DEFAULT_POLICY)
+    registry = build_registry(sandbox)
+
+    paused = await run_task(
+        session,
+        task,
+        FakeProvider([_open_pr_step()]),
+        registry,
+        policy,
+        workspace=pathlib.Path("."),
+        holder=task.claimed_by,
+        keys=keys,
+    )
+    assert paused.status == "WAITING_APPROVAL"
+
+    approval = (await session.scalars(select(Approval).where(Approval.task_id == task.id))).one()
+    await approvals.decide_approval(
+        session, approval.id, approve=True, user_id=task.user_id, note=None
+    )
+    await session.commit()
+
+    resumed = await queue.claim(session, "worker-e2e-2")
+    assert resumed is not None
+    await session.commit()
+    resume = rebuild(await read_events(session, task.id))
+
+    result = await run_task(
+        session,
+        resumed,
+        FakeProvider([_finish_step()]),
+        registry,
+        policy,
+        workspace=pathlib.Path("."),
+        resume=resume,
+        holder=resumed.claimed_by,
+        keys=keys,
+    )
+    assert result.status == "SUCCEEDED"
+    assert len(minted_tokens) == 1, "one per-call token, for the one ALLOW (approved) call"
+    assert fake.pulls, "the PR really was opened, this is not a vacuously passing scan"
+
+    # The scan.
+    event_payloads = [event.payload for event in await read_events(session, task.id)]
+    tool_calls = list(await session.scalars(select(ToolCall).where(ToolCall.task_id == task.id)))
+    audit_rows = list(await session.scalars(select(AuditLog).where(AuditLog.id > audit_baseline)))
+
+    haystack = "\n".join(
+        [
+            *(json.dumps(payload, default=str) for payload in event_payloads),
+            *(row.result_summary or "" for row in tool_calls),
+            *(row.error or "" for row in tool_calls),
+            *(json.dumps(row.args_safe, default=str) for row in tool_calls),
+            *(json.dumps(row.details, default=str) for row in audit_rows),
+        ]
+    )
+
+    assert FAKE_TOKEN not in haystack
+    for token in minted_tokens:
+        assert token not in haystack
