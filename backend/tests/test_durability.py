@@ -17,6 +17,7 @@ from collections.abc import AsyncIterator
 from decimal import Decimal
 
 import pytest
+from cryptography.hazmat.primitives import serialization
 from pydantic import BaseModel
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -487,7 +488,19 @@ script:
     )
 
     test_db_url = with_database(get_settings().database_url, TEST_DB)
-    env = {**os.environ, "DATABASE_URL": test_db_url}
+    # The worker entry point loads its signing key from disk and refuses to start without
+    # one. Hand it the suite's own ephemeral key through a temp file rather than relying on
+    # a `make keys` file on this machine: CI has none, and the in-process worker that
+    # resumes below signs with this same key, so both halves of the run agree.
+    key_path = tmp_path / "jwt-private.pem"
+    key_path.write_bytes(
+        keys.private_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+    )
+    env = {**os.environ, "DATABASE_URL": test_db_url, "JWT_PRIVATE_KEY_PATH": str(key_path)}
 
     client = docker_sdk.from_env()
     proc: subprocess.Popen[bytes] | None = None
