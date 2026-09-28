@@ -54,8 +54,12 @@ worker: sandbox-image
 
 # The HTTP surface (briefing §14). Needs `make keys` done once first: it loads the signing
 # key at startup and refuses to serve without one.
+# WARDEN_API_PORT moves the API off 8000 when another project holds it; the Vite dev proxy
+# reads the same variable (frontend/vite.config.ts).
+WARDEN_API_PORT ?= 8000
+
 api:
-	$(UV) uvicorn warden.api.main:app --reload
+	$(UV) uvicorn warden.api.main:app --reload --port $(WARDEN_API_PORT)
 
 # Mints a user JWT for manual testing, e.g.:
 #   TOKEN=$(make user-token email=you@example.com scopes="tasks:write tasks:read audit:read")

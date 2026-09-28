@@ -47,6 +47,31 @@ class TaskOut(BaseModel):
     iterations: int
 
 
+class TaskListItemOut(BaseModel):
+    """The row shape for GET /tasks.
+
+    No `cost_usd`/`iterations` here on purpose: those come from an aggregate query per task
+    (`routes_tasks.py::_to_task_out`), and running one per row would turn a list endpoint
+    into N+1 queries. The task detail screen (`GET /tasks/{id}`) is where a viewer sees them;
+    the list only needs enough to link to it and to render state.
+    """
+
+    id: uuid.UUID
+    status: str
+    spec: str
+    target_repo: str | None
+    created_at: datetime
+    started_at: datetime | None
+    finished_at: datetime | None
+
+
+class TaskListOut(BaseModel):
+    tasks: list[TaskListItemOut]
+    # Opaque keyset cursor (created_at, id of the last row), None once the last page
+    # returned fewer rows than `limit`. See routes_tasks.py's `_encode_cursor`.
+    next_cursor: str | None
+
+
 class TaskEventOut(BaseModel):
     seq: int
     type: str

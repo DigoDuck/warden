@@ -49,19 +49,20 @@ export function SubmitTask() {
   const isUnexpectedError = error !== null && !(error instanceof ApiError && error.status === 422);
 
   return (
-    <main>
+    <div>
       <h1>Submeter tarefa</h1>
-      <form onSubmit={handleSubmit} noValidate>
-        <div>
+      <form onSubmit={handleSubmit} noValidate className="mt-4 flex max-w-[72ch] flex-col gap-4">
+        <div className="flex flex-col gap-1">
           <label htmlFor="spec">Especificação da tarefa</label>
           <textarea
             id="spec"
             required
+            rows={8}
             value={spec}
             onChange={(event) => setSpec(event.target.value)}
           />
         </div>
-        <div>
+        <div className="flex flex-col gap-1">
           <label htmlFor="target-repo">Repositório alvo (opcional)</label>
           <input
             id="target-repo"
@@ -71,18 +72,22 @@ export function SubmitTask() {
           />
         </div>
 
-        {emptySpecError && <p role="alert">Descreva a tarefa antes de enviar.</p>}
+        {emptySpecError && <p role="alert" className="text-danger">Descreva a tarefa antes de enviar.</p>}
         {serverValidationErrors.map((message) => (
-          <p role="alert" key={message}>
+          <p role="alert" className="text-danger" key={message}>
             {message}
           </p>
         ))}
-        {isUnexpectedError && <p role="alert">Falha ao enviar a tarefa. Tente novamente.</p>}
+        {isUnexpectedError && (
+          <p role="alert" className="text-danger">
+            Falha ao enviar a tarefa. Tente novamente.
+          </p>
+        )}
 
-        <button type="submit" disabled={isPending}>
+        <button type="submit" className="self-start bg-accent text-bg" disabled={isPending}>
           {isPending ? "Enviando…" : "Enviar tarefa"}
         </button>
       </form>
-    </main>
+    </div>
   );
 }

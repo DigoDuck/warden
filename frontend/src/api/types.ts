@@ -4,7 +4,11 @@ import type { components } from "./schema";
 
 export type TaskCreate = components["schemas"]["TaskCreate"];
 export type TaskOut = components["schemas"]["TaskOut"];
+export type TaskListItemOut = components["schemas"]["TaskListItemOut"];
+export type TaskListOut = components["schemas"]["TaskListOut"];
 export type TaskEventOut = components["schemas"]["TaskEventOut"];
 export type TaskEventPage = components["schemas"]["TaskEventPage"];
+export type ApprovalOut = components["schemas"]["ApprovalOut"];
+export type ApprovalDecisionIn = components["schemas"]["ApprovalDecisionIn"];
 export type ValidationError = components["schemas"]["ValidationError"];
 export type HTTPValidationError = components["schemas"]["HTTPValidationError"];

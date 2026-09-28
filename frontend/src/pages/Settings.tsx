@@ -22,7 +22,7 @@ export function Settings() {
   }
 
   return (
-    <main>
+    <div>
       <h1>Configurações</h1>
       <p>
         Ainda não existe <code>/auth/login</code>. Gere um token no backend com{" "}
@@ -31,7 +31,7 @@ export function Settings() {
       </p>
       {/* sessionStorage, não localStorage: token de dev colado à mão, vale só para esta
           aba/janela e some ao fechá-la (ver frontend/README.md). */}
-      <form onSubmit={handleSubmit}>
+      <form onSubmit={handleSubmit} className="mt-4 flex max-w-[72ch] flex-col gap-3">
         <label htmlFor="token">Token</label>
         <input
           id="token"
@@ -43,12 +43,16 @@ export function Settings() {
             setSaved(false);
           }}
         />
-        <button type="submit">Salvar</button>
-        <button type="button" onClick={handleClear}>
-          Limpar
-        </button>
+        <div className="flex gap-2">
+          <button type="submit" className="bg-accent text-bg">
+            Salvar
+          </button>
+          <button type="button" className="border-border-control" onClick={handleClear}>
+            Limpar
+          </button>
+        </div>
       </form>
       {saved && <p role="status">Token salvo nesta aba.</p>}
-    </main>
+    </div>
   );
 }

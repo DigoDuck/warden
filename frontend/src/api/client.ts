@@ -25,6 +25,13 @@ export function onUnauthorized(handler: UnauthorizedHandler): void {
   unauthorizedHandler = handler;
 }
 
+/** Lets a caller outside apiFetch (the raw `fetch` the SSE stream uses, since it needs
+ * `Last-Event-ID` and reads the body itself instead of going through apiFetch's JSON path)
+ * react to a 401 the exact same way: one handler, registered once from App.tsx. */
+export function notifyUnauthorized(): void {
+  unauthorizedHandler();
+}
+
 export interface ApiFetchInit extends Omit<RequestInit, "body"> {
   /** JSON-serialised as the request body; sets Content-Type automatically. */
   json?: unknown;

@@ -1,8 +1,116 @@
-/* Tailwind without Preflight, its CSS reset: with no classes on the pages yet, the reset strips
-   every input, textarea and button down to borderless transparent boxes, and the form fields
-   become invisible. Browser defaults keep these unstyled pages usable until the design wave,
-   which decides whether to bring the reset back (add `@import "tailwindcss/preflight.css"
-   layer(base);`) together with the classes that restyle the fields. */
-@layer theme, base, components, utilities;
+/* DESIGN.md is the single source of truth for every token below: no component picks a
+   color, font or spacing value that is not defined here. Preflight is back (ADR-023
+   deferred it to this wave): the design now styles inputs/buttons/links itself instead of
+   living off the browser default. */
+@import "tailwindcss/preflight.css" layer(base);
 @import "tailwindcss/theme.css" layer(theme);
 @import "tailwindcss/utilities.css" layer(utilities);
+
+/* Self-hosted, not Google Fonts (DESIGN.md "Desvios da recomendação"): a control-plane
+   login screen makes no request to a third party to render text, and the CSP can stay
+   `font-src 'self'`. Only the weights DESIGN.md actually uses. */
+@import "@fontsource/fira-sans/400.css";
+@import "@fontsource/fira-sans/500.css";
+@import "@fontsource/fira-sans/600.css";
+@import "@fontsource/fira-code/400.css";
+
+@theme {
+  /* Drop Tailwind's default palette: a color utility that is not a DESIGN.md token below
+     (bg-red-500, text-white...) then generates nothing instead of slipping in unnoticed. */
+  --color-*: initial;
+  /* DESIGN.md "Tipografia": technical data (Fira Code) and labels are 13px, not 12px. */
+  --text-xs: 0.8125rem;
+
+  --color-bg: #0f172a;
+  --color-surface: #1e293b;
+  --color-surface-raised: #272f42;
+  --color-fg: #f8fafc;
+  --color-fg-muted: #94a3b8;
+  --color-border-control: #71809a;
+  --color-border-subtle: #334155;
+  --color-ring: #38bdf8;
+  --color-accent: #22c55e;
+  --color-danger: #f87171;
+  --color-danger-solid: #dc2626;
+  --color-ok: #4ade80;
+  --color-warn: #f59e0b;
+  --color-info: #38bdf8;
+  --color-caution: #fb923c;
+
+  --font-sans: "Fira Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "Fira Code", ui-monospace, "SFMono-Regular", monospace;
+}
+
+@layer base {
+  body {
+    background-color: var(--color-bg);
+    color: var(--color-fg);
+    font-family: var(--font-sans);
+    font-size: 16px;
+    line-height: 1.5;
+  }
+
+  h1 {
+    font-size: 24px;
+    font-weight: 600;
+  }
+
+  h2 {
+    font-size: 18px;
+    font-weight: 600;
+  }
+
+  /* DESIGN.md "Desvios da recomendação": the skill's own suggested ring (its bg color on
+     the page bg, 1.22:1) was invisible; this is the accessible replacement (8.3:1). Native
+     `:focus-visible` instead of a per-component ring utility: a keyboard user always gets
+     it, a mouse click never does, for free. */
+  :focus-visible {
+    outline: 2px solid var(--color-ring);
+    outline-offset: 2px;
+  }
+
+  a {
+    color: var(--color-info);
+  }
+
+  button,
+  input,
+  select,
+  textarea {
+    font-family: inherit;
+    font-size: 16px;
+  }
+
+  input,
+  textarea,
+  select {
+    background-color: var(--color-surface);
+    color: var(--color-fg);
+    /* DESIGN.md "Desvios da recomendação": the skill's suggested border (1.93:1 on the
+       card) failed WCAG 1.4.11's 3:1 for controls; this hits 3.3:1+ everywhere it is used. */
+    border: 1px solid var(--color-border-control);
+    border-radius: 6px;
+    padding: 6px 12px;
+    min-height: 32px;
+  }
+
+  button {
+    border-radius: 6px;
+    min-height: 32px;
+    padding: 6px 16px;
+    border: 1px solid transparent;
+    cursor: pointer;
+    font-weight: 500;
+  }
+
+  button:disabled {
+    cursor: not-allowed;
+    opacity: 0.6;
+  }
+
+  /* DESIGN.md "Tipografia": numbers that can change next to each other (a table of costs
+     and counts) line up. Tailwind's own `tabular-nums` utility covers a single value. */
+  table {
+    font-variant-numeric: tabular-nums;
+  }
+}

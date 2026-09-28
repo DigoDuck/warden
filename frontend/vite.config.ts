@@ -13,7 +13,9 @@ export default defineConfig({
       // token never crosses origins. 127.0.0.1, not localhost: `make api` (uvicorn) binds
       // IPv4 only, and localhost can resolve to ::1 first.
       "/api": {
-        target: "http://127.0.0.1:8000",
+        // WARDEN_API_PORT, the same variable `make api` reads: port 8000 is often taken on a
+        // dev machine by another project's container, and both ends have to move together.
+        target: `http://127.0.0.1:${process.env.WARDEN_API_PORT ?? "8000"}`,
         rewrite: (path) => path.replace(/^\/api/, ""),
       },
     },

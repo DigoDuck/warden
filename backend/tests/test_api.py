@@ -223,8 +223,10 @@ async def test_an_agent_token_is_refused_even_with_a_matching_scope_name(
     ("method", "path", "granted"),
     [
         ("POST", "/tasks", ["tasks:read", "audit:read"]),
+        ("GET", "/tasks", ["tasks:write", "audit:read"]),
         ("GET", f"/tasks/{uuid.uuid4()}", ["tasks:write", "audit:read"]),
         ("GET", f"/tasks/{uuid.uuid4()}/events", ["tasks:write", "audit:read"]),
+        ("GET", f"/tasks/{uuid.uuid4()}/stream", ["tasks:write", "audit:read"]),
         ("GET", "/audit/verify", ["tasks:write", "tasks:read"]),
         ("POST", f"/tasks/{uuid.uuid4()}/cancel", ["tasks:read", "audit:read"]),
     ],

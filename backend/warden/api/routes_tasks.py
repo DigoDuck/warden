@@ -1,31 +1,49 @@
-"""POST /tasks, GET /tasks/{id}, GET /tasks/{id}/events.
+"""POST /tasks, GET /tasks, GET /tasks/{id}, GET /tasks/{id}/events, GET /tasks/{id}/stream.
 
 No agent logic here (briefing §10): this module validates input, calls
 `core.queue.enqueue`, and reads rows back. It never touches a provider, a sandbox or the
 policy engine.
 """
 
+import asyncio
+import base64
+import binascii
+import time
 import uuid
+from collections.abc import AsyncIterator
+from datetime import datetime
 from decimal import Decimal
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response
-from sqlalchemy import func, select
-from sqlalchemy.ext.asyncio import AsyncSession
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
+from fastapi.responses import StreamingResponse
+from sqlalchemy import func, select, tuple_
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from warden import audit
 from warden.api.deps import SessionDep, require_scope
-from warden.api.schemas import TaskCreate, TaskEventOut, TaskEventPage, TaskOut
+from warden.api.schemas import (
+    TaskCreate,
+    TaskEventOut,
+    TaskEventPage,
+    TaskListItemOut,
+    TaskListOut,
+    TaskOut,
+)
 from warden.core import cancel, queue
+from warden.core import events as core_events
 from warden.core.events import ITERATION_STARTED
 from warden.identity import Claims
-from warden.models import AuditLog, ModelCall, Task, TaskEvent
+from warden.models import TASK_STATUSES, AuditLog, ModelCall, Task, TaskEvent
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
 
 # A page any bigger risks turning "read the events" into "read the whole table" for a long
 # task; 500 is generous for a UI timeline and still cheap to serialise.
 _MAX_EVENTS_PAGE = 500
+
+# Same reasoning for the task list: a page bounded well below "the whole table".
+_MAX_TASKS_PAGE = 100
 
 
 def _user_id_of(claims: Claims) -> uuid.UUID:
@@ -73,6 +91,78 @@ async def _to_task_out(session: AsyncSession, task: Task) -> TaskOut:
         finished_at=task.finished_at,
         cost_usd=Decimal(cost or 0),
         iterations=iterations or 0,
+    )
+
+
+def _encode_cursor(created_at: datetime, task_id: uuid.UUID) -> str:
+    raw = f"{created_at.isoformat()}|{task_id}"
+    return base64.urlsafe_b64encode(raw.encode()).decode()
+
+
+def _decode_cursor(cursor: str) -> tuple[datetime, uuid.UUID]:
+    try:
+        raw = base64.urlsafe_b64decode(cursor.encode()).decode()
+        created_at_raw, id_raw = raw.rsplit("|", 1)
+        created_at = datetime.fromisoformat(created_at_raw)
+        cursor_id = uuid.UUID(id_raw)
+    except (ValueError, UnicodeDecodeError, binascii.Error) as exc:
+        raise HTTPException(422, "invalid cursor") from exc
+    if created_at.tzinfo is None:
+        # Task.created_at is DateTime(timezone=True), but asyncpg does not reject a naive
+        # datetime bound against it: it silently assumes UTC instead of raising, so a forged
+        # cursor would otherwise compare against the wrong instant rather than fail loudly.
+        # Rejected here, at the same boundary as every other malformed cursor.
+        raise HTTPException(422, "invalid cursor")
+    return created_at, cursor_id
+
+
+@router.get("", response_model=TaskListOut)
+async def list_tasks(
+    session: SessionDep,
+    claims: Annotated[Claims, Depends(require_scope("tasks:read"))],
+    status: Annotated[str | None, Query()] = None,
+    cursor: Annotated[str | None, Query()] = None,
+    limit: Annotated[int, Query(gt=0, le=_MAX_TASKS_PAGE)] = 50,
+) -> TaskListOut:
+    if status is not None and status not in TASK_STATUSES:
+        raise HTTPException(422, f"status must be one of {TASK_STATUSES}")
+
+    conditions = []
+    if "admin" not in claims.scopes:
+        conditions.append(Task.user_id == _user_id_of(claims))
+    if status is not None:
+        conditions.append(Task.status == status)
+    if cursor is not None:
+        cursor_created_at, cursor_id = _decode_cursor(cursor)
+        # Row-value comparison: matches the (created_at DESC, id DESC) order below, so
+        # "strictly after the cursor" means exactly the rows the previous page did not
+        # already return, whatever ties `created_at` alone would have left ambiguous.
+        conditions.append(tuple_(Task.created_at, Task.id) < (cursor_created_at, cursor_id))
+
+    rows = (
+        await session.scalars(
+            select(Task)
+            .where(*conditions)
+            .order_by(Task.created_at.desc(), Task.id.desc())
+            .limit(limit)
+        )
+    ).all()
+
+    next_cursor = _encode_cursor(rows[-1].created_at, rows[-1].id) if len(rows) == limit else None
+    return TaskListOut(
+        tasks=[
+            TaskListItemOut(
+                id=row.id,
+                status=row.status,
+                spec=row.spec,
+                target_repo=row.target_repo,
+                created_at=row.created_at,
+                started_at=row.started_at,
+                finished_at=row.finished_at,
+            )
+            for row in rows
+        ],
+        next_cursor=next_cursor,
     )
 
 
@@ -230,3 +320,119 @@ async def get_task_events(
     # changed. See ADR-020.
     next_after = events[-1].seq if len(events) == limit else None
     return TaskEventPage(events=events, next_after=next_after)
+
+
+# How often the stream polls the database for new events, and how often it sends a
+# comment-line heartbeat when nothing new shows up. Module-level so tests can monkeypatch
+# them down instead of waiting on real wall-clock seconds.
+_STREAM_POLL_SECONDS = 1.0
+_STREAM_HEARTBEAT_SECONDS = 15.0
+
+# Mirrors core/worker.py::TERMINAL_STATUSES (kept local, not imported: worker.py pulls in
+# the sandbox/docker/policy stack, which this API module must never depend on — briefing
+# §10, "api does not have agent logic"). A task in one of these never runs again, so once
+# an empty poll finds one here, the stream has nothing left to ever wait for.
+_TERMINAL_TASK_STATUSES = frozenset(
+    {"SUCCEEDED", "FAILED", "CANCELLED", "TIMED_OUT", "BUDGET_EXCEEDED"}
+)
+
+
+@router.get("/{task_id}/stream")
+async def stream_task_events(
+    task_id: uuid.UUID,
+    request: Request,
+    session: SessionDep,
+    claims: Annotated[Claims, Depends(require_scope("tasks:read"))],
+    after: Annotated[int, Query(ge=0)] = 0,
+) -> StreamingResponse:
+    """Server-Sent Events of `task_events` for one task, newest-appended-first is not a
+    thing here: it is always in `seq` order, the same order the event log is written in.
+
+    Visibility and the `after` param are resolved with the request's `SessionDep`, which
+    is then closed by hand below. FastAPI (>= 0.118) only exits a yield dependency after the
+    response has been fully sent, which for a stream is the life of the browser tab: left
+    open, that session would sit "idle in transaction" holding a pool connection and an
+    ACCESS SHARE lock on `tasks`. See ADR-019: no transaction may sit open for the life of a
+    connection that waits on something external, and a browser holding this one open is
+    exactly that.
+    """
+    user_id = _user_id_of(claims)
+    await _task_or_404(session, task_id, claims, user_id)
+
+    # EventSource cannot set a custom Authorization header, which is why the frontend uses
+    # fetch + ReadableStream instead and can set Last-Event-ID by hand on a reconnect; ?after
+    # covers the very first connection, before there is any last event id to send.
+    last_event_id = request.headers.get("last-event-id")
+    if last_event_id is not None:
+        try:
+            start_after = int(last_event_id)
+        except ValueError as exc:
+            raise HTTPException(422, "Last-Event-ID must be an integer") from exc
+    else:
+        start_after = after
+
+    # Ends the checks' transaction and returns the connection to the pool now, not when the
+    # stream ends. The dependency's own `async with` closes it again later: a no-op.
+    await session.close()
+
+    session_factory: async_sessionmaker[AsyncSession] = request.app.state.session_factory
+
+    async def event_source() -> AsyncIterator[str]:
+        last = start_after
+        last_activity = time.monotonic()
+        while True:
+            if await request.is_disconnected():
+                return
+
+            # A fresh, short-lived session per poll (never the request's own SessionDep):
+            # it is opened, used for one SELECT and closed before the sleep below, so no
+            # transaction or connection sits idle for the ~1s between polls. See ADR-019.
+            # The status is only read here, inside the same short poll session, when the
+            # event query comes back empty: no point spending a second round trip on a poll
+            # that already found rows to send.
+            status: str | None = None
+            async with session_factory() as poll_session:
+                rows = (
+                    await poll_session.scalars(
+                        select(TaskEvent)
+                        .where(TaskEvent.task_id == task_id, TaskEvent.seq > last)
+                        .order_by(TaskEvent.seq)
+                        .limit(_MAX_EVENTS_PAGE)
+                    )
+                ).all()
+                if not rows:
+                    status = await poll_session.scalar(
+                        select(Task.status).where(Task.id == task_id)
+                    )
+
+            if rows:
+                for row in rows:
+                    out = TaskEventOut(
+                        seq=row.seq, type=row.type, payload=row.payload, created_at=row.created_at
+                    )
+                    yield f"id: {out.seq}\nevent: {out.type}\ndata: {out.model_dump_json()}\n\n"
+                    last = out.seq
+                    if row.type == core_events.TASK_FINISHED:
+                        # The terminal marker: every path to a terminal status writes this
+                        # event (core/loop.py::_finish, core/cancel.py::request_cancel), so
+                        # seeing it is exactly "the task reached a terminal status and that
+                        # was the last thing it had to say".
+                        return
+                last_activity = time.monotonic()
+                continue
+
+            # Nothing new, and the task is already done (or gone): a client resuming with
+            # Last-Event-ID at or past task.finished's own seq never sees that event again,
+            # and a task fixed up by hand can reach a terminal status without ever writing
+            # it. Either way there is nothing left to ever arrive, so the stream ends here
+            # instead of polling and heartbeating until the client disconnects.
+            if status is None or status in _TERMINAL_TASK_STATUSES:
+                return
+
+            now = time.monotonic()
+            if now - last_activity >= _STREAM_HEARTBEAT_SECONDS:
+                yield ": heartbeat\n\n"
+                last_activity = now
+            await asyncio.sleep(_STREAM_POLL_SECONDS)
+
+    return StreamingResponse(event_source(), media_type="text/event-stream")
