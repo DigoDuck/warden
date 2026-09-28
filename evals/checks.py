@@ -7,6 +7,7 @@ ever being exercised end to end.
 """
 
 from dataclasses import dataclass, field
+from typing import cast
 
 
 @dataclass
@@ -30,10 +31,139 @@ class CaseOutcome:
     detail: str
 
 
-# skeleton: not yet implemented (TDD red step).
+def _mismatch(field_name: str, expected: object, actual: object) -> str:
+    return f"{field_name}: expected {expected!r}, got {actual!r}"
+
+
+def _check_tool_calls(expected: list[dict[str, object]], facts: Facts) -> list[str]:
+    """Match each expected entry against the FIRST tool_calls row for that tool name.
+
+    First, not "the" row: a case that calls the same tool twice on purpose is rare enough
+    (none of the 9 runnable cases do) that indexing by first occurrence is simpler than a
+    positional or exhaustive match, and it is what the two cases that need this
+    (open_pr rejection, secret redaction) actually mean by "the read_file call".
+    """
+    mismatches: list[str] = []
+    by_tool: dict[str, dict[str, object]] = {}
+    for entry in facts.tool_calls:
+        by_tool.setdefault(str(entry["tool"]), entry)
+
+    for spec in expected:
+        tool = str(spec["tool"])
+        row: dict[str, object] | None = by_tool.get(tool)
+        if row is None:
+            mismatches.append(f"tool_calls: no tool_calls row for tool {tool!r}")
+            continue
+        if "decision" in spec and row.get("decision") != spec["decision"]:
+            mismatches.append(
+                f"tool_calls[{tool}].decision: expected {spec['decision']!r}, "
+                f"got {row.get('decision')!r}"
+            )
+    return mismatches
+
+
+def _check_args_safe(expected: list[dict[str, object]], facts: Facts) -> list[str]:
+    mismatches: list[str] = []
+    by_tool: dict[str, dict[str, object]] = {}
+    for entry in facts.tool_calls:
+        by_tool.setdefault(str(entry["tool"]), entry)
+
+    for spec in expected:
+        tool = str(spec["tool"])
+        key = str(spec["key"])
+        row: dict[str, object] | None = by_tool.get(tool)
+        if row is None:
+            mismatches.append(f"args_safe: no tool_calls row for tool {tool!r}")
+            continue
+        args_safe = row.get("args_safe")
+        actual = args_safe.get(key) if isinstance(args_safe, dict) else None
+        if actual != spec["equals"]:
+            mismatches.append(
+                f"args_safe[{tool}][{key}]: expected {spec['equals']!r}, got {actual!r}"
+            )
+    return mismatches
+
+
 def check_expectations(expect: dict[str, object], facts: Facts) -> list[str]:
-    raise NotImplementedError
+    """Compare one case's `expect` block against the facts a real run produced.
+
+    Only the keys present in `expect` are checked: a case states what it cares about, not
+    every field this shape happens to carry, so tests_case YAML stays short. Returns an
+    empty list on a pass; every mismatch is reported (not just the first), because a case
+    that fails on three fronts should say so in one run of the suite, not three.
+    """
+    mismatches: list[str] = []
+
+    if "policy_effects" in expect:
+        expected_effects = expect["policy_effects"]
+        if facts.policy_effects != expected_effects:
+            mismatches.append(
+                _mismatch("policy_effects", expected_effects, facts.policy_effects)
+            )
+
+    if "task_status" in expect and facts.task_status != expect["task_status"]:
+        mismatches.append(
+            _mismatch("task_status", expect["task_status"], facts.task_status)
+        )
+
+    if (
+        "tool_executed_count" in expect
+        and facts.tool_executed_count != expect["tool_executed_count"]
+    ):
+        mismatches.append(
+            _mismatch(
+                "tool_executed_count",
+                expect["tool_executed_count"],
+                facts.tool_executed_count,
+            )
+        )
+
+    if (
+        "approvals_pending" in expect
+        and facts.approvals_pending != expect["approvals_pending"]
+    ):
+        mismatches.append(
+            _mismatch(
+                "approvals_pending",
+                expect["approvals_pending"],
+                facts.approvals_pending,
+            )
+        )
+
+    if "audit_contains" in expect:
+        corpus = "\n".join(facts.audit_corpus)
+        for needle in cast(list[str], expect["audit_contains"]):
+            if needle not in corpus:
+                mismatches.append(
+                    f"audit_contains: {needle!r} not found in the audit log"
+                )
+
+    if "tool_calls" in expect:
+        mismatches.extend(
+            _check_tool_calls(
+                cast("list[dict[str, object]]", expect["tool_calls"]), facts
+            )
+        )
+
+    if "args_safe" in expect:
+        mismatches.extend(
+            _check_args_safe(
+                cast("list[dict[str, object]]", expect["args_safe"]), facts
+            )
+        )
+
+    return mismatches
 
 
 def summarize(outcomes: list[CaseOutcome]) -> tuple[str, int]:
-    raise NotImplementedError
+    """The one-line summary the CLI prints, and the process exit code.
+
+    Pending cases are counted separately and never fail the exit code (briefing week 6
+    scope: 3 of the 12 cases wait on features this track does not build). A PENDING case
+    reported as anything but visible would be the exact silent-skip the task warns against.
+    """
+    scored = [outcome for outcome in outcomes if outcome.state != "PENDING"]
+    pending = len(outcomes) - len(scored)
+    passed = sum(1 for outcome in scored if outcome.state == "PASS")
+    exit_code = 0 if all(outcome.state == "PASS" for outcome in scored) else 1
+    return f"{passed}/{len(scored)} pass, {pending} pending", exit_code

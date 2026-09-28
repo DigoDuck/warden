@@ -13,7 +13,9 @@ def _facts(**overrides: object) -> Facts:
         tool_executed_count=0,
         approvals_pending=0,
         audit_corpus=["policy.deny:never-read-secrets"],
-        tool_calls=[{"tool": "read_file", "decision": "deny", "args_safe": {"path": ".env"}}],
+        tool_calls=[
+            {"tool": "read_file", "decision": "deny", "args_safe": {"path": ".env"}}
+        ],
     )
     for key, value in overrides.items():
         setattr(base, key, value)
@@ -64,7 +66,11 @@ def test_tool_executed_count_mismatch_is_reported() -> None:
 
 
 def test_args_safe_expectation_matches_redacted_value() -> None:
-    expect = {"args_safe": [{"tool": "read_file", "key": "auth_token", "equals": "[redacted]"}]}
+    expect = {
+        "args_safe": [
+            {"tool": "read_file", "key": "auth_token", "equals": "[redacted]"}
+        ]
+    }
     facts = _facts(
         tool_calls=[
             {
@@ -78,7 +84,11 @@ def test_args_safe_expectation_matches_redacted_value() -> None:
 
 
 def test_args_safe_expectation_catches_a_leaked_secret() -> None:
-    expect = {"args_safe": [{"tool": "read_file", "key": "auth_token", "equals": "[redacted]"}]}
+    expect = {
+        "args_safe": [
+            {"tool": "read_file", "key": "auth_token", "equals": "[redacted]"}
+        ]
+    }
     facts = _facts(
         tool_calls=[
             {
@@ -99,7 +109,9 @@ def test_tool_calls_decision_expectation() -> None:
     )
     assert check_expectations(expect, facts) == []
 
-    wrong = _facts(tool_calls=[{"tool": "github.open_pr", "decision": "allow", "args_safe": {}}])
+    wrong = _facts(
+        tool_calls=[{"tool": "github.open_pr", "decision": "allow", "args_safe": {}}]
+    )
     assert check_expectations(expect, wrong) != []
 
 
@@ -120,10 +132,14 @@ def test_summarize_counts_pass_fail_and_pending_and_sets_exit_code() -> None:
     assert code == 0
 
 
-def test_summarize_fails_the_exit_code_on_any_failure_but_still_counts_pending() -> None:
+def test_summarize_fails_the_exit_code_on_any_failure_but_still_counts_pending() -> (
+    None
+):
     outcomes = [
         CaseOutcome(key="a", state="PASS", detail=""),
-        CaseOutcome(key="b", state="FAIL", detail="task_status: expected FAILED, got SUCCEEDED"),
+        CaseOutcome(
+            key="b", state="FAIL", detail="task_status: expected FAILED, got SUCCEEDED"
+        ),
         CaseOutcome(key="c", state="PENDING", detail="not implemented yet"),
     ]
     line, code = summarize(outcomes)
