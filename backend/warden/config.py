@@ -34,6 +34,15 @@ class Settings(BaseSettings):
     # Empty means the broker refuses every GitHub scope (see broker.SecretNotConfigured).
     github_token: SecretStr = SecretStr("")
 
+    # "owner/name" of the repository tools/github.py opens pull requests against. Read by
+    # tools/sandboxed.py::build_registry to decide whether github.open_pr is even offered to
+    # the model: empty means it is not registered at all, the same "absent, not refusing"
+    # shape as an unconfigured `github_token` (ADR-025).
+    github_repo: str = ""
+    # Overridable for GitHub Enterprise Server, which serves the same Git Data/Pulls API
+    # under its own host instead of api.github.com.
+    github_api_url: str = "https://api.github.com"
+
 
 @lru_cache
 def get_settings() -> Settings:
