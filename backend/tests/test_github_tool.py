@@ -7,6 +7,7 @@ is a `MockTransport` that plays a small in-memory git/pulls server, records ever
 never touches the network, so the assertions are about what warden sent, not about GitHub.
 """
 
+import hashlib
 import json
 import os
 import pathlib
@@ -62,6 +63,7 @@ def workspace(tmp_path: pathlib.Path) -> pathlib.Path:
     root = tmp_path / "repo"
     (root / "src").mkdir(parents=True)
     (root / "src" / "app.py").write_text("print('hello')\n", encoding="utf-8", newline="\n")
+    (root / "src" / "other.py").write_text("x = 1\n", encoding="utf-8", newline="\n")
     (root / ".env").write_text("SECRET=nope\n", encoding="utf-8", newline="\n")
     return root
 
@@ -93,56 +95,72 @@ async def _claims(session: AsyncSession, keys: KeyPair) -> identity.Claims:
 
 
 class FakeGitHub:
-    """A tiny, stateful stand-in for the Git Data + Pulls API, keyed by ref/branch name.
+    """A tiny, stateful stand-in for the Git Data + Pulls API.
 
     Every request is recorded (`self.requests`) so a test can inspect what warden actually
     sent, in particular the `Authorization` header, without ever making a real HTTP call:
     `httpx.MockTransport` calls `handler` in place of opening a socket.
+
+    Content-addressed where it matters, like git: a tree's sha is derived from its full
+    path -> blob mapping, so the same files on the same base give the same tree. Commits
+    remember their parents, and a ref update without `force` is refused (422) unless it is a
+    fast-forward, which is what the real API does.
     """
 
     def __init__(self) -> None:
         self.requests: list[httpx.Request] = []
         self.refs: dict[str, str] = {"heads/main": "base-sha"}
+        self.trees: dict[str, dict[str, str]] = {"base-tree": {}}
+        self.commits: dict[str, dict[str, object]] = {
+            "base-sha": {"tree": "base-tree", "parents": []}
+        }
         self.pulls: list[dict[str, object]] = []
-        self._blob_seq = 0
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
         method, path = request.method, request.url.path
+        body = json.loads(request.content) if request.content else {}
 
-        if method == "GET" and path.endswith("/git/ref/heads/main"):
-            return httpx.Response(200, json={"object": {"sha": self.refs["heads/main"]}})
-        if method == "GET" and "/git/commits/" in path:
-            return httpx.Response(200, json={"sha": "base-sha", "tree": {"sha": "base-tree"}})
-        if method == "POST" and path.endswith("/git/blobs"):
-            self._blob_seq += 1
-            return httpx.Response(201, json={"sha": f"blob-{self._blob_seq}"})
-        if method == "POST" and path.endswith("/git/trees"):
-            return httpx.Response(201, json={"sha": "new-tree"})
-        if method == "POST" and path.endswith("/git/commits"):
-            return httpx.Response(201, json={"sha": "new-commit"})
-        if method == "GET" and "/git/ref/heads/warden/" in path:
-            branch = path.split("/git/ref/", 1)[1]
-            if branch in self.refs:
-                return httpx.Response(200, json={"object": {"sha": self.refs[branch]}})
+        if method == "GET" and "/git/ref/" in path:
+            ref = path.split("/git/ref/", 1)[1]
+            if ref in self.refs:
+                return httpx.Response(200, json={"object": {"sha": self.refs[ref]}})
             return httpx.Response(404, json={"message": "Not Found"})
+        if method == "GET" and "/git/commits/" in path:
+            sha = path.rsplit("/", 1)[1]
+            commit = self.commits[sha]
+            return httpx.Response(200, json={"sha": sha, "tree": {"sha": commit["tree"]}})
+        if method == "POST" and path.endswith("/git/blobs"):
+            digest = hashlib.sha1(body["content"].encode()).hexdigest()[:12]
+            return httpx.Response(201, json={"sha": f"blob-{digest}"})
+        if method == "POST" and path.endswith("/git/trees"):
+            files = dict(self.trees[body["base_tree"]])
+            files.update({entry["path"]: entry["sha"] for entry in body["tree"]})
+            digest = hashlib.sha1(json.dumps(sorted(files.items())).encode()).hexdigest()[:12]
+            self.trees[f"tree-{digest}"] = files
+            return httpx.Response(201, json={"sha": f"tree-{digest}"})
+        if method == "POST" and path.endswith("/git/commits"):
+            sha = f"commit-{len(self.commits)}"
+            self.commits[sha] = {"tree": body["tree"], "parents": body["parents"]}
+            return httpx.Response(201, json={"sha": sha})
         if method == "POST" and path.endswith("/git/refs"):
-            body = json.loads(request.content)
-            self.refs[body["ref"].removeprefix("refs/")] = body["sha"]
+            ref = body["ref"].removeprefix("refs/")
+            if ref in self.refs:
+                return httpx.Response(422, json={"message": "Reference already exists"})
+            self.refs[ref] = body["sha"]
             return httpx.Response(201, json={"ref": body["ref"], "object": {"sha": body["sha"]}})
-        if method == "PATCH" and "/git/refs/heads/warden/" in path:
-            body = json.loads(request.content)
-            branch = path.split("/git/refs/", 1)[1]
-            self.refs[branch] = body["sha"]
-            return httpx.Response(
-                200, json={"ref": f"refs/{branch}", "object": {"sha": body["sha"]}}
-            )
+        if method == "PATCH" and "/git/refs/" in path:
+            ref = path.split("/git/refs/", 1)[1]
+            parents = self.commits[body["sha"]]["parents"]
+            if not body.get("force") and self.refs[ref] not in parents:  # type: ignore[operator]
+                return httpx.Response(422, json={"message": "Update is not a fast forward"})
+            self.refs[ref] = body["sha"]
+            return httpx.Response(200, json={"ref": f"refs/{ref}", "object": {"sha": body["sha"]}})
         if method == "GET" and path.endswith("/pulls"):
             head = request.url.params.get("head")
             head_branch = head.split(":", 1)[1] if head else None
             return httpx.Response(200, json=[p for p in self.pulls if p["_branch"] == head_branch])
         if method == "POST" and path.endswith("/pulls"):
-            body = json.loads(request.content)
             number = len(self.pulls) + 1
             pr = {
                 "number": number,
@@ -152,6 +170,9 @@ class FakeGitHub:
             self.pulls.append(pr)
             return httpx.Response(201, json=pr)
         raise AssertionError(f"unexpected request: {method} {request.url}")
+
+    def branch_files(self, branch: str) -> dict[str, str]:
+        return self.trees[str(self.commits[self.refs[f"heads/{branch}"]]["tree"])]
 
     def client(self) -> httpx.AsyncClient:
         return httpx.AsyncClient(transport=httpx.MockTransport(self.handler))
@@ -243,6 +264,63 @@ async def test_open_pr_is_idempotent_for_the_same_task_and_branch(
     assert len(fake.pulls) == 1, "a second call for the same task must not open a second PR"
     pull_posts = [r for r in fake.requests if r.method == "POST" and r.url.path.endswith("/pulls")]
     assert len(pull_posts) == 1
+
+
+async def test_a_second_publish_builds_on_the_branch_instead_of_overwriting_it(
+    sandbox: Sandbox, session: AsyncSession, keys: KeyPair
+) -> None:
+    """Same task, same slug, a second batch of files (the agent fixed something after the
+    PR was opened). The branch must move forward, keeping the first file, never be
+    force-reset onto the base: that would silently drop already-published work from a PR a
+    human may be reviewing."""
+    fake = FakeGitHub()
+    claims = await _claims(session, keys)
+    context = ToolContext(claims=claims, session=session, checkpoint=session.commit)
+    branch = f"warden/{str(claims.task_id)[:8]}-grow"
+
+    async with fake.client() as client:
+        await open_pr(
+            sandbox,
+            _settings(),
+            OpenPrArgs(title="t", body="b", branch_slug="grow", paths=["src/app.py"]),
+            context,
+            client=client,
+        )
+        first_head = fake.refs[f"heads/{branch}"]
+        await open_pr(
+            sandbox,
+            _settings(),
+            OpenPrArgs(title="t", body="b", branch_slug="grow", paths=["src/other.py"]),
+            context,
+            client=client,
+        )
+
+    assert set(fake.branch_files(branch)) == {"src/app.py", "src/other.py"}
+    assert fake.commits[fake.refs[f"heads/{branch}"]]["parents"] == [first_head]
+    patches = [json.loads(r.content) for r in fake.requests if r.method == "PATCH"]
+    assert patches and not any(p.get("force") for p in patches), "a ref was force-updated"
+    assert len(fake.pulls) == 1
+
+
+async def test_replaying_the_same_publish_creates_no_new_commit(
+    sandbox: Sandbox, session: AsyncSession, keys: KeyPair
+) -> None:
+    """ADR-019's at-least-once window: a crash after GitHub answered but before
+    `tool.executed` committed replays the call. Same files on the same branch must be a
+    no-op on the branch, not an empty commit per replay."""
+    fake = FakeGitHub()
+    claims = await _claims(session, keys)
+    context = ToolContext(claims=claims, session=session, checkpoint=session.commit)
+    args = OpenPrArgs(title="t", body="b", branch_slug="replay", paths=["src/app.py"])
+
+    async with fake.client() as client:
+        await open_pr(sandbox, _settings(), args, context, client=client)
+        await open_pr(sandbox, _settings(), args, context, client=client)
+
+    commit_posts = [
+        r for r in fake.requests if r.method == "POST" and r.url.path.endswith("/git/commits")
+    ]
+    assert len(commit_posts) == 1
 
 
 async def test_open_pr_publishes_the_files_content_read_from_the_sandbox(
