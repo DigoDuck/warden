@@ -22,6 +22,7 @@ from warden.core import approvals, cancel, queue
 from warden.core.events import read_events
 from warden.core.loop import Budget, run_task
 from warden.core.replay import ResumeState, rebuild
+from warden.identity.jwt import KeyPair
 from warden.models import (
     Approval,
     AuditLog,
@@ -104,7 +105,7 @@ class _CostlyProvider:
 
 
 async def test_successful_run_records_everything(
-    session: AsyncSession, workspace: pathlib.Path
+    session: AsyncSession, keys: KeyPair, workspace: pathlib.Path
 ) -> None:
     task = await _a_task(session)
     provider = FakeProvider(
@@ -116,7 +117,13 @@ async def test_successful_run_records_everything(
     )
 
     result = await run_task(
-        session, task, provider, FakeWorkspace().registry(), _allow_all(), workspace=workspace
+        session,
+        task,
+        provider,
+        FakeWorkspace().registry(),
+        _allow_all(),
+        workspace=workspace,
+        keys=keys,
     )
 
     assert result.status == "SUCCEEDED"
@@ -141,7 +148,7 @@ async def test_successful_run_records_everything(
 
 
 async def test_a_refused_tool_does_not_kill_the_task(
-    session: AsyncSession, workspace: pathlib.Path
+    session: AsyncSession, keys: KeyPair, workspace: pathlib.Path
 ) -> None:
     """A denied call is a normal event in an agent loop: the model sees it and carries on."""
     task = await _a_task(session)
@@ -153,7 +160,13 @@ async def test_a_refused_tool_does_not_kill_the_task(
     )
 
     result = await run_task(
-        session, task, provider, FakeWorkspace().registry(), _allow_all(), workspace=workspace
+        session,
+        task,
+        provider,
+        FakeWorkspace().registry(),
+        _allow_all(),
+        workspace=workspace,
+        keys=keys,
     )
 
     assert result.status == "SUCCEEDED"
@@ -166,7 +179,7 @@ async def test_a_refused_tool_does_not_kill_the_task(
 
 
 async def test_a_run_that_never_finishes_stops_at_max_iterations(
-    session: AsyncSession, workspace: pathlib.Path
+    session: AsyncSession, keys: KeyPair, workspace: pathlib.Path
 ) -> None:
     task = await _a_task(session)
     provider = FakeProvider([_step("list_files") for _ in range(20)])
@@ -179,6 +192,7 @@ async def test_a_run_that_never_finishes_stops_at_max_iterations(
         _allow_all(),
         workspace=workspace,
         budget=Budget(max_iterations=3),
+        keys=keys,
     )
 
     assert result.status == "TIMED_OUT"
@@ -187,7 +201,7 @@ async def test_a_run_that_never_finishes_stops_at_max_iterations(
 
 
 async def test_spending_over_the_ceiling_stops_the_run(
-    session: AsyncSession, workspace: pathlib.Path
+    session: AsyncSession, keys: KeyPair, workspace: pathlib.Path
 ) -> None:
     """The ceiling has to bite before the next model call, or it is not a ceiling."""
     task = await _a_task(session)
@@ -201,6 +215,7 @@ async def test_spending_over_the_ceiling_stops_the_run(
         _allow_all(),
         workspace=workspace,
         budget=Budget(max_iterations=10, max_usd=Decimal("1.00")),
+        keys=keys,
     )
 
     assert result.status == "BUDGET_EXCEEDED"
@@ -208,12 +223,20 @@ async def test_spending_over_the_ceiling_stops_the_run(
     assert result.cost_usd > Decimal("1.00")
 
 
-async def test_scripted_run_costs_nothing(session: AsyncSession, workspace: pathlib.Path) -> None:
+async def test_scripted_run_costs_nothing(
+    session: AsyncSession, keys: KeyPair, workspace: pathlib.Path
+) -> None:
     task = await _a_task(session)
     provider = FakeProvider([_step("finish", summary="done")])
 
     result = await run_task(
-        session, task, provider, FakeWorkspace().registry(), _allow_all(), workspace=workspace
+        session,
+        task,
+        provider,
+        FakeWorkspace().registry(),
+        _allow_all(),
+        workspace=workspace,
+        keys=keys,
     )
 
     assert result.cost_usd == Decimal("0")
@@ -226,7 +249,7 @@ async def test_scripted_run_costs_nothing(session: AsyncSession, workspace: path
 
 
 async def test_policy_denies_a_readable_secret_and_the_task_carries_on(
-    session: AsyncSession, workspace: pathlib.Path
+    session: AsyncSession, keys: KeyPair, workspace: pathlib.Path
 ) -> None:
     """The decisive test: the file exists and is readable, and only the policy stops it.
 
@@ -249,6 +272,7 @@ async def test_policy_denies_a_readable_secret_and_the_task_carries_on(
         FakeWorkspace().registry(),
         load_policy(DEFAULT_POLICY),
         workspace=workspace,
+        keys=keys,
     )
 
     assert result.status == "SUCCEEDED"
@@ -265,7 +289,7 @@ async def test_policy_denies_a_readable_secret_and_the_task_carries_on(
 
 
 async def test_a_denied_call_is_recorded_with_the_rule_that_decided(
-    session: AsyncSession, workspace: pathlib.Path
+    session: AsyncSession, keys: KeyPair, workspace: pathlib.Path
 ) -> None:
     (workspace / ".env").write_text("SECRET=x\n", encoding="utf-8", newline="\n")
     task = await _a_task(session)
@@ -278,6 +302,7 @@ async def test_a_denied_call_is_recorded_with_the_rule_that_decided(
         FakeWorkspace().registry(),
         load_policy(DEFAULT_POLICY),
         workspace=workspace,
+        keys=keys,
     )
 
     decisions = list(
@@ -294,7 +319,7 @@ async def test_a_denied_call_is_recorded_with_the_rule_that_decided(
 
 
 async def test_the_refusal_reaches_the_model_and_names_the_rule(
-    session: AsyncSession, workspace: pathlib.Path
+    session: AsyncSession, keys: KeyPair, workspace: pathlib.Path
 ) -> None:
     """A refusal the model cannot understand is a refusal it retries, burning iterations."""
     (workspace / ".env").write_text("SECRET=x\n", encoding="utf-8", newline="\n")
@@ -308,6 +333,7 @@ async def test_the_refusal_reaches_the_model_and_names_the_rule(
         FakeWorkspace().registry(),
         load_policy(DEFAULT_POLICY),
         workspace=workspace,
+        keys=keys,
     )
 
     row = (
@@ -319,7 +345,9 @@ async def test_the_refusal_reaches_the_model_and_names_the_rule(
     assert "never-read-secrets" in (row.error or "")
 
 
-async def test_an_allowed_call_still_runs(session: AsyncSession, workspace: pathlib.Path) -> None:
+async def test_an_allowed_call_still_runs(
+    session: AsyncSession, keys: KeyPair, workspace: pathlib.Path
+) -> None:
     """The default policy must not be so tight that the agent cannot do its job."""
     task = await _a_task(session)
     provider = FakeProvider(
@@ -333,6 +361,7 @@ async def test_an_allowed_call_still_runs(session: AsyncSession, workspace: path
         FakeWorkspace().registry(),
         load_policy(DEFAULT_POLICY),
         workspace=workspace,
+        keys=keys,
     )
 
     assert result.status == "SUCCEEDED"
@@ -380,7 +409,7 @@ def _require_approval_policy(tool: str = "github.open_pr") -> Policy:
 
 
 async def test_require_approval_pauses_the_task_and_releases_the_lease(
-    session: AsyncSession, workspace: pathlib.Path
+    session: AsyncSession, keys: KeyPair, workspace: pathlib.Path
 ) -> None:
     """ADR-022: a REQUIRE_APPROVAL decision used to degrade to a refusal (week 2). Now it
     parks the task for a human instead, with the lease released so a worker can pick up
@@ -398,6 +427,7 @@ async def test_require_approval_pauses_the_task_and_releases_the_lease(
         _require_approval_policy(),
         workspace=workspace,
         holder=holder,
+        keys=keys,
     )
 
     assert result.status == "WAITING_APPROVAL"
@@ -421,7 +451,7 @@ async def test_require_approval_pauses_the_task_and_releases_the_lease(
 
 
 async def test_calls_before_the_paused_one_still_ran_and_calls_after_stay_pending(
-    session: AsyncSession, workspace: pathlib.Path
+    session: AsyncSession, keys: KeyPair, workspace: pathlib.Path
 ) -> None:
     task = await _claimed_task(session)
     provider = FakeProvider(
@@ -446,6 +476,7 @@ async def test_calls_before_the_paused_one_still_ran_and_calls_after_stay_pendin
         _require_approval_policy(),
         workspace=workspace,
         holder=task.claimed_by,
+        keys=keys,
     )
 
     assert result.status == "WAITING_APPROVAL"
@@ -467,7 +498,7 @@ async def test_calls_before_the_paused_one_still_ran_and_calls_after_stay_pendin
 
 
 async def test_a_policy_deny_writes_an_audit_entry(
-    session: AsyncSession, workspace: pathlib.Path
+    session: AsyncSession, keys: KeyPair, workspace: pathlib.Path
 ) -> None:
     (workspace / ".env").write_text("SECRET=x\n", encoding="utf-8", newline="\n")
     task = await _a_task(session)
@@ -480,6 +511,7 @@ async def test_a_policy_deny_writes_an_audit_entry(
         FakeWorkspace().registry(),
         load_policy(DEFAULT_POLICY),
         workspace=workspace,
+        keys=keys,
     )
 
     rows = list(
@@ -495,7 +527,7 @@ async def test_a_policy_deny_writes_an_audit_entry(
 
 
 async def test_an_approval_request_writes_an_audit_entry(
-    session: AsyncSession, workspace: pathlib.Path
+    session: AsyncSession, keys: KeyPair, workspace: pathlib.Path
 ) -> None:
     task = await _claimed_task(session)
     provider = FakeProvider([_step("github.open_pr", title="x")])
@@ -508,6 +540,7 @@ async def test_an_approval_request_writes_an_audit_entry(
         _require_approval_policy(),
         workspace=workspace,
         holder=task.claimed_by,
+        keys=keys,
     )
 
     approval = (await session.scalars(select(Approval).where(Approval.task_id == task.id))).one()
@@ -524,13 +557,19 @@ async def test_an_approval_request_writes_an_audit_entry(
 
 
 async def test_a_finished_task_writes_an_audit_entry(
-    session: AsyncSession, workspace: pathlib.Path
+    session: AsyncSession, keys: KeyPair, workspace: pathlib.Path
 ) -> None:
     task = await _a_task(session)
     provider = FakeProvider([_step("finish", summary="done")])
 
     await run_task(
-        session, task, provider, FakeWorkspace().registry(), _allow_all(), workspace=workspace
+        session,
+        task,
+        provider,
+        FakeWorkspace().registry(),
+        _allow_all(),
+        workspace=workspace,
+        keys=keys,
     )
 
     rows = list(
@@ -596,7 +635,7 @@ async def _pending_approval(session: AsyncSession, task_id: object) -> Approval:
 
 
 async def test_approving_a_paused_call_resumes_and_executes_it_exactly_once(
-    session: AsyncSession, workspace: pathlib.Path
+    session: AsyncSession, keys: KeyPair, workspace: pathlib.Path
 ) -> None:
     task = await _claimed_task(session)
     counter = _OpenPrCounter()
@@ -609,6 +648,7 @@ async def test_approving_a_paused_call_resumes_and_executes_it_exactly_once(
         _require_approval_policy(),
         workspace=workspace,
         holder=task.claimed_by,
+        keys=keys,
     )
     assert paused.status == "WAITING_APPROVAL"
     assert counter.calls == 0  # paused, not executed
@@ -636,6 +676,7 @@ async def test_approving_a_paused_call_resumes_and_executes_it_exactly_once(
         workspace=workspace,
         resume=resume,
         holder=resumed.claimed_by,
+        keys=keys,
     )
 
     assert result.status == "SUCCEEDED"
@@ -660,7 +701,7 @@ async def test_approving_a_paused_call_resumes_and_executes_it_exactly_once(
 
 
 async def test_time_waiting_for_a_human_does_not_count_against_max_seconds(
-    session: AsyncSession, workspace: pathlib.Path
+    session: AsyncSession, keys: KeyPair, workspace: pathlib.Path
 ) -> None:
     """ADR-022: max_seconds budgets the agent's own time. A reviewer who takes two hours to
     approve must not turn a 60 second budget into an instant TIMED_OUT on resume, with the
@@ -680,6 +721,7 @@ async def test_time_waiting_for_a_human_does_not_count_against_max_seconds(
         workspace=workspace,
         budget=budget,
         holder=task.claimed_by,
+        keys=keys,
     )
     assert paused.status == "WAITING_APPROVAL"
 
@@ -713,6 +755,7 @@ async def test_time_waiting_for_a_human_does_not_count_against_max_seconds(
         budget=budget,
         resume=rebuild(await read_events(session, task.id)),
         holder=resumed.claimed_by,
+        keys=keys,
     )
 
     assert result.status == "SUCCEEDED", result.reason
@@ -720,7 +763,7 @@ async def test_time_waiting_for_a_human_does_not_count_against_max_seconds(
 
 
 async def test_an_approval_never_overrides_a_deny_added_after_the_request(
-    session: AsyncSession, workspace: pathlib.Path
+    session: AsyncSession, keys: KeyPair, workspace: pathlib.Path
 ) -> None:
     """ADR-003's ordering still holds after ADR-022: the most restrictive effect wins, and an
     approval is not a way around a deny the policy grows later."""
@@ -733,6 +776,7 @@ async def test_an_approval_never_overrides_a_deny_added_after_the_request(
         _require_approval_policy(),
         workspace=workspace,
         holder=task.claimed_by,
+        keys=keys,
     )
     assert paused.status == "WAITING_APPROVAL"
 
@@ -770,6 +814,7 @@ async def test_an_approval_never_overrides_a_deny_added_after_the_request(
         workspace=workspace,
         resume=resume,
         holder=resumed.claimed_by,
+        keys=keys,
     )
 
     assert result.status == "SUCCEEDED"
@@ -785,7 +830,7 @@ async def test_an_approval_never_overrides_a_deny_added_after_the_request(
 
 
 async def test_rejecting_a_paused_call_injects_the_note_and_the_loop_continues(
-    session: AsyncSession, workspace: pathlib.Path
+    session: AsyncSession, keys: KeyPair, workspace: pathlib.Path
 ) -> None:
     task = await _claimed_task(session)
     provider = FakeProvider(
@@ -809,6 +854,7 @@ async def test_rejecting_a_paused_call_injects_the_note_and_the_loop_continues(
         _require_approval_policy(),
         workspace=workspace,
         holder=task.claimed_by,
+        keys=keys,
     )
     assert paused.status == "WAITING_APPROVAL"
 
@@ -833,6 +879,7 @@ async def test_rejecting_a_paused_call_injects_the_note_and_the_loop_continues(
         workspace=workspace,
         resume=resume,
         holder=resumed.claimed_by,
+        keys=keys,
     )
 
     assert result.status == "SUCCEEDED"
@@ -873,7 +920,7 @@ async def test_rejecting_a_paused_call_injects_the_note_and_the_loop_continues(
 
 
 async def test_a_path_escaping_the_workspace_is_denied_by_policy_too(
-    session: AsyncSession, workspace: pathlib.Path
+    session: AsyncSession, keys: KeyPair, workspace: pathlib.Path
 ) -> None:
     """Belt and braces: the tool would refuse it, and the policy never sees a matchable path."""
     task = await _a_task(session)
@@ -886,6 +933,7 @@ async def test_a_path_escaping_the_workspace_is_denied_by_policy_too(
         FakeWorkspace().registry(),
         load_policy(DEFAULT_POLICY),
         workspace=workspace,
+        keys=keys,
     )
 
     row = (
@@ -897,7 +945,7 @@ async def test_a_path_escaping_the_workspace_is_denied_by_policy_too(
 
 
 async def test_every_tool_call_leaves_a_policy_event(
-    session: AsyncSession, workspace: pathlib.Path
+    session: AsyncSession, keys: KeyPair, workspace: pathlib.Path
 ) -> None:
     """The audit trail has to show a decision for each call, allowed or not."""
     task = await _a_task(session)
@@ -916,6 +964,7 @@ async def test_every_tool_call_leaves_a_policy_event(
         FakeWorkspace().registry(),
         load_policy(DEFAULT_POLICY),
         workspace=workspace,
+        keys=keys,
     )
 
     kinds = [event.type for event in await read_events(session, task.id)]
@@ -923,7 +972,7 @@ async def test_every_tool_call_leaves_a_policy_event(
 
 
 async def test_finish_leaves_no_tool_requested_or_tool_executed_event(
-    session: AsyncSession, workspace: pathlib.Path
+    session: AsyncSession, keys: KeyPair, workspace: pathlib.Path
 ) -> None:
     """ADR-019: `finish` deliberately gets no `tool.requested`/`tool.executed` event.
 
@@ -937,7 +986,13 @@ async def test_finish_leaves_no_tool_requested_or_tool_executed_event(
     provider = FakeProvider([_step("finish", summary="done")])
 
     result = await run_task(
-        session, task, provider, FakeWorkspace().registry(), _allow_all(), workspace=workspace
+        session,
+        task,
+        provider,
+        FakeWorkspace().registry(),
+        _allow_all(),
+        workspace=workspace,
+        keys=keys,
     )
 
     assert result.status == "SUCCEEDED"
@@ -950,7 +1005,7 @@ async def test_finish_leaves_no_tool_requested_or_tool_executed_event(
 
 
 async def test_a_cancel_requested_before_the_run_starts_stops_before_any_model_call(
-    session: AsyncSession, workspace: pathlib.Path
+    session: AsyncSession, keys: KeyPair, workspace: pathlib.Path
 ) -> None:
     """The check at the top of iteration 1 has to run before `provider.generate`, not after:
     an empty `FakeProvider` blows up the instant anything calls it, so this only stays green
@@ -971,6 +1026,7 @@ async def test_a_cancel_requested_before_the_run_starts_stops_before_any_model_c
         FakeWorkspace().registry(),
         _allow_all(),
         workspace=workspace,
+        keys=keys,
     )
 
     assert result.status == "CANCELLED"
@@ -982,6 +1038,7 @@ async def test_a_cancel_requested_before_the_run_starts_stops_before_any_model_c
 
 async def test_a_cancel_requested_mid_turn_stops_before_the_next_tool_runs(
     session: AsyncSession,
+    keys: KeyPair,
     session_factory: async_sessionmaker[AsyncSession],
     workspace: pathlib.Path,
 ) -> None:
@@ -1011,7 +1068,13 @@ async def test_a_cancel_requested_mid_turn_stops_before_the_next_tool_runs(
     )
 
     result = await run_task(
-        session, task, provider, FakeWorkspace().registry(), _allow_all(), workspace=workspace
+        session,
+        task,
+        provider,
+        FakeWorkspace().registry(),
+        _allow_all(),
+        workspace=workspace,
+        keys=keys,
     )
 
     assert result.status == "CANCELLED"
@@ -1023,7 +1086,7 @@ async def test_a_cancel_requested_mid_turn_stops_before_the_next_tool_runs(
 
 
 async def test_a_run_past_its_max_seconds_deadline_stops_before_the_next_tool(
-    session: AsyncSession, workspace: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    session: AsyncSession, keys: KeyPair, workspace: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Wall clock, not sleep: `_now` is swapped for a clock this test drives by hand, so the
     deadline trips deterministically instead of racing a real clock in CI.
@@ -1055,6 +1118,7 @@ async def test_a_run_past_its_max_seconds_deadline_stops_before_the_next_tool(
         _allow_all(),
         workspace=workspace,
         budget=Budget(max_iterations=10, max_seconds=15),
+        keys=keys,
     )
 
     assert result.status == "TIMED_OUT"
@@ -1067,7 +1131,7 @@ async def test_a_run_past_its_max_seconds_deadline_stops_before_the_next_tool(
 
 
 async def test_max_iterations_still_ends_timed_out_when_no_deadline_is_set(
-    session: AsyncSession, workspace: pathlib.Path
+    session: AsyncSession, keys: KeyPair, workspace: pathlib.Path
 ) -> None:
     """Regression guard: adding max_seconds must not change the existing, deadline-less
     max_iterations behaviour that `test_a_run_that_never_finishes_stops_at_max_iterations`
@@ -1085,6 +1149,7 @@ async def test_max_iterations_still_ends_timed_out_when_no_deadline_is_set(
         _allow_all(),
         workspace=workspace,
         budget=Budget(max_iterations=2),
+        keys=keys,
     )
 
     assert result.status == "TIMED_OUT"
@@ -1092,7 +1157,7 @@ async def test_max_iterations_still_ends_timed_out_when_no_deadline_is_set(
 
 
 async def test_a_resumed_run_keeps_the_original_clock_for_max_seconds(
-    session: AsyncSession, workspace: pathlib.Path
+    session: AsyncSession, keys: KeyPair, workspace: pathlib.Path
 ) -> None:
     """The deadline is measured from the persisted `task.started_at`, so a task that crashed
     and was reclaimed an hour later is already out of time: the resume path must not stamp
@@ -1113,6 +1178,7 @@ async def test_a_resumed_run_keeps_the_original_clock_for_max_seconds(
         workspace=workspace,
         budget=Budget(max_iterations=10, max_seconds=60),
         resume=resume,
+        keys=keys,
     )
 
     assert result.status == "TIMED_OUT"
@@ -1123,6 +1189,7 @@ async def test_a_resumed_run_keeps_the_original_clock_for_max_seconds(
 
 async def test_a_cancel_landing_while_the_call_is_being_decided_wins_over_the_pause(
     session: AsyncSession,
+    keys: KeyPair,
     session_factory: async_sessionmaker[AsyncSession],
     workspace: pathlib.Path,
 ) -> None:
@@ -1157,6 +1224,7 @@ async def test_a_cancel_landing_while_the_call_is_being_decided_wins_over_the_pa
         _require_approval_policy(),
         workspace=workspace,
         holder=task.claimed_by,
+        keys=keys,
     )
 
     assert result.status == "CANCELLED"

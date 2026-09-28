@@ -27,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from warden.core import events
 from warden.core.events import read_events
 from warden.core.loop import run_task
+from warden.identity.jwt import KeyPair
 from warden.models import PolicyDecision, Task, ToolCall, User
 from warden.policy.engine import load_policy
 from warden.providers.base import ToolCall as ProviderToolCall
@@ -307,7 +308,7 @@ async def _apply_patch_row(session: AsyncSession, task_id: UUID) -> ToolCall:
 
 @pytest.mark.sandbox
 async def test_a_valid_patch_under_src_applies_and_the_file_changes(
-    session: AsyncSession, workspace: pathlib.Path, sandbox: Sandbox
+    session: AsyncSession, keys: KeyPair, workspace: pathlib.Path, sandbox: Sandbox
 ) -> None:
     task = await _a_task(session, "fix a line")
     provider = FakeProvider([_step("apply_patch", diff=_MODIFY_A), _step("finish", summary="done")])
@@ -319,6 +320,7 @@ async def test_a_valid_patch_under_src_applies_and_the_file_changes(
         build_registry(sandbox),
         load_policy(DEFAULT_POLICY),
         workspace=workspace,
+        keys=keys,
     )
 
     assert result.status == "SUCCEEDED"
@@ -334,7 +336,7 @@ async def test_a_valid_patch_under_src_applies_and_the_file_changes(
 
 @pytest.mark.sandbox
 async def test_a_patch_touching_an_allowed_and_a_denied_path_is_denied_as_a_whole(
-    session: AsyncSession, workspace: pathlib.Path, sandbox: Sandbox
+    session: AsyncSession, keys: KeyPair, workspace: pathlib.Path, sandbox: Sandbox
 ) -> None:
     """One call, two files: src/a.py alone would be allowed, .github/ci.yml alone would not
     be. The combined decision must be the denial, and neither file changes, src/a.py
@@ -352,6 +354,7 @@ async def test_a_patch_touching_an_allowed_and_a_denied_path_is_denied_as_a_whol
         build_registry(sandbox),
         load_policy(DEFAULT_POLICY),
         workspace=workspace,
+        keys=keys,
     )
 
     assert result.status == "SUCCEEDED"
@@ -363,7 +366,7 @@ async def test_a_patch_touching_an_allowed_and_a_denied_path_is_denied_as_a_whol
 
 @pytest.mark.sandbox
 async def test_a_patch_touching_a_secret_is_denied_by_never_read_secrets(
-    session: AsyncSession, workspace: pathlib.Path, sandbox: Sandbox
+    session: AsyncSession, keys: KeyPair, workspace: pathlib.Path, sandbox: Sandbox
 ) -> None:
     task = await _a_task(session, "rotate the secret")
     provider = FakeProvider(
@@ -377,6 +380,7 @@ async def test_a_patch_touching_a_secret_is_denied_by_never_read_secrets(
         build_registry(sandbox),
         load_policy(DEFAULT_POLICY),
         workspace=workspace,
+        keys=keys,
     )
 
     row = await _apply_patch_row(session, task.id)
@@ -390,7 +394,7 @@ async def test_a_patch_touching_a_secret_is_denied_by_never_read_secrets(
 
 @pytest.mark.sandbox
 async def test_a_rename_into_a_denied_tree_is_denied_and_the_destination_is_judged_too(
-    session: AsyncSession, workspace: pathlib.Path, sandbox: Sandbox
+    session: AsyncSession, keys: KeyPair, workspace: pathlib.Path, sandbox: Sandbox
 ) -> None:
     task = await _a_task(session, "move a.py under .github")
     provider = FakeProvider(
@@ -404,6 +408,7 @@ async def test_a_rename_into_a_denied_tree_is_denied_and_the_destination_is_judg
         build_registry(sandbox),
         load_policy(DEFAULT_POLICY),
         workspace=workspace,
+        keys=keys,
     )
 
     row = await _apply_patch_row(session, task.id)
@@ -426,7 +431,7 @@ async def test_a_rename_into_a_denied_tree_is_denied_and_the_destination_is_judg
 
 @pytest.mark.sandbox
 async def test_a_quoted_rename_source_is_still_judged_and_denied(
-    session: AsyncSession, workspace: pathlib.Path, sandbox: Sandbox
+    session: AsyncSession, keys: KeyPair, workspace: pathlib.Path, sandbox: Sandbox
 ) -> None:
     """The full exploit the review reproduced in a real sandbox: `.env` renamed into
     `src/**`, its source quoted in the extended header. `write-source` would allow the
@@ -445,6 +450,7 @@ async def test_a_quoted_rename_source_is_still_judged_and_denied(
         build_registry(sandbox),
         load_policy(DEFAULT_POLICY),
         workspace=workspace,
+        keys=keys,
     )
 
     row = await _apply_patch_row(session, task.id)
@@ -460,7 +466,7 @@ async def test_a_quoted_rename_source_is_still_judged_and_denied(
 
 @pytest.mark.sandbox
 async def test_apply_patch_refuses_to_create_a_symlink(
-    session: AsyncSession, workspace: pathlib.Path, sandbox: Sandbox
+    session: AsyncSession, keys: KeyPair, workspace: pathlib.Path, sandbox: Sandbox
 ) -> None:
     """The other half of the symlink bypass: even with `_CONTAIN` now checking the
     *effective* path against the judged one, a control plane that authorises by path
@@ -480,6 +486,7 @@ async def test_apply_patch_refuses_to_create_a_symlink(
         build_registry(sandbox),
         load_policy(DEFAULT_POLICY),
         workspace=workspace,
+        keys=keys,
     )
 
     row = await _apply_patch_row(session, task.id)
@@ -494,7 +501,7 @@ async def test_apply_patch_refuses_to_create_a_symlink(
 
 @pytest.mark.sandbox
 async def test_a_dotdot_path_is_refused(
-    session: AsyncSession, workspace: pathlib.Path, sandbox: Sandbox
+    session: AsyncSession, keys: KeyPair, workspace: pathlib.Path, sandbox: Sandbox
 ) -> None:
     task = await _a_task(session, "escape the workspace")
     provider = FakeProvider(
@@ -508,6 +515,7 @@ async def test_a_dotdot_path_is_refused(
         build_registry(sandbox),
         load_policy(DEFAULT_POLICY),
         workspace=workspace,
+        keys=keys,
     )
 
     row = await _apply_patch_row(session, task.id)
@@ -518,7 +526,7 @@ async def test_a_dotdot_path_is_refused(
 
 @pytest.mark.sandbox
 async def test_creating_through_a_symlinked_directory_creates_nothing_outside(
-    session: AsyncSession, workspace: pathlib.Path, sandbox: Sandbox
+    session: AsyncSession, keys: KeyPair, workspace: pathlib.Path, sandbox: Sandbox
 ) -> None:
     """Policy judges the string `src/linked/through.py`, which looks like an ordinary
     allowed path; it has no way to know `src/linked` is a symlink leaving the workspace.
@@ -542,6 +550,7 @@ async def test_creating_through_a_symlinked_directory_creates_nothing_outside(
         build_registry(sandbox),
         load_policy(DEFAULT_POLICY),
         workspace=workspace,
+        keys=keys,
     )
 
     row = await _apply_patch_row(session, task.id)
@@ -554,7 +563,7 @@ async def test_creating_through_a_symlinked_directory_creates_nothing_outside(
 
 @pytest.mark.sandbox
 async def test_a_malformed_patch_is_refused_at_inspection_with_no_allow_decision(
-    session: AsyncSession, workspace: pathlib.Path, sandbox: Sandbox
+    session: AsyncSession, keys: KeyPair, workspace: pathlib.Path, sandbox: Sandbox
 ) -> None:
     task = await _a_task(session, "apply garbage")
     provider = FakeProvider([_step("apply_patch", diff=_GARBAGE), _step("finish", summary="done")])
@@ -566,6 +575,7 @@ async def test_a_malformed_patch_is_refused_at_inspection_with_no_allow_decision
         build_registry(sandbox),
         load_policy(DEFAULT_POLICY),
         workspace=workspace,
+        keys=keys,
     )
 
     row = await _apply_patch_row(session, task.id)
@@ -580,7 +590,7 @@ async def test_a_malformed_patch_is_refused_at_inspection_with_no_allow_decision
 
 @pytest.mark.sandbox
 async def test_a_patch_that_passes_policy_but_does_not_apply_is_a_tool_error(
-    session: AsyncSession, workspace: pathlib.Path, sandbox: Sandbox
+    session: AsyncSession, keys: KeyPair, workspace: pathlib.Path, sandbox: Sandbox
 ) -> None:
     """`--numstat -z` only parses the patch, so a context mismatch is invisible to policy:
     the call is allowed and only fails for real when the executor runs `--check`.
@@ -597,6 +607,7 @@ async def test_a_patch_that_passes_policy_but_does_not_apply_is_a_tool_error(
         build_registry(sandbox),
         load_policy(DEFAULT_POLICY),
         workspace=workspace,
+        keys=keys,
     )
 
     row = await _apply_patch_row(session, task.id)

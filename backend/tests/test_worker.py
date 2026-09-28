@@ -8,9 +8,11 @@ RULE from the spec: a task can only ever tighten the worker's own ceiling, never
 and a value that does not parse as a sane positive number must not crash the worker.
 """
 
+import asyncio
 import contextlib
 import os
 import pathlib
+import socket
 import uuid
 from collections.abc import AsyncIterator
 from decimal import Decimal
@@ -22,6 +24,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from warden.core import queue
 from warden.core.loop import Budget
 from warden.core.worker import Worker, discard_orphaned_workspace_volumes, merge_budget
+from warden.db import make_engine, make_session_factory
+from warden.identity.jwt import KeyPair
 from warden.models import Task, User
 from warden.policy.engine import Effect, Policy, Rule
 from warden.providers.base import ToolCall as ProviderToolCall
@@ -177,6 +181,7 @@ async def test_run_once_applies_the_tightened_per_task_budget(
     docker_available: None,
     _empty_tasks_and_users: None,
     session: AsyncSession,
+    keys: KeyPair,
     session_factory: async_sessionmaker[AsyncSession],
     _repo_workspace: pathlib.Path,
 ) -> None:
@@ -204,12 +209,50 @@ async def test_run_once_applies_the_tightened_per_task_budget(
     def provider_factory() -> FakeProvider:
         return FakeProvider([ScriptStep(tool_calls=[list_files]), ScriptStep(tool_calls=[finish])])
 
-    worker = Worker(session_factory, provider_factory, _allow_all(), _repo_workspace)
+    worker = Worker(session_factory, provider_factory, _allow_all(), _repo_workspace, keys)
     result = await worker.run_once()
 
     assert result is not None
     assert result.status == "TIMED_OUT"
     assert result.iterations == 1
+
+
+# --- surviving the database being unreachable (ADR-025's worker-resilience item) ------------
+#
+# Seen for real when Docker Desktop restarts mid-poll: `run_forever`'s claim loop hit an
+# unhandled asyncpg/OSError and the whole worker process died. Caused here, not simulated: the
+# engine really points at a closed TCP port (bound, read back, then released, so nothing is
+# listening there), so `queue.claim` really raises the same way a downed database would.
+
+
+def _closed_port_url() -> str:
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    return f"postgresql+asyncpg://warden:warden@127.0.0.1:{port}/warden"
+
+
+@pytest.mark.sandbox
+async def test_run_forever_survives_the_database_being_unreachable(
+    docker_available: None, keys: KeyPair, tmp_path: pathlib.Path
+) -> None:
+    engine = make_engine(_closed_port_url())
+    sessions = make_session_factory(engine)
+    worker = Worker(sessions, lambda: FakeProvider([]), _allow_all(), tmp_path, keys)
+
+    running = asyncio.create_task(worker.run_forever())
+    try:
+        # Long enough for several failed claim attempts against the closed port (each one
+        # fails fast; `IDLE_POLL_SECONDS` paces the retries). The assertion is simply that
+        # the task is still alive: a worker that died would have `running.done()` here with
+        # an OSError/SQLAlchemyError as its exception.
+        await asyncio.sleep(1.5)
+        assert not running.done()
+    finally:
+        worker.stop()
+        await asyncio.wait_for(running, timeout=5)
+        await engine.dispose()
 
 
 # --- the orphaned-workspace-volume janitor (maintenance track, item 2) ----------------------

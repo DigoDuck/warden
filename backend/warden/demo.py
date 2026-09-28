@@ -18,6 +18,7 @@ from warden.config import get_settings
 from warden.core import events
 from warden.core.loop import Budget, run_task
 from warden.db import make_engine, make_session_factory
+from warden.identity.jwt import load_keys
 from warden.models import Task as TaskRow
 from warden.models import User
 from warden.policy.engine import load_policy, never_readable
@@ -79,6 +80,10 @@ async def main(kind: str) -> int:
         await session.flush()
 
         policy = load_policy(POLICY)
+        # Same requirement as the worker (ADR-025): the loop mints a per-call agent token
+        # for every allowed tool call, so it needs a real signing key even for a one-off
+        # demo run. Fails fast with `load_keys`'s own "run make keys" message if none exists.
+        keys = load_keys()
         print(f"task {task.id}  provider={provider.name}  workspace={WORKSPACE}")
         print(f"policy {POLICY.name}  hash={policy.policy_hash[:12]}")
 
@@ -95,6 +100,7 @@ async def main(kind: str) -> int:
                 provider,
                 build_registry(sandbox),
                 policy,
+                keys=keys,
                 workspace=WORKSPACE,
                 budget=DEMO_BUDGET,
             )

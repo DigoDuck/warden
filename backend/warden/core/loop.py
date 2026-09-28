@@ -23,6 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from warden import audit
 from warden.core import approvals, cancel, events, queue
 from warden.core.replay import ApprovalOutcome, ResumeState
+from warden.identity.jwt import KeyPair
 from warden.models import Task, User
 from warden.policy.engine import Decision, Effect, Policy, PolicyContext, UserRef, combine
 from warden.providers.base import (
@@ -187,6 +188,7 @@ async def run_task(
     registry: ToolRegistry,
     policy: Policy,
     *,
+    keys: KeyPair,
     workspace: pathlib.Path,
     budget: Budget | None = None,
     resume: ResumeState | None = None,
