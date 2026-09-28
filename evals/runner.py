@@ -83,6 +83,10 @@ os.environ.setdefault("GITHUB_REPO", "evals/unused-placeholder-repo")
 os.environ.setdefault("GITHUB_TOKEN", "eval-placeholder-token")
 
 
+def isolate_github() -> None:
+    """Skeleton: implemented in the next commit."""
+
+
 # --------------------------------------------------------------------------------------
 # Dataset
 # --------------------------------------------------------------------------------------
