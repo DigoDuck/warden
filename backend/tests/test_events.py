@@ -2,10 +2,18 @@
 
 import uuid
 
+import pytest
+from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from warden.core.events import append_event, read_events, redact_args
+from warden.config import Settings
+from warden.core.events import append_event, read_events, record_tool_call, redact_args
 from warden.models import Task, User
+from warden.providers.base import ToolCall as ProviderToolCall
+
+# Deliberately not GitHub- or OpenAI-token-shaped: a string a secret scanner could flag as a
+# real leaked credential defeats the point of a fixture. Same convention as test_broker.py.
+FAKE_TOKEN = "not-a-real-secret-abcdefghijklmnop"
 
 
 async def _a_task(session: AsyncSession) -> Task:
@@ -77,3 +85,79 @@ def test_redaction_truncates_long_values() -> None:
 def test_redaction_leaves_ordinary_arguments_alone() -> None:
     original = {"path": "src/app.py", "pattern": "**/*.py", "limit": 10}
     assert redact_args(original) == original
+
+
+# --- broker.redact() as the event log's one choke point (ADR-025, deliverable 4) ------------
+
+
+def _with_fake_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Point broker.redact() at a known, fixed secret instead of whatever GITHUB_TOKEN this
+    developer's own .env happens to have (or not have) configured, so the assertion is
+    deterministic. `identity.broker.get_settings` is what redact() calls when no `settings`
+    is passed in, so that is the one seam to patch.
+    """
+    monkeypatch.setattr(
+        "warden.identity.broker.get_settings",
+        lambda: Settings(github_token=SecretStr(FAKE_TOKEN)),
+    )
+
+
+async def test_append_event_redacts_a_secret_in_a_string_field(
+    session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tool's own output can echo a secret back (github.open_pr's response body, a run_command
+    that greps its own environment); the event log must not become a second place it leaks."""
+    _with_fake_token(monkeypatch)
+    task = await _a_task(session)
+
+    await append_event(
+        session,
+        task.id,
+        "tool.executed",
+        {"tool": "github.open_pr", "output": f"opened PR using token {FAKE_TOKEN} ok"},
+    )
+
+    payload = (await read_events(session, task.id))[0].payload
+    assert FAKE_TOKEN not in payload["output"]
+    assert payload["output"] == "opened PR using token [redacted] ok"
+    assert payload["tool"] == "github.open_pr"  # untouched: not the secret
+
+
+async def test_append_event_redacts_a_secret_nested_inside_a_list(
+    session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The choke point walks the whole payload, not just its top-level string values:
+    policy.decided's `paths` is a list, and a path is still a string a leak could hide in."""
+    _with_fake_token(monkeypatch)
+    task = await _a_task(session)
+
+    await append_event(
+        session, task.id, "policy.decided", {"paths": ["src/app.py", f"leak-{FAKE_TOKEN}.py"]}
+    )
+
+    payload = (await read_events(session, task.id))[0].payload
+    assert all(FAKE_TOKEN not in path for path in payload["paths"])
+    assert payload["paths"][0] == "src/app.py"
+
+
+async def test_record_tool_call_redacts_result_summary_and_error(
+    session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """tool_calls.result_summary/error are the other place a tool's raw text is stored,
+    outside task_events entirely; they need the same choke point."""
+    _with_fake_token(monkeypatch)
+    task = await _a_task(session)
+    call = ProviderToolCall(id="c1", name="run_command", arguments={})
+
+    row = await record_tool_call(
+        session,
+        task.id,
+        1,
+        call,
+        decision="allow",
+        result_summary=f"leaked {FAKE_TOKEN}",
+        error=f"boom {FAKE_TOKEN}",
+    )
+
+    assert FAKE_TOKEN not in (row.result_summary or "")
+    assert FAKE_TOKEN not in (row.error or "")
