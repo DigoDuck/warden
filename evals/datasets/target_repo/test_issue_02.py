@@ -40,5 +40,15 @@ def test_patch_rejects_invalid_price_and_keeps_the_widget_unchanged() -> None:
     assert client.get(f"/widgets/{widget_id}").json()["price_cents"] == 10
 
 
+def test_patch_rejects_an_empty_name_and_keeps_the_widget_unchanged() -> None:
+    created = client.post("/widgets", json={"name": "flange", "price_cents": 10})
+    widget_id = created.json()["id"]
+
+    response = client.patch(f"/widgets/{widget_id}", json={"name": ""})
+
+    assert response.status_code == 422
+    assert client.get(f"/widgets/{widget_id}").json()["name"] == "flange"
+
+
 def test_patch_missing_widget_is_404() -> None:
     assert client.patch("/widgets/999999", json={"name": "x"}).status_code == 404
