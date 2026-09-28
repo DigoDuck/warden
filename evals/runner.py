@@ -72,19 +72,28 @@ DEFAULT_DATASET = REPO_ROOT / "evals" / "datasets" / "behavioral_v1.yaml"
 DEFAULT_METRICS = REPO_ROOT / "docs" / "metrics.md"
 TEST_DB = os.environ.get("WARDEN_TEST_DB", "warden_test")
 
-# github.open_pr is only registered by build_registry() when both of these are set
-# (ADR-025's "absent, not refusing" shape). Case 3 needs the tool to exist so the policy
-# engine's own require_approval rule pauses the task; it never actually reaches GitHub,
-# because a REQUIRE_APPROVAL decision returns before core/loop.py ever calls gateway.execute,
-# and the rejection path in _run_tools answers the call without executing it either. A
-# placeholder repo/token is therefore honest, not a workaround: nothing here ever makes an
-# HTTP request.
-os.environ.setdefault("GITHUB_REPO", "evals/unused-placeholder-repo")
-os.environ.setdefault("GITHUB_TOKEN", "eval-placeholder-token")
+# github.open_pr is only registered by build_registry() when a repo and a token are both
+# set (ADR-025's "absent, not refusing" shape). Case 3 needs the tool to exist so the
+# policy's require_approval rule pauses the task. While the approval gate works, nothing
+# reaches GitHub. But case 3 exists to catch the day it does not, and on that day the call
+# goes through the real gateway with whatever the environment holds. So the values are
+# forced, not defaulted: a PAT exported in the shell must not survive into an eval run, and
+# the API host is a loopback port nothing listens on (9, "discard"), so a leaked call fails
+# with a refused connection instead of opening a real pull request.
+_GITHUB_PLACEHOLDERS = {
+    "GITHUB_REPO": "evals/unused-placeholder-repo",
+    "GITHUB_TOKEN": "eval-placeholder-token",
+    "GITHUB_API_URL": "http://127.0.0.1:9",
+}
 
 
 def isolate_github() -> None:
-    """Skeleton: implemented in the next commit."""
+    """Force the placeholders above. Environment variables win over .env in
+    pydantic-settings, and the subprocess worker of case 7 inherits os.environ, so this
+    covers every process the run starts. Clears the cached Settings in case anything read
+    them before this ran."""
+    os.environ.update(_GITHUB_PLACEHOLDERS)
+    get_settings.cache_clear()
 
 
 # --------------------------------------------------------------------------------------
@@ -718,6 +727,7 @@ def write_metrics(
 
 
 async def _amain(dataset_path: pathlib.Path, *, should_write_metrics: bool) -> int:
+    isolate_github()  # before anything builds a registry or starts the case 7 subprocess
     cases = load_cases(dataset_path)
     session_factory, test_db_url = await prepare_database()
     keys = ephemeral_keys()
