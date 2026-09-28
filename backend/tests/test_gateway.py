@@ -31,7 +31,9 @@ async def _user(session: AsyncSession) -> User:
 
 
 async def _task(session: AsyncSession) -> Task:
-    row = Task(user_id=(await _user(session)).id, spec="open a pr", idempotency_key=str(uuid.uuid4()))
+    row = Task(
+        user_id=(await _user(session)).id, spec="open a pr", idempotency_key=str(uuid.uuid4())
+    )
     session.add(row)
     await session.flush()
     return row
@@ -90,7 +92,9 @@ async def _audit_rows(session: AsyncSession, action: str, task_id: uuid.UUID) ->
 async def test_a_live_task_bound_token_runs_the_tool(session: AsyncSession, keys: KeyPair) -> None:
     task = await _task(session)
     recorder = _Recorder()
-    token = await identity.issue_agent_token(session, keys, task_id=task.id, scopes=["tool:plain_tool"])
+    token = await identity.issue_agent_token(
+        session, keys, task_id=task.id, scopes=["tool:plain_tool"]
+    )
 
     output = await gateway.execute(
         session, keys, _registry(recorder), "plain_tool", {}, token=token, task_id=task.id
@@ -105,7 +109,9 @@ async def test_a_tool_that_needs_identity_receives_the_verified_claims(
 ) -> None:
     task = await _task(session)
     recorder = _Recorder()
-    token = await identity.issue_agent_token(session, keys, task_id=task.id, scopes=["github:pr:open"])
+    token = await identity.issue_agent_token(
+        session, keys, task_id=task.id, scopes=["github:pr:open"]
+    )
 
     output = await gateway.execute(
         session, keys, _registry(recorder), "scoped_tool", {}, token=token, task_id=task.id
@@ -127,7 +133,9 @@ async def test_an_expired_token_is_never_executed_and_is_audited(
 ) -> None:
     task = await _task(session)
     recorder = _Recorder()
-    token = await identity.issue_agent_token(session, keys, task_id=task.id, scopes=["tool:plain_tool"])
+    token = await identity.issue_agent_token(
+        session, keys, task_id=task.id, scopes=["tool:plain_tool"]
+    )
     # Cause the real expiry, in the database, rather than mocking `identity.verify`.
     await session.execute(
         update(IssuedToken)
@@ -153,7 +161,9 @@ async def test_a_revoked_token_is_never_executed_and_is_audited(
 ) -> None:
     task = await _task(session)
     recorder = _Recorder()
-    token = await identity.issue_agent_token(session, keys, task_id=task.id, scopes=["tool:plain_tool"])
+    token = await identity.issue_agent_token(
+        session, keys, task_id=task.id, scopes=["tool:plain_tool"]
+    )
     claims = await identity.verify(session, keys, token)
     await identity.revoke(session, claims.jti)
 
@@ -179,7 +189,13 @@ async def test_a_token_minted_for_another_task_is_never_executed(
 
     with pytest.raises(ToolError, match="401"):
         await gateway.execute(
-            session, keys, _registry(recorder), "plain_tool", {}, token=token, task_id=running_task.id
+            session,
+            keys,
+            _registry(recorder),
+            "plain_tool",
+            {},
+            token=token,
+            task_id=running_task.id,
         )
 
     assert recorder.calls == []
