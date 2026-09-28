@@ -1,0 +1,34 @@
+name: CI
+
+# Own, minimal CI for this small service (briefing.md, section 29): ruff + pytest.
+# Written to work standalone the day this folder becomes its own GitHub repository
+# (paths are repo-root-relative, no --directory), and mirrored as a job in the
+# monorepo's own .github/workflows/ci.yml in the meantime.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - run: uv sync --locked
+
+      - run: uv run ruff check
+
+      - run: uv run ruff format --check
+
+      - run: uv run pytest
