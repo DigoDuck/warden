@@ -26,6 +26,7 @@ from warden.policy.engine import Effect, PolicyContext, UserRef, combine, load_p
 from warden.sandbox.docker import Sandbox, SandboxProfile
 from warden.tools.github import OpenPrArgs, open_pr, open_pr_paths
 from warden.tools.registry import ToolContext, ToolError
+from warden.tools.sandboxed import build_registry
 
 pytestmark = pytest.mark.sandbox
 
@@ -130,8 +131,8 @@ class FakeGitHub:
             )
         if method == "GET" and path.endswith("/pulls"):
             head = request.url.params.get("head")
-            branch = head.split(":", 1)[1] if head else None
-            return httpx.Response(200, json=[p for p in self.pulls if p["_branch"] == branch])
+            head_branch = head.split(":", 1)[1] if head else None
+            return httpx.Response(200, json=[p for p in self.pulls if p["_branch"] == head_branch])
         if method == "POST" and path.endswith("/pulls"):
             body = json.loads(request.content)
             number = len(self.pulls) + 1
@@ -284,3 +285,19 @@ async def test_open_pr_fails_as_a_tool_error_when_the_secret_is_not_configured(
 
     with pytest.raises(ToolError, match="credential denied"):
         await open_pr(sandbox, unconfigured, args, ToolContext(claims=claims, session=session))
+
+
+# --- conditional registration -----------------------------------------------------------------
+
+
+def test_build_registry_only_offers_github_open_pr_when_configured(
+    sandbox: Sandbox, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "warden.config.get_settings",
+        lambda: Settings(github_token=SecretStr(""), github_repo=""),
+    )
+    assert not build_registry(sandbox).has("github.open_pr")
+
+    monkeypatch.setattr("warden.config.get_settings", _settings)
+    assert build_registry(sandbox).has("github.open_pr")

@@ -556,4 +556,31 @@ def build_registry(sandbox: Sandbox) -> ToolRegistry:
         args_model=RunTestsArgs,
         execute=lambda args: run_tests(sandbox, args),
     )
+
+    # Imported here, not at module level: warden.tools.github itself imports read_file and
+    # ReadFileArgs from this module ("reuse the existing sandboxed read helper, no new
+    # container code"), so a top-level import in both directions would be a circular one.
+    from warden.config import get_settings
+    from warden.tools import github
+
+    settings = get_settings()
+    # Absent, not refusing (ADR-025): a repo with no github_repo/github_token configured
+    # never sees github.open_pr offered to it at all, the same shape the secret broker
+    # already uses for "not configured" (identity/broker.py::SecretNotConfigured).
+    if settings.github_repo and settings.github_token.get_secret_value():
+        registry.register(
+            name="github.open_pr",
+            description=(
+                "Open a pull request via the GitHub Git Data API, publishing files "
+                "already written in the workspace."
+            ),
+            args_model=github.OpenPrArgs,
+            execute=lambda args, context: github.open_pr(sandbox, settings, args, context),
+            # Judged per path, exactly like apply_patch: a deny on any one path blocks the
+            # whole call before a request is ever made.
+            path_inspector=github.open_pr_paths,
+            required_scope="github:pr:open",
+            needs_identity=True,
+        )
+
     return registry

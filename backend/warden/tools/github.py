@@ -90,10 +90,16 @@ async def _upsert_ref(
     `force: true` on the update is safe only because `_BRANCH_PREFIX` is this control plane's
     own namespace: nothing else ever pushes to a `warden/*` branch, so there is no history on
     it a force-update could ever discard that this same tool did not itself just supersede.
+
+    `ref_url` (the caller's `.../git/ref/heads/<branch>`, singular) is only ever right for the
+    GET: GitHub's own API is inconsistent here, and creating or updating a reference is
+    `POST .../git/refs` / `PATCH .../git/refs/<ref>` (plural), never the singular form the read
+    uses. Reusing `ref_url` for the PATCH too, an earlier version of this function did, sends a
+    real request to a URL the real API does not update, silently failing to move the branch.
     """
     existing = await client.get(ref_url, headers=headers)
+    base, _, ref_path = ref_url.rpartition("/git/ref/")
     if existing.status_code == 404:
-        base, _, ref_path = ref_url.rpartition("/git/ref/")
         await _request(
             client,
             "POST",
@@ -103,7 +109,9 @@ async def _upsert_ref(
         )
         return
     existing.raise_for_status()
-    await _request(client, "PATCH", ref_url, headers, json={"sha": sha, "force": True})
+    await _request(
+        client, "PATCH", f"{base}/git/refs/{ref_path}", headers, json={"sha": sha, "force": True}
+    )
 
 
 async def open_pr(
@@ -186,7 +194,6 @@ async def open_pr(
             headers,
             params={"head": f"{owner}:{branch}", "state": "open"},
         )
-        existing = []  # TEMP: idempotency check disabled to prove the RED test for it
         if existing:
             pr = existing[0]
         else:
