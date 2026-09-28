@@ -1,0 +1,605 @@
+"""tools/github.py against a fake GitHub (httpx.MockTransport): never the real network.
+
+`sandbox` is real (Docker): "reuse the existing sandboxed read helper, no new container
+code" means `open_pr` reads through the same container-hardened path every other tool does,
+so faking that half away would test a different tool than the one that ships. The GitHub side
+is a `MockTransport` that plays a small in-memory git/pulls server, records every request, and
+never touches the network, so the assertions are about what warden sent, not about GitHub.
+"""
+
+import hashlib
+import json
+import os
+import pathlib
+import uuid
+from collections.abc import AsyncIterator
+
+import httpx
+import pytest
+from pydantic import SecretStr
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from warden import identity
+from warden.audit.log import _LOCK_KEY
+from warden.config import Settings
+from warden.core import approvals, queue
+from warden.core.events import read_events
+from warden.core.loop import run_task
+from warden.core.replay import rebuild
+from warden.identity.jwt import KeyPair
+from warden.models import Approval, AuditLog, Task, ToolCall, User
+from warden.policy.engine import Effect, PolicyContext, UserRef, combine, load_policy
+from warden.providers.base import ToolCall as ProviderToolCall
+from warden.providers.fake import FakeProvider, ScriptStep
+from warden.sandbox.docker import Sandbox, SandboxProfile
+from warden.tools.github import OpenPrArgs, open_pr, open_pr_paths
+from warden.tools.registry import ToolContext, ToolError
+from warden.tools.sandboxed import build_registry
+
+pytestmark = pytest.mark.sandbox
+
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
+DEFAULT_POLICY = REPO_ROOT / "policies" / "default.yaml"
+# Deliberately not shaped like a real GitHub PAT: a secret scanner flagging a fixture string
+# defeats the point of a fixture. Same convention as test_broker.py/test_events.py.
+FAKE_TOKEN = "not-a-real-secret-abcdefghijklmnop"
+
+
+@pytest.fixture(scope="session")
+def docker_available() -> None:
+    import docker
+
+    try:
+        docker.from_env().ping()
+    except Exception as exc:  # noqa: BLE001 - any failure to reach the daemon counts
+        if os.environ.get("CI"):
+            raise RuntimeError(f"CI requires a working Docker daemon: {exc}") from exc
+        pytest.skip(f"Docker is not available on this machine: {exc}")
+
+
+@pytest.fixture
+def workspace(tmp_path: pathlib.Path) -> pathlib.Path:
+    root = tmp_path / "repo"
+    (root / "src").mkdir(parents=True)
+    (root / "src" / "app.py").write_text("print('hello')\n", encoding="utf-8", newline="\n")
+    (root / "src" / "other.py").write_text("x = 1\n", encoding="utf-8", newline="\n")
+    (root / ".env").write_text("SECRET=nope\n", encoding="utf-8", newline="\n")
+    return root
+
+
+@pytest.fixture
+async def sandbox(docker_available: None, workspace: pathlib.Path) -> AsyncIterator[Sandbox]:
+    box = await Sandbox.create(SandboxProfile(), workspace)
+    try:
+        yield box
+    finally:
+        await box.destroy()
+
+
+def _settings() -> Settings:
+    return Settings(github_token=SecretStr(FAKE_TOKEN), github_repo="acme/widgets")
+
+
+async def _claims(session: AsyncSession, keys: KeyPair) -> identity.Claims:
+    user = User(email=f"{uuid.uuid4()}@warden.test", password_hash="x", role="worker")
+    session.add(user)
+    await session.flush()
+    task = Task(user_id=user.id, spec="open a pr", idempotency_key=str(uuid.uuid4()))
+    session.add(task)
+    await session.flush()
+    token = await identity.issue_agent_token(
+        session, keys, task_id=task.id, scopes=["github:pr:open"]
+    )
+    return await identity.verify(session, keys, token)
+
+
+class FakeGitHub:
+    """A tiny, stateful stand-in for the Git Data + Pulls API.
+
+    Every request is recorded (`self.requests`) so a test can inspect what warden actually
+    sent, in particular the `Authorization` header, without ever making a real HTTP call:
+    `httpx.MockTransport` calls `handler` in place of opening a socket.
+
+    Content-addressed where it matters, like git: a tree's sha is derived from its full
+    path -> blob mapping, so the same files on the same base give the same tree. Commits
+    remember their parents, and a ref update without `force` is refused (422) unless it is a
+    fast-forward, which is what the real API does.
+    """
+
+    def __init__(self) -> None:
+        self.requests: list[httpx.Request] = []
+        self.refs: dict[str, str] = {"heads/main": "base-sha"}
+        self.trees: dict[str, dict[str, str]] = {"base-tree": {}}
+        self.commits: dict[str, dict[str, object]] = {
+            "base-sha": {"tree": "base-tree", "parents": []}
+        }
+        self.pulls: list[dict[str, object]] = []
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        method, path = request.method, request.url.path
+        body = json.loads(request.content) if request.content else {}
+
+        if method == "GET" and "/git/ref/" in path:
+            ref = path.split("/git/ref/", 1)[1]
+            if ref in self.refs:
+                return httpx.Response(200, json={"object": {"sha": self.refs[ref]}})
+            return httpx.Response(404, json={"message": "Not Found"})
+        if method == "GET" and "/git/commits/" in path:
+            sha = path.rsplit("/", 1)[1]
+            commit = self.commits[sha]
+            return httpx.Response(200, json={"sha": sha, "tree": {"sha": commit["tree"]}})
+        if method == "POST" and path.endswith("/git/blobs"):
+            digest = hashlib.sha1(body["content"].encode()).hexdigest()[:12]
+            return httpx.Response(201, json={"sha": f"blob-{digest}"})
+        if method == "POST" and path.endswith("/git/trees"):
+            files = dict(self.trees[body["base_tree"]])
+            files.update({entry["path"]: entry["sha"] for entry in body["tree"]})
+            digest = hashlib.sha1(json.dumps(sorted(files.items())).encode()).hexdigest()[:12]
+            self.trees[f"tree-{digest}"] = files
+            return httpx.Response(201, json={"sha": f"tree-{digest}"})
+        if method == "POST" and path.endswith("/git/commits"):
+            sha = f"commit-{len(self.commits)}"
+            self.commits[sha] = {"tree": body["tree"], "parents": body["parents"]}
+            return httpx.Response(201, json={"sha": sha})
+        if method == "POST" and path.endswith("/git/refs"):
+            ref = body["ref"].removeprefix("refs/")
+            if ref in self.refs:
+                return httpx.Response(422, json={"message": "Reference already exists"})
+            self.refs[ref] = body["sha"]
+            return httpx.Response(201, json={"ref": body["ref"], "object": {"sha": body["sha"]}})
+        if method == "PATCH" and "/git/refs/" in path:
+            ref = path.split("/git/refs/", 1)[1]
+            parents = self.commits[body["sha"]]["parents"]
+            if not body.get("force") and self.refs[ref] not in parents:  # type: ignore[operator]
+                return httpx.Response(422, json={"message": "Update is not a fast forward"})
+            self.refs[ref] = body["sha"]
+            return httpx.Response(200, json={"ref": f"refs/{ref}", "object": {"sha": body["sha"]}})
+        if method == "GET" and path.endswith("/pulls"):
+            head = request.url.params.get("head")
+            head_branch = head.split(":", 1)[1] if head else None
+            return httpx.Response(200, json=[p for p in self.pulls if p["_branch"] == head_branch])
+        if method == "POST" and path.endswith("/pulls"):
+            number = len(self.pulls) + 1
+            pr = {
+                "number": number,
+                "html_url": f"https://github.com/acme/widgets/pull/{number}",
+                "_branch": body["head"],
+            }
+            self.pulls.append(pr)
+            return httpx.Response(201, json=pr)
+        raise AssertionError(f"unexpected request: {method} {request.url}")
+
+    def branch_files(self, branch: str) -> dict[str, str]:
+        return self.trees[str(self.commits[self.refs[f"heads/{branch}"]]["tree"])]
+
+    def client(self) -> httpx.AsyncClient:
+        return httpx.AsyncClient(transport=httpx.MockTransport(self.handler))
+
+
+# --- the inspector: judged like apply_patch --------------------------------------------------
+
+
+async def test_open_pr_paths_reports_every_path_verbatim() -> None:
+    args = OpenPrArgs(title="t", body="b", branch_slug="fix", paths=["src/a.py", "src/b.py"])
+    assert await open_pr_paths(args) == ["src/a.py", "src/b.py"]
+
+
+def test_a_denied_path_blocks_the_whole_pr() -> None:
+    """The real default policy's `never-read-secrets` (tool: "*") must deny a call that
+    would publish `.env`, exactly as it would for apply_patch: `combine()` takes the most
+    restrictive decision across every path this call touches."""
+    policy = load_policy(DEFAULT_POLICY)
+    user = UserRef(role="worker")
+    decisions = [
+        policy.evaluate(PolicyContext(tool="github.open_pr", path=path, user=user))
+        for path in ("src/app.py", ".env")
+    ]
+    assert combine(decisions).effect == Effect.DENY
+
+
+# --- the real flow, against the fake GitHub ---------------------------------------------------
+
+
+async def test_open_pr_runs_the_full_git_data_sequence_and_opens_a_pr(
+    sandbox: Sandbox, session: AsyncSession, keys: KeyPair
+) -> None:
+    fake = FakeGitHub()
+    claims = await _claims(session, keys)
+    args = OpenPrArgs(
+        title="Fix the timeout",
+        body="Closes the bug.",
+        branch_slug="fix-timeout",
+        paths=["src/app.py"],
+    )
+
+    async with fake.client() as client:
+        result = await open_pr(
+            sandbox,
+            _settings(),
+            args,
+            ToolContext(claims=claims, session=session, checkpoint=session.commit),
+            client=client,
+        )
+
+    assert "opened PR #1" in result
+    assert fake.pulls[0]["_branch"] == f"warden/{str(claims.task_id)[:8]}-fix-timeout"
+
+    methods_and_paths = [(r.method, r.url.path) for r in fake.requests]
+    assert ("GET", "/repos/acme/widgets/git/ref/heads/main") in methods_and_paths
+    assert ("POST", "/repos/acme/widgets/git/blobs") in methods_and_paths
+    assert ("POST", "/repos/acme/widgets/git/trees") in methods_and_paths
+    assert ("POST", "/repos/acme/widgets/git/commits") in methods_and_paths
+    assert ("POST", "/repos/acme/widgets/pulls") in methods_and_paths
+
+    # The brokered token, not a placeholder: every request warden sent carries it.
+    assert all(r.headers["authorization"] == f"Bearer {FAKE_TOKEN}" for r in fake.requests)
+
+
+async def test_open_pr_is_idempotent_for_the_same_task_and_branch(
+    sandbox: Sandbox, session: AsyncSession, keys: KeyPair
+) -> None:
+    fake = FakeGitHub()
+    claims = await _claims(session, keys)
+    args = OpenPrArgs(title="Fix", body="body", branch_slug="fix", paths=["src/app.py"])
+
+    async with fake.client() as client:
+        first = await open_pr(
+            sandbox,
+            _settings(),
+            args,
+            ToolContext(claims=claims, session=session, checkpoint=session.commit),
+            client=client,
+        )
+        second = await open_pr(
+            sandbox,
+            _settings(),
+            args,
+            ToolContext(claims=claims, session=session, checkpoint=session.commit),
+            client=client,
+        )
+
+    assert first == second
+    assert len(fake.pulls) == 1, "a second call for the same task must not open a second PR"
+    pull_posts = [r for r in fake.requests if r.method == "POST" and r.url.path.endswith("/pulls")]
+    assert len(pull_posts) == 1
+
+
+async def test_a_second_publish_builds_on_the_branch_instead_of_overwriting_it(
+    sandbox: Sandbox, session: AsyncSession, keys: KeyPair
+) -> None:
+    """Same task, same slug, a second batch of files (the agent fixed something after the
+    PR was opened). The branch must move forward, keeping the first file, never be
+    force-reset onto the base: that would silently drop already-published work from a PR a
+    human may be reviewing."""
+    fake = FakeGitHub()
+    claims = await _claims(session, keys)
+    context = ToolContext(claims=claims, session=session, checkpoint=session.commit)
+    branch = f"warden/{str(claims.task_id)[:8]}-grow"
+
+    async with fake.client() as client:
+        await open_pr(
+            sandbox,
+            _settings(),
+            OpenPrArgs(title="t", body="b", branch_slug="grow", paths=["src/app.py"]),
+            context,
+            client=client,
+        )
+        first_head = fake.refs[f"heads/{branch}"]
+        await open_pr(
+            sandbox,
+            _settings(),
+            OpenPrArgs(title="t", body="b", branch_slug="grow", paths=["src/other.py"]),
+            context,
+            client=client,
+        )
+
+    assert set(fake.branch_files(branch)) == {"src/app.py", "src/other.py"}
+    assert fake.commits[fake.refs[f"heads/{branch}"]]["parents"] == [first_head]
+    patches = [json.loads(r.content) for r in fake.requests if r.method == "PATCH"]
+    assert patches and not any(p.get("force") for p in patches), "a ref was force-updated"
+    assert len(fake.pulls) == 1
+
+
+async def test_replaying_the_same_publish_creates_no_new_commit(
+    sandbox: Sandbox, session: AsyncSession, keys: KeyPair
+) -> None:
+    """ADR-019's at-least-once window: a crash after GitHub answered but before
+    `tool.executed` committed replays the call. Same files on the same branch must be a
+    no-op on the branch, not an empty commit per replay."""
+    fake = FakeGitHub()
+    claims = await _claims(session, keys)
+    context = ToolContext(claims=claims, session=session, checkpoint=session.commit)
+    args = OpenPrArgs(title="t", body="b", branch_slug="replay", paths=["src/app.py"])
+
+    async with fake.client() as client:
+        await open_pr(sandbox, _settings(), args, context, client=client)
+        await open_pr(sandbox, _settings(), args, context, client=client)
+
+    commit_posts = [
+        r for r in fake.requests if r.method == "POST" and r.url.path.endswith("/git/commits")
+    ]
+    assert len(commit_posts) == 1
+
+
+async def test_open_pr_publishes_the_files_content_read_from_the_sandbox(
+    sandbox: Sandbox, session: AsyncSession, keys: KeyPair
+) -> None:
+    """No new container code: this is `sandboxed.read_file` under the hood, so the blob
+    content warden sends to GitHub is exactly what is on disk in the sandbox."""
+    fake = FakeGitHub()
+    claims = await _claims(session, keys)
+    args = OpenPrArgs(title="t", body="b", branch_slug="content-check", paths=["src/app.py"])
+
+    async with fake.client() as client:
+        await open_pr(
+            sandbox,
+            _settings(),
+            args,
+            ToolContext(claims=claims, session=session, checkpoint=session.commit),
+            client=client,
+        )
+
+    blob_post = next(
+        r for r in fake.requests if r.method == "POST" and r.url.path.endswith("/git/blobs")
+    )
+    assert json.loads(blob_post.content)["content"] == "print('hello')\n"
+
+
+async def test_the_pr_body_names_the_task_and_files(
+    sandbox: Sandbox, session: AsyncSession, keys: KeyPair
+) -> None:
+    fake = FakeGitHub()
+    claims = await _claims(session, keys)
+    args = OpenPrArgs(
+        title="t", body="Fixed the race condition.", branch_slug="report", paths=["src/app.py"]
+    )
+
+    async with fake.client() as client:
+        await open_pr(
+            sandbox,
+            _settings(),
+            args,
+            ToolContext(claims=claims, session=session, checkpoint=session.commit),
+            client=client,
+        )
+
+    pr_post = next(r for r in fake.requests if r.method == "POST" and r.url.path.endswith("/pulls"))
+    body = json.loads(pr_post.content)["body"]
+    assert str(claims.task_id) in body
+    assert "src/app.py" in body
+    assert "Fixed the race condition." in body
+
+
+async def test_no_transaction_or_audit_lock_is_held_while_github_is_called(
+    sandbox: Sandbox,
+    session: AsyncSession,
+    session_factory: async_sessionmaker[AsyncSession],
+    keys: KeyPair,
+) -> None:
+    """`broker.get_credential` appends a `credential.granted` audit row, and `audit.append`
+    takes the chain's transaction-scoped advisory lock. If that transaction is still open
+    while GitHub is being called, every other task's audit write in the whole control plane
+    waits on GitHub's latency (ADR-019: no transaction open while waiting on the outside).
+
+    Observed from a second connection, from inside the fake GitHub, at the moment of each
+    request: the lock must be free and the grant must already be committed."""
+    fake = FakeGitHub()
+    claims = await _claims(session, keys)
+    await session.commit()
+    observed: list[tuple[bool, int]] = []
+
+    async def probing_handler(request: httpx.Request) -> httpx.Response:
+        async with session_factory() as other:
+            # A try-lock, never a blocking one: if the loop's session holds it, this returns
+            # false immediately instead of deadlocking the test. Released by the rollback.
+            free = await other.scalar(select(func.pg_try_advisory_xact_lock(_LOCK_KEY)))
+            granted = await other.scalar(
+                select(func.count())
+                .select_from(AuditLog)
+                .where(
+                    AuditLog.action == "credential.granted",
+                    AuditLog.target_id == str(claims.jti),
+                )
+            )
+            await other.rollback()
+        observed.append((bool(free), int(granted or 0)))
+        return fake.handler(request)
+
+    args = OpenPrArgs(title="t", body="b", branch_slug="no-lock", paths=["src/app.py"])
+    async with httpx.AsyncClient(transport=httpx.MockTransport(probing_handler)) as client:
+        await open_pr(
+            sandbox,
+            _settings(),
+            args,
+            ToolContext(claims=claims, session=session, checkpoint=session.commit),
+            client=client,
+        )
+
+    assert observed, "the fake GitHub was never called"
+    assert all(free for free, _ in observed), "the audit advisory lock was held during HTTP"
+    assert all(granted == 1 for _, granted in observed), "the grant was not committed first"
+
+
+# --- refusals: the token itself, judged by tools/gateway.py, not this module -----------------
+#
+# gateway.py's own test suite (test_gateway.py) already covers expired/revoked/wrong-task/
+# missing-scope refusals generically. What is specific to this tool is that `broker.
+# get_credential` is a second, independent check underneath the gateway's: a token that
+# passed the gateway (it carries `github:pr:open`, `required_scope`'s own check) but whose
+# scope the broker's static map does not recognise, or whose secret is not configured, must
+# still fail as a normal tool error, not a crash.
+
+
+async def test_open_pr_fails_as_a_tool_error_when_the_secret_is_not_configured(
+    sandbox: Sandbox, session: AsyncSession, keys: KeyPair
+) -> None:
+    claims = await _claims(session, keys)
+    args = OpenPrArgs(title="t", body="b", branch_slug="no-secret", paths=["src/app.py"])
+    unconfigured = Settings(github_token=SecretStr(""), github_repo="acme/widgets")
+
+    with pytest.raises(ToolError, match="credential denied"):
+        await open_pr(
+            sandbox,
+            unconfigured,
+            args,
+            ToolContext(claims=claims, session=session, checkpoint=session.commit),
+        )
+
+
+# --- conditional registration -----------------------------------------------------------------
+
+
+def test_build_registry_only_offers_github_open_pr_when_configured(
+    sandbox: Sandbox, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "warden.config.get_settings",
+        lambda: Settings(github_token=SecretStr(""), github_repo=""),
+    )
+    assert not build_registry(sandbox).has("github.open_pr")
+
+    monkeypatch.setattr("warden.config.get_settings", _settings)
+    assert build_registry(sandbox).has("github.open_pr")
+
+
+# --- end to end: nothing secret ever reaches the log (ADR-025, deliverable 5) -----------------
+
+
+async def _claimed_task(session: AsyncSession) -> Task:
+    user = User(email=f"{uuid.uuid4()}@warden.test", password_hash="x", role="worker")
+    session.add(user)
+    await session.flush()
+    await queue.enqueue(
+        session, user_id=user.id, spec="open a pr", idempotency_key=str(uuid.uuid4())
+    )
+    await session.commit()
+    claimed = await queue.claim(session, "worker-e2e")
+    assert claimed is not None
+    return claimed
+
+
+def _open_pr_step() -> ScriptStep:
+    return ScriptStep(
+        tool_calls=[
+            ProviderToolCall(
+                id="call-open-pr",
+                name="github.open_pr",
+                arguments={
+                    "title": "Add a feature",
+                    "body": "Closes the ticket.",
+                    "branch_slug": "e2e",
+                    "paths": ["src/app.py"],
+                },
+            )
+        ]
+    )
+
+
+def _finish_step(summary: str = "opened the PR") -> ScriptStep:
+    return ScriptStep(
+        tool_calls=[
+            ProviderToolCall(id="call-finish", name="finish", arguments={"summary": summary})
+        ]
+    )
+
+
+async def test_no_secret_or_agent_token_ever_reaches_the_log(
+    sandbox: Sandbox, session: AsyncSession, keys: KeyPair, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Runs a real task through github.open_pr end to end (approval requested, granted,
+    resumed, finished), against the real default policy and a fake GitHub, then scans every
+    task_events payload, every tool_calls row and every audit_log row this run produced for
+    the configured GitHub token and for every agent JWT the loop minted along the way.
+    Neither may appear anywhere: task_events/tool_calls go through core/events.py's
+    broker.redact() choke point, and the GitHub token itself is only ever read into an HTTP
+    header this module builds, never into a string this module raises or logs itself.
+    """
+    fake = FakeGitHub()
+    monkeypatch.setattr(
+        "warden.config.get_settings",
+        lambda: Settings(github_token=SecretStr(FAKE_TOKEN), github_repo="acme/widgets"),
+    )
+    # Captured before patching: the lambda below must build a *real* client, not recurse into
+    # itself through the module-global `httpx.AsyncClient` name it is about to replace.
+    real_async_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        "warden.tools.github.httpx.AsyncClient",
+        lambda *a, **k: real_async_client(transport=httpx.MockTransport(fake.handler)),
+    )
+
+    # A spy, not a mock: the real issue_agent_token still runs, its return value (the actual
+    # JWT string this task's tool calls were authorised with) is just also captured here, so
+    # the scan at the bottom has something concrete to look for.
+    minted_tokens: list[str] = []
+    original_issue = identity.issue_agent_token
+
+    async def _spy_issue(*args: object, **kwargs: object) -> str:
+        token = await original_issue(*args, **kwargs)  # type: ignore[arg-type]
+        minted_tokens.append(token)
+        return token
+
+    monkeypatch.setattr(identity, "issue_agent_token", _spy_issue)
+
+    audit_baseline = await session.scalar(select(func.max(AuditLog.id))) or 0
+    task = await _claimed_task(session)
+    policy = load_policy(DEFAULT_POLICY)
+    registry = build_registry(sandbox)
+
+    paused = await run_task(
+        session,
+        task,
+        FakeProvider([_open_pr_step()]),
+        registry,
+        policy,
+        workspace=pathlib.Path("."),
+        holder=task.claimed_by,
+        keys=keys,
+    )
+    assert paused.status == "WAITING_APPROVAL"
+
+    approval = (await session.scalars(select(Approval).where(Approval.task_id == task.id))).one()
+    await approvals.decide_approval(
+        session, approval.id, approve=True, user_id=task.user_id, note=None
+    )
+    await session.commit()
+
+    resumed = await queue.claim(session, "worker-e2e-2")
+    assert resumed is not None
+    await session.commit()
+    resume = rebuild(await read_events(session, task.id))
+
+    result = await run_task(
+        session,
+        resumed,
+        FakeProvider([_finish_step()]),
+        registry,
+        policy,
+        workspace=pathlib.Path("."),
+        resume=resume,
+        holder=resumed.claimed_by,
+        keys=keys,
+    )
+    assert result.status == "SUCCEEDED"
+    assert len(minted_tokens) == 1, "one per-call token, for the one ALLOW (approved) call"
+    assert fake.pulls, "the PR really was opened, this is not a vacuously passing scan"
+
+    # The scan.
+    event_payloads = [event.payload for event in await read_events(session, task.id)]
+    tool_calls = list(await session.scalars(select(ToolCall).where(ToolCall.task_id == task.id)))
+    audit_rows = list(await session.scalars(select(AuditLog).where(AuditLog.id > audit_baseline)))
+
+    haystack = "\n".join(
+        [
+            *(json.dumps(payload, default=str) for payload in event_payloads),
+            *(row.result_summary or "" for row in tool_calls),
+            *(row.error or "" for row in tool_calls),
+            *(json.dumps(row.args_safe, default=str) for row in tool_calls),
+            *(json.dumps(row.details, default=str) for row in audit_rows),
+        ]
+    )
+
+    assert FAKE_TOKEN not in haystack
+    for token in minted_tokens:
+        assert token not in haystack

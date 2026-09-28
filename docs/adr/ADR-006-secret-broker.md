@@ -160,3 +160,24 @@ a partir de uma string de mensagem.
 - Um segundo segredo (segundo provedor, ou um GitHub App por instalação) adiciona um campo em
   `Settings`, uma linha em `_SCOPE_TO_SETTING` e uma entrada em `_configured_secrets`; não pede
   mudança de forma no broker.
+
+## Addendum (ADR-025, `feat/github-gateway`): as duas lacunas que esta ADR deixou em aberto
+
+Duas frases desta ADR previam trabalho futuro específico, e as duas fecham juntas no mesmo PR:
+
+- **"a wave 4 (gateway MCP) precisa tratar essas três formas diferentes"**: `tools/gateway.py` é
+  esse gateway, e as três exceções deste módulo mapeiam para as duas que o gateway distingue.
+  `CredentialDenied`/`UnknownScope`/`SecretNotConfigured` nunca escapam de `tools/github.py`
+  como uma exceção Python crua: `github.open_pr` as captura e relança como `ToolError`, que o
+  loop já sabe transformar num `tool_result` com `is_error`, sem crashar a tarefa. A distinção
+  401/403 que o gateway faz é uma camada acima desta: sobre o *token do agente* (é live? tem o
+  scope que a tool exige?), não sobre o *segredo do GitHub* que o broker decide depois.
+- **"falta a wave 4 chamá-la [`redact()`] de fato em `structlog` e em `task_events`"**:
+  `core/events.py` agora chama `broker.redact()` em todo payload de evento e em todo
+  `result_summary`/`error` de `tool_calls`, o choke point único que o checklist da semana 3
+  ("`grep` em logs e em `task_events` não encontra o token do GitHub") pede. `structlog` ainda
+  não existe neste repo (chega na semana 7); quando chegar, herda o mesmo `redact()`.
+
+O que esta ADR não previa e o gateway trouxe: `get_credential` agora é chamado de dentro de um
+executor de tool (`tools/github.py::open_pr`), não só de teste, exatamente o caminho que o
+parágrafo de contexto original já apontava.

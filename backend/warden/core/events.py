@@ -15,6 +15,7 @@ from uuid import UUID
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from warden.identity import broker
 from warden.models import ModelCall, PolicyDecision, TaskEvent, ToolCall
 from warden.policy.engine import Decision
 from warden.providers.base import Completion
@@ -61,6 +62,26 @@ def redact_args(arguments: dict[str, Any]) -> dict[str, Any]:
     return safe
 
 
+def _redact_value(value: Any) -> Any:
+    """Walk a JSON-shaped value (what a `task_events.payload`/tool output always is) and run
+    every string leaf through `broker.redact()`, whatever shape it is nested in: a bare
+    string (`tool.executed`'s `output`), a list of strings (`policy.decided`'s `paths`), or a
+    dict (`tool.requested`'s `arguments`, already covered by `redact_args` for the *key*-based
+    case, but a value can also just happen to contain a secret verbatim, which is what this
+    catches). `redact_args`'s key-name rule and this value-scan are complementary, not
+    redundant: a `github_token` argument is masked outright by the first before this ever
+    runs, while a tool whose *output* echoes a token back under an innocuous key name
+    (`{"body": "used <token>"}`) is only caught by this one.
+    """
+    if isinstance(value, str):
+        return broker.redact(value)
+    if isinstance(value, dict):
+        return {key: _redact_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact_value(item) for item in value]
+    return value
+
+
 async def append_event(
     session: AsyncSession, task_id: UUID, event_type: str, payload: dict[str, Any] | None = None
 ) -> TaskEvent:
@@ -88,7 +109,9 @@ async def append_event(
         task_id=task_id,
         seq=(highest or 0) + 1,
         type=event_type,
-        payload=payload or {},
+        # The event log's one choke point for a secret in tool output (ADR-025, deliverable
+        # 4): whatever wrote this payload, nothing reaches the database before this.
+        payload=_redact_value(payload or {}),
     )
     session.add(event)
     await session.flush()
@@ -152,8 +175,10 @@ async def record_tool_call(
                 json.dumps(safe, sort_keys=True, default=str).encode()
             ).hexdigest(),
             decision=decision,
-            result_summary=result_summary,
-            error=error,
+            # Same choke point as `append_event`'s payload: the tool's own text, not just
+            # its arguments, can echo a secret back.
+            result_summary=_redact_value(result_summary),
+            error=_redact_value(error),
             duration_ms=duration_ms,
         )
     )

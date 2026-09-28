@@ -12,11 +12,16 @@ is not an option.
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ValidationError
 
 from warden.providers.base import ToolSchema
+
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from warden.identity.jwt import Claims
 
 
 class ToolError(Exception):
@@ -37,10 +42,35 @@ class InvalidArgumentsError(ToolError):
 
 
 @dataclass(frozen=True)
+class ToolContext:
+    """Identity handed to a tool registered with `needs_identity=True` (ADR-025).
+
+    `claims` is what `tools/gateway.py` already verified before this call reached the
+    registry: a live, task-bound token carrying whatever scope the tool required. `session`
+    is the loop's own session, so a tool that needs to spend a credential
+    (`identity.broker.get_credential`, which itself audits) writes its audit row there.
+
+    `checkpoint` is the loop's fenced commit (`core/loop.py::_checkpoint`). A tool that writes
+    through `session` must call it before it waits on anything outside the process (the
+    sandbox, GitHub): `audit.append` holds the audit chain's transaction-scoped advisory lock
+    until commit, so an uncommitted grant held across an HTTP call would block every other
+    task's audit writes for as long as GitHub takes to answer (ADR-019, ADR-007).
+    """
+
+    claims: "Claims"
+    session: "AsyncSession"
+    checkpoint: Callable[[], Awaitable[None]]
+
+
+@dataclass(frozen=True)
 class RegisteredTool:
     schema: ToolSchema
     args_model: type[BaseModel]
-    execute: Callable[[Any], Awaitable[str]]
+    # Two call shapes share this one slot: `execute(args)` for an ordinary tool,
+    # `execute(args, context)` when `needs_identity` is set. `Callable[..., Awaitable[str]]`
+    # rather than a stricter alias because the registry itself picks which shape to call
+    # (`ToolRegistry.execute`, below) based on `needs_identity`, not the type checker.
+    execute: Callable[..., Awaitable[str]]
     # Which argument carries a filesystem path, if any. The loop asks for this so it can
     # normalise that argument once and hand the same value to the policy engine.
     path_arg: str | None = None
@@ -49,6 +79,15 @@ class RegisteredTool:
     # arguments. Mutually exclusive with `path_arg` in practice: when both are set, the
     # inspector wins, because it is the more precise answer.
     path_inspector: Callable[[Any], Awaitable[list[str]]] | None = None
+    # The scope `tools/gateway.py` requires the call's token to carry before this tool ever
+    # runs. None means any live, task-bound token is enough, which is every tool before
+    # github.open_pr: the policy engine already decided the call may run, and there is no
+    # narrower credential underneath it to gate a second time.
+    required_scope: str | None = None
+    # True for a tool whose executor needs `ToolContext` (github.open_pr, so it can reach
+    # the secret broker). Kept a flag rather than inspecting `execute`'s arity: an explicit
+    # opt-in at registration is one line to read, a `inspect.signature` probe is not.
+    needs_identity: bool = False
 
 
 class ToolRegistry:
@@ -60,9 +99,11 @@ class ToolRegistry:
         name: str,
         description: str,
         args_model: type[BaseModel],
-        execute: Callable[[Any], Awaitable[str]],
+        execute: Callable[..., Awaitable[str]],
         path_arg: str | None = None,
         path_inspector: Callable[[Any], Awaitable[list[str]]] | None = None,
+        required_scope: str | None = None,
+        needs_identity: bool = False,
     ) -> None:
         if name in self._tools:
             raise ValueError(f"tool {name!r} is already registered")
@@ -76,11 +117,19 @@ class ToolRegistry:
             execute=execute,
             path_arg=path_arg,
             path_inspector=path_inspector,
+            required_scope=required_scope,
+            needs_identity=needs_identity,
         )
 
     def path_arg(self, name: str) -> str | None:
         tool = self._tools.get(name)
         return tool.path_arg if tool else None
+
+    def required_scope(self, name: str) -> str | None:
+        """The scope `tools/gateway.py` must find on a call's token before running `name`,
+        or None for a tool no narrower credential gates (every tool but github.open_pr)."""
+        tool = self._tools.get(name)
+        return tool.required_scope if tool else None
 
     def schemas(self) -> list[ToolSchema]:
         # Sorted so the tool list is byte-identical between runs. A varying tool order
@@ -102,13 +151,23 @@ class ToolRegistry:
             )
             raise InvalidArgumentsError(f"invalid arguments for {name!r}: {problems}") from exc
 
-    async def execute(self, name: str, arguments: dict[str, Any]) -> str:
+    async def execute(
+        self, name: str, arguments: dict[str, Any], *, context: ToolContext | None = None
+    ) -> str:
         tool = self._tools.get(name)
         if tool is None:
             known = ", ".join(sorted(self._tools)) or "none"
             raise UnknownToolError(f"unknown tool {name!r}; registered tools: {known}")
 
         validated = self._validate(name, tool, arguments)
+        if tool.needs_identity:
+            if context is None:
+                # A caller bug, not a model-facing refusal: `tools/gateway.py` is the only
+                # caller that ever has a `ToolContext` to give, so reaching here with none
+                # means something called `execute()` directly for a tool that requires the
+                # gateway's verification step first.
+                raise ToolError(f"tool {name!r} requires identity context but none was given")
+            return await tool.execute(validated, context)
         return await tool.execute(validated)
 
     async def touched_paths(self, name: str, arguments: dict[str, Any]) -> list[str | None]:

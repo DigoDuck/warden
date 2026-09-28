@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from warden.core import events
 from warden.core.events import read_events
 from warden.core.loop import run_task
+from warden.identity.jwt import KeyPair
 from warden.models import Task, ToolCall, User
 from warden.policy.engine import load_policy
 from warden.providers.base import ToolCall as ProviderToolCall
@@ -307,7 +308,7 @@ async def _a_task(session: AsyncSession, spec: str) -> Task:
 
 
 async def test_loop_denies_rm_rf_and_really_runs_the_allowed_test_command(
-    session: AsyncSession, target_repo_workspace: pathlib.Path
+    session: AsyncSession, keys: KeyPair, target_repo_workspace: pathlib.Path
 ) -> None:
     """The claim is stronger than "the tool refuses it": policy has to deny `rm -rf /`
     before the sandbox is ever asked to run it, while a command the same rules allow, and
@@ -331,6 +332,7 @@ async def test_loop_denies_rm_rf_and_really_runs_the_allowed_test_command(
             build_registry(sandbox),
             load_policy(DEFAULT_POLICY),
             workspace=target_repo_workspace,
+            keys=keys,
         )
     finally:
         await sandbox.destroy()

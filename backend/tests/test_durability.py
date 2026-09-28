@@ -17,6 +17,7 @@ from collections.abc import AsyncIterator
 from decimal import Decimal
 
 import pytest
+from cryptography.hazmat.primitives import serialization
 from pydantic import BaseModel
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -31,6 +32,7 @@ from warden.core.loop import _finish as _loop_finish
 from warden.core.worker import WORKSPACE as WORKER_WORKSPACE
 from warden.core.worker import Worker, run_claimed_task
 from warden.db import with_database
+from warden.identity.jwt import KeyPair
 from warden.models import ModelCall, Task, ToolCall, User
 from warden.policy.engine import Effect, Policy, Rule, load_policy
 from warden.providers.base import Completion
@@ -121,7 +123,7 @@ class _PausingProvider:
 
 
 async def test_a_run_in_progress_does_not_starve_the_heartbeat(
-    session_factory: async_sessionmaker[AsyncSession], workspace: pathlib.Path
+    session_factory: async_sessionmaker[AsyncSession], keys: KeyPair, workspace: pathlib.Path
 ) -> None:
     """Regression test for a real, confirmed defect, not a hypothesis.
 
@@ -153,6 +155,7 @@ async def test_a_run_in_progress_does_not_starve_the_heartbeat(
                 _allow_all(),
                 workspace,
                 FakeWorkspace().registry(),
+                keys=keys,
                 budget=BUDGET,
                 holder="worker-a",
             )
@@ -221,6 +224,7 @@ async def test_a_worker_that_lost_its_lease_writes_nothing_after_and_cannot_fini
 async def test_a_live_worker_that_loses_its_lease_stops_without_touching_what_is_no_longer_its(
     docker_available: None,
     session: AsyncSession,
+    keys: KeyPair,
     session_factory: async_sessionmaker[AsyncSession],
     workspace: pathlib.Path,
 ) -> None:
@@ -259,7 +263,7 @@ async def test_a_live_worker_that_loses_its_lease_stops_without_touching_what_is
         script = FakeProvider([ScriptStep(tool_calls=[read]), _finish()])
         return _PausingProvider(script, paused, release)
 
-    worker_a = Worker(session_factory, provider_factory, _allow_all(), workspace)
+    worker_a = Worker(session_factory, provider_factory, _allow_all(), workspace, keys)
     client = docker_sdk.from_env()
     running = asyncio.create_task(worker_a.run_once())
     try:
@@ -306,6 +310,7 @@ async def test_a_live_worker_that_loses_its_lease_stops_without_touching_what_is
 
 async def test_a_turns_tool_requests_all_commit_before_the_first_one_executes(
     session: AsyncSession,
+    keys: KeyPair,
     session_factory: async_sessionmaker[AsyncSession],
     workspace: pathlib.Path,
 ) -> None:
@@ -355,7 +360,9 @@ async def test_a_turns_tool_requests_all_commit_before_the_first_one_executes(
         ]
     )
 
-    result = await run_task(session, task, provider, registry, _allow_all(), workspace=workspace)
+    result = await run_task(
+        session, task, provider, registry, _allow_all(), workspace=workspace, keys=keys
+    )
 
     assert result.status == "SUCCEEDED"
     assert len(seen_at_first_execution) == 2
@@ -408,6 +415,7 @@ def _write_yaml(path: pathlib.Path, text_content: str) -> pathlib.Path:
 async def test_a_task_survives_the_worker_process_being_killed(
     docker_available: None,
     session: AsyncSession,
+    keys: KeyPair,
     session_factory: async_sessionmaker[AsyncSession],
     tmp_path: pathlib.Path,
 ) -> None:
@@ -480,7 +488,19 @@ script:
     )
 
     test_db_url = with_database(get_settings().database_url, TEST_DB)
-    env = {**os.environ, "DATABASE_URL": test_db_url}
+    # The worker entry point loads its signing key from disk and refuses to start without
+    # one. Hand it the suite's own ephemeral key through a temp file rather than relying on
+    # a `make keys` file on this machine: CI has none, and the in-process worker that
+    # resumes below signs with this same key, so both halves of the run agree.
+    key_path = tmp_path / "jwt-private.pem"
+    key_path.write_bytes(
+        keys.private_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+    )
+    env = {**os.environ, "DATABASE_URL": test_db_url, "JWT_PRIVATE_KEY_PATH": str(key_path)}
 
     client = docker_sdk.from_env()
     proc: subprocess.Popen[bytes] | None = None
@@ -559,6 +579,7 @@ script:
             resume_provider_factory,
             load_policy(policy_path),
             WORKER_WORKSPACE,
+            keys,
         )
         result = await worker2.run_once()
 
@@ -594,6 +615,7 @@ script:
 async def test_a_cancel_request_kills_a_long_running_tool_and_the_task_ends_cancelled(
     docker_available: None,
     session: AsyncSession,
+    keys: KeyPair,
     session_factory: async_sessionmaker[AsyncSession],
     workspace: pathlib.Path,
 ) -> None:
@@ -633,7 +655,7 @@ async def test_a_cancel_request_kills_a_long_running_tool_and_the_task_ends_canc
             ]
         )
 
-    worker = Worker(session_factory, provider_factory, _allow_all(), workspace)
+    worker = Worker(session_factory, provider_factory, _allow_all(), workspace, keys)
     client = docker_sdk.from_env()
     running = asyncio.create_task(worker.run_once())
     try:

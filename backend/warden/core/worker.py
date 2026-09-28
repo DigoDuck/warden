@@ -32,6 +32,7 @@ from warden.core import cancel, events, queue
 from warden.core.loop import Budget, RunResult, run_task
 from warden.core.replay import ResumeState, rebuild
 from warden.db import make_engine, make_session_factory
+from warden.identity.jwt import KeyPair, load_keys
 from warden.models import Task
 from warden.policy.engine import Policy, load_policy, never_readable
 from warden.providers.base import ModelProvider
@@ -213,6 +214,7 @@ async def run_claimed_task(
     workspace: pathlib.Path,
     registry: ToolRegistry,
     *,
+    keys: KeyPair,
     budget: Budget | None = None,
     holder: str | None = None,
 ) -> RunResult:
@@ -221,7 +223,8 @@ async def run_claimed_task(
     A task with no prior events starts fresh; one with history resumes. The caller does not
     have to know which, and neither does the loop. `holder` fences every checkpoint the run
     makes (ADR-019): the `Worker` below passes its own id, so a run that outlives its lease
-    stops with `LeaseLost` instead of writing over the next owner.
+    stops with `LeaseLost` instead of writing over the next owner. `keys` signs the per-call
+    agent tokens `core/loop.py` mints for every allowed tool call (ADR-025).
     """
     history = await events.read_events(session, task.id)
     resume: ResumeState | None = None
@@ -234,6 +237,7 @@ async def run_claimed_task(
         provider,
         registry,
         policy,
+        keys=keys,
         workspace=workspace,
         budget=budget,
         resume=resume,
@@ -306,6 +310,7 @@ class Worker:
         provider_factory: Callable[[], ModelProvider],
         policy: Policy,
         workspace: pathlib.Path,
+        keys: KeyPair,
         *,
         lease_seconds: int = queue.DEFAULT_LEASE_SECONDS,
         budget: Budget | None = None,
@@ -315,6 +320,11 @@ class Worker:
         self._provider_factory = provider_factory
         self._policy = policy
         self._workspace = workspace
+        # No `keys=None` bypass: every task this worker runs mints a per-call agent token
+        # (ADR-025), so a worker with no signing key cannot exist, only one that fails to
+        # start (`main()`'s `identity.load_keys()`, which already fails fast with a
+        # "run make keys" message).
+        self._keys = keys
         self._lease_seconds = lease_seconds
         self._budget = budget
         self._profile = profile or SandboxProfile()
@@ -326,13 +336,21 @@ class Worker:
         self._stopping.set()
 
     async def run_once(self) -> RunResult | None:
-        """Claim one task and run it. None means the queue was empty."""
-        async with self._sessions() as session:
-            task = await queue.claim(session, self.id, lease_seconds=self._lease_seconds)
-            await session.commit()
-            if task is None:
-                return None
-            task_id = task.id
+        """Claim one task and run it. None means the queue was empty, or the database was
+        briefly unreachable while claiming (see the `except` below): `run_forever` treats
+        both the same way, an idle poll's worth of backoff before trying again, which is
+        what turns a downed database (seen for real when Docker Desktop restarts) into a
+        worker that keeps polling instead of one that dies.
+        """
+        try:
+            async with self._sessions() as session:
+                task = await queue.claim(session, self.id, lease_seconds=self._lease_seconds)
+                await session.commit()
+        except _TRANSIENT_DB_ERRORS:
+            return None
+        if task is None:
+            return None
+        task_id = task.id
 
         beat = asyncio.create_task(_beat(self._sessions, task_id, self.id, self._lease_seconds))
         # The workspace volume is named after the task, so a sandbox created here attaches
@@ -367,6 +385,7 @@ class Worker:
                         self._policy,
                         self._workspace,
                         build_registry(sandbox),
+                        keys=self._keys,
                         budget=budget,
                         holder=self.id,
                     )
@@ -437,6 +456,11 @@ async def main() -> int:  # pragma: no cover - process entry point
     args = parser.parse_args()
 
     settings = get_settings()
+    # Fails fast with `identity.jwt.load_keys`'s own "run make keys" message when no key has
+    # been generated yet: a worker cannot run a single task without one to sign per-call
+    # agent tokens with (ADR-025), so finding out at the first claim, mid-run, would be worse
+    # than refusing to start at all.
+    keys = load_keys(settings)
     engine = make_engine(settings.database_url)
     sessions = make_session_factory(engine)
 
@@ -447,7 +471,7 @@ async def main() -> int:  # pragma: no cover - process entry point
         # approval or a crash) must continue the script, not replay it from step 0.
         return FakeProvider.from_yaml(args.script, resume_aware=True)
 
-    worker = Worker(sessions, provider_factory, load_policy(args.policy), WORKSPACE)
+    worker = Worker(sessions, provider_factory, load_policy(args.policy), WORKSPACE, keys)
 
     loop = asyncio.get_running_loop()
     for signame in ("SIGINT", "SIGTERM"):

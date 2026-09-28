@@ -1,9 +1,9 @@
 """Agent/user identity: issuing, verifying and revoking RS256 JWTs.
 
-`keys` is an ephemeral RSA pair built with `cryptography` directly (see `_kid_for`, imported
-from the module under test so both sides compute the same `kid`), never `identity.load_keys()`
-reading a file: neither this suite nor CI needs a key on disk. `issued_tokens` has a real
-foreign key to `tasks`, so an agent token needs a real task row, `task_id` builds one.
+`keys` (conftest.py) is an ephemeral RSA pair built with `cryptography` directly, never
+`identity.load_keys()` reading a file: neither this suite nor CI needs a key on disk.
+`issued_tokens` has a real foreign key to `tasks`, so an agent token needs a real task row,
+`task_id` builds one.
 """
 
 import asyncio
@@ -28,15 +28,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from warden import audit, identity
 from warden.config import Settings
 from warden.identity import generate_keys
-from warden.identity.jwt import ALGORITHM, AUDIENCE, ISSUER, KeyPair, _kid_for
+from warden.identity.jwt import ALGORITHM, AUDIENCE, ISSUER, KeyPair
 from warden.models import AuditLog, IssuedToken, Task, User
-
-
-@pytest.fixture(scope="session")
-def keys() -> KeyPair:
-    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    public_key = private_key.public_key()
-    return KeyPair(private_key=private_key, public_key=public_key, kid=_kid_for(public_key))
 
 
 @pytest.fixture

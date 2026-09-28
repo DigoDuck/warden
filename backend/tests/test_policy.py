@@ -181,6 +181,20 @@ def test_combine_scopes_are_the_union_when_every_decision_allows() -> None:
     assert combine([a, b]).scopes == ["repo:read", "repo:write"]
 
 
+def test_combine_scopes_survive_a_require_approval_effect() -> None:
+    """github.open_pr's own shape (ADR-025): every path matches open-pr-needs-human, which
+    carries github:pr:open, and no path is denied. core/loop.py has to know which scope to
+    put on the token it mints once a human approves the call, so REQUIRE_APPROVAL must not
+    erase scopes the way a DENY does (the case the test above this one covers): approving is
+    not yet a refusal, so it must not be treated as one here either."""
+    approval = _decision(
+        Effect.REQUIRE_APPROVAL, rules=["open-pr-needs-human"], scopes=["github:pr:open"]
+    )
+    combined = combine([approval])
+    assert combined.effect == Effect.REQUIRE_APPROVAL
+    assert combined.scopes == ["github:pr:open"]
+
+
 def test_combine_of_no_decisions_raises() -> None:
     with pytest.raises(ValueError, match="at least one"):
         combine([])

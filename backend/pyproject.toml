@@ -15,6 +15,10 @@ dependencies = [
     "pyjwt[crypto]>=2.10",
     "fastapi>=0.141.1",
     "uvicorn[standard]>=0.53.0",
+    # tools/github.py talks to the GitHub REST Git Data API over HTTP (ADR-025); moved out
+    # of dev because it is now a runtime call path, not only a test double
+    # (httpx.MockTransport), the way it was while only the FastAPI test client used it.
+    "httpx>=0.28.1",
 ]
 
 [dependency-groups]
@@ -24,7 +28,6 @@ dev = [
     "ruff>=0.8.0",
     "mypy>=1.14.0",
     "types-pyyaml>=6.0.12.20260906",
-    "httpx>=0.28.1",
 ]
 
 [build-system]

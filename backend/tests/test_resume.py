@@ -27,6 +27,7 @@ from warden.core.events import read_events
 from warden.core.loop import Budget, RunResult
 from warden.core.replay import rebuild
 from warden.core.worker import run_claimed_task
+from warden.identity.jwt import KeyPair
 from warden.models import ModelCall, Task, TaskEvent, ToolCall, User
 from warden.policy.engine import Effect, Policy, Rule
 from warden.providers.base import ToolCall as ProviderToolCall
@@ -94,6 +95,7 @@ async def _run(
     script: Sequence[ScriptStep],
     files: FakeWorkspace,
     workspace: pathlib.Path,
+    keys: KeyPair,
 ) -> RunResult:
     return await run_claimed_task(
         session,
@@ -102,6 +104,7 @@ async def _run(
         _allow_all(),
         workspace,
         files.registry(),
+        keys=keys,
         budget=BUDGET,
         # Fences every checkpoint against the claim `task` actually carries, the same as a
         # real `Worker` passing its own id. Every task here is legitimately held by whoever
@@ -112,7 +115,10 @@ async def _run(
 
 
 async def _crash_midway(
-    session_factory: async_sessionmaker[AsyncSession], task: Task, workspace: pathlib.Path
+    session_factory: async_sessionmaker[AsyncSession],
+    task: Task,
+    workspace: pathlib.Path,
+    keys: KeyPair,
 ) -> FakeWorkspace:
     """First worker: claims, runs iteration 1, and dies on the second of two tools.
 
@@ -130,7 +136,7 @@ async def _crash_midway(
         workspace_files.crash_after = 1
 
         with pytest.raises(RuntimeError, match="worker died"):
-            await _run(crashed, claim, [_two_reads(), _finish()], workspace_files, workspace)
+            await _run(crashed, claim, [_two_reads(), _finish()], workspace_files, workspace, keys)
         await crashed.rollback()
 
     assert workspace_files.executions == ["read_file"], "the first tool ran exactly once"
@@ -140,13 +146,14 @@ async def _crash_midway(
 async def test_a_crashed_run_resumes_and_no_tool_runs_twice(
     session: AsyncSession,
     session_factory: async_sessionmaker[AsyncSession],
+    keys: KeyPair,
     workspace: pathlib.Path,
 ) -> None:
     """The checklist item, end to end."""
     task = await _queued_task(session)
     await session.commit()
 
-    await _crash_midway(session_factory, task, workspace)
+    await _crash_midway(session_factory, task, workspace, keys)
 
     # The worker is gone. The lease expires and a second worker takes over.
     await queue.expire_lease_now(session, task.id)
@@ -156,7 +163,7 @@ async def test_a_crashed_run_resumes_and_no_tool_runs_twice(
     assert second_claim is not None and second_claim.id == task.id
 
     surviving = FakeWorkspace()
-    result = await _run(session, second_claim, [_finish("resumed")], surviving, workspace)
+    result = await _run(session, second_claim, [_finish("resumed")], surviving, workspace, keys)
     await session.commit()
 
     assert result.status == "SUCCEEDED"
@@ -174,12 +181,13 @@ async def test_a_crashed_run_resumes_and_no_tool_runs_twice(
 async def test_resuming_does_not_buy_the_interrupted_model_call_again(
     session: AsyncSession,
     session_factory: async_sessionmaker[AsyncSession],
+    keys: KeyPair,
     workspace: pathlib.Path,
 ) -> None:
     """The assistant turn is replayed from the log, not requested from the provider again."""
     task = await _queued_task(session)
     await session.commit()
-    await _crash_midway(session_factory, task, workspace)
+    await _crash_midway(session_factory, task, workspace, keys)
 
     before = await session.scalar(
         select(func.count()).select_from(ModelCall).where(ModelCall.task_id == task.id)
@@ -189,7 +197,7 @@ async def test_resuming_does_not_buy_the_interrupted_model_call_again(
     await queue.expire_lease_now(session, task.id)
     resumed = await queue.claim(session, "worker-live")
     assert resumed is not None
-    await _run(session, resumed, [_finish()], FakeWorkspace(), workspace)
+    await _run(session, resumed, [_finish()], FakeWorkspace(), workspace, keys)
     await session.commit()
 
     after = await session.scalar(
@@ -203,17 +211,18 @@ async def test_resuming_does_not_buy_the_interrupted_model_call_again(
 async def test_the_budget_is_not_reset_by_a_crash(
     session: AsyncSession,
     session_factory: async_sessionmaker[AsyncSession],
+    keys: KeyPair,
     workspace: pathlib.Path,
 ) -> None:
     """A crash is not a fresh allowance. Spending carries across the resume."""
     task = await _queued_task(session)
     await session.commit()
-    await _crash_midway(session_factory, task, workspace)
+    await _crash_midway(session_factory, task, workspace, keys)
 
     await queue.expire_lease_now(session, task.id)
     resumed = await queue.claim(session, "worker-live")
     assert resumed is not None
-    result = await _run(session, resumed, [_finish()], FakeWorkspace(), workspace)
+    result = await _run(session, resumed, [_finish()], FakeWorkspace(), workspace, keys)
 
     # FakeProvider costs nothing, so the number is zero either way. What matters is that it
     # came from the replayed log rather than from a counter that started over: the events
@@ -226,17 +235,18 @@ async def test_the_budget_is_not_reset_by_a_crash(
 async def test_a_resumed_task_leaves_one_coherent_event_log(
     session: AsyncSession,
     session_factory: async_sessionmaker[AsyncSession],
+    keys: KeyPair,
     workspace: pathlib.Path,
 ) -> None:
     """A resume must not write a second task.created or leave the log ending mid-iteration."""
     task = await _queued_task(session)
     await session.commit()
-    await _crash_midway(session_factory, task, workspace)
+    await _crash_midway(session_factory, task, workspace, keys)
 
     await queue.expire_lease_now(session, task.id)
     resumed = await queue.claim(session, "worker-live")
     assert resumed is not None
-    await _run(session, resumed, [_finish()], FakeWorkspace(), workspace)
+    await _run(session, resumed, [_finish()], FakeWorkspace(), workspace, keys)
     await session.commit()
 
     kinds = [event.type for event in await read_events(session, task.id)]
@@ -260,6 +270,7 @@ async def test_a_resumed_task_leaves_one_coherent_event_log(
 async def test_two_crashes_in_a_row_still_run_each_tool_once(
     session: AsyncSession,
     session_factory: async_sessionmaker[AsyncSession],
+    keys: KeyPair,
     workspace: pathlib.Path,
 ) -> None:
     """One crash is the case everyone tests. The second one is where the log gets reread
@@ -274,7 +285,7 @@ async def test_two_crashes_in_a_row_still_run_each_tool_once(
     task = await _queued_task(session)
     await session.commit()
 
-    await _crash_midway(session_factory, task, workspace)
+    await _crash_midway(session_factory, task, workspace, keys)
 
     # The second worker dies too, on the very tool it came back to run.
     await queue.expire_lease_now(session, task.id)
@@ -285,7 +296,7 @@ async def test_two_crashes_in_a_row_still_run_each_tool_once(
         second = FakeWorkspace()
         second.crash_after = 0
         with pytest.raises(RuntimeError, match="worker died"):
-            await _run(crashed, claim, [_finish()], second, workspace)
+            await _run(crashed, claim, [_finish()], second, workspace, keys)
         await crashed.rollback()
     assert second.executions == []
 
@@ -295,7 +306,7 @@ async def test_two_crashes_in_a_row_still_run_each_tool_once(
     assert third_claim is not None
 
     surviving = FakeWorkspace()
-    result = await _run(session, third_claim, [_finish("third time")], surviving, workspace)
+    result = await _run(session, third_claim, [_finish("third time")], surviving, workspace, keys)
     assert result.status == "SUCCEEDED"
 
     # The side effect itself: the pending read ran once, not once per crash it sat through.
@@ -349,7 +360,7 @@ def test_replay_reruns_an_iteration_that_never_got_its_model_call() -> None:
 
 
 async def test_a_task_with_no_history_simply_starts(
-    session: AsyncSession, workspace: pathlib.Path
+    session: AsyncSession, keys: KeyPair, workspace: pathlib.Path
 ) -> None:
     """Recovery is not a special path: the same call handles a task that never ran."""
     await _queued_task(session)
@@ -358,7 +369,7 @@ async def test_a_task_with_no_history_simply_starts(
     assert claim is not None
 
     registry = FakeWorkspace()
-    result = await _run(session, claim, [_two_reads(), _finish("ok")], registry, workspace)
+    result = await _run(session, claim, [_two_reads(), _finish("ok")], registry, workspace, keys)
 
     assert result.status == "SUCCEEDED"
     assert registry.executions == ["read_file", "read_file"]

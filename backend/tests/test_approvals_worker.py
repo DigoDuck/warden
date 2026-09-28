@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from warden.core import approvals, queue
 from warden.core.worker import Worker
+from warden.identity.jwt import KeyPair
 from warden.models import Approval, Task, ToolCall, User
 from warden.policy.engine import Effect, Policy, Rule
 from warden.providers.base import ToolCall as ProviderToolCall
@@ -91,6 +92,7 @@ def _finish() -> ScriptStep:
 
 
 async def test_a_real_worker_pauses_releases_and_a_second_one_resumes_after_approval(
+    keys: KeyPair,
     docker_available: None,
     session_factory: async_sessionmaker[AsyncSession],
     workspace: pathlib.Path,
@@ -115,7 +117,11 @@ async def test_a_real_worker_pauses_releases_and_a_second_one_resumes_after_appr
         user_id, task_id = user.id, task.id
 
     worker_a = Worker(
-        session_factory, lambda: FakeProvider([_run_echo()]), _require_approval_policy(), workspace
+        session_factory,
+        lambda: FakeProvider([_run_echo()]),
+        _require_approval_policy(),
+        workspace,
+        keys,
     )
     paused = await worker_a.run_once()
 
@@ -146,7 +152,11 @@ async def test_a_real_worker_pauses_releases_and_a_second_one_resumes_after_appr
         await decide.commit()
 
     worker_b = Worker(
-        session_factory, lambda: FakeProvider([_finish()]), _require_approval_policy(), workspace
+        session_factory,
+        lambda: FakeProvider([_finish()]),
+        _require_approval_policy(),
+        workspace,
+        keys,
     )
     finished = await worker_b.run_once()
 

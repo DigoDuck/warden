@@ -146,13 +146,18 @@ def combine(decisions: list[Decision]) -> Decision:
     but two paths). The most restrictive effect still wins, `matched_rules` is still the
     full union, and scopes still come only from the decisions that decided.
 
-    `scopes` is the one place this is stricter than a single evaluate(): they are handed
-    out only when *every* path was itself allowed. A call spanning N files is authorised as
-    one action, so a call where 9 paths are allowed and 1 is denied must not leak the
-    scopes of the 9, because `effect` on the combined decision is deny and those scopes
-    would otherwise look like they belonged to a call the control plane actually approved.
-    Since ALLOW is the least severe effect, "every decision is allow" and "the combined
-    effect is allow" are the same condition, checked once below.
+    `scopes` is the one place this is stricter than a single evaluate(): they are erased
+    whenever the combined effect is DENY. A call spanning N files is authorised as one
+    action, so a call where 9 paths are allowed and 1 is denied must not leak the scopes of
+    the 9, because `effect` on the combined decision is deny and those scopes would
+    otherwise look like they belonged to a call the control plane actually approved.
+
+    REQUIRE_APPROVAL keeps its scopes, unlike DENY: `deciding` (below) only ever holds
+    decisions at the winning severity, so if the combined effect is REQUIRE_APPROVAL no path
+    was denied, and core/loop.py needs to know which scope to mint a token with once a human
+    approves the call (ADR-025), the same way it would for a call that was ALLOW from the
+    start. Losing them here would silently downgrade every approved gateway call to the
+    fallback `tool:<name>` scope instead of the one the policy actually granted.
     """
     if not decisions:
         raise ValueError("combine() requires at least one decision")
@@ -169,9 +174,9 @@ def combine(decisions: list[Decision]) -> Decision:
         matched_rules=sorted({rule for decision in decisions for rule in decision.matched_rules}),
         reason=reason,
         scopes=(
-            sorted({scope for decision in decisions for scope in decision.scopes})
-            if effect is Effect.ALLOW
-            else []
+            []
+            if effect is Effect.DENY
+            else sorted({scope for decision in deciding for scope in decision.scopes})
         ),
         # Every decision folded here came from evaluating the same loaded Policy, so they
         # all carry the same hash; the first is as good as any other.
