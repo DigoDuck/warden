@@ -70,7 +70,9 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 BACKEND_DIR = REPO_ROOT / "backend"
 DEFAULT_DATASET = REPO_ROOT / "evals" / "datasets" / "behavioral_v1.yaml"
 DEFAULT_METRICS = REPO_ROOT / "docs" / "metrics.md"
-TEST_DB = os.environ.get("WARDEN_TEST_DB", "warden_test")
+# Not "warden_test": that is backend/tests/conftest.py's default, and this run drops and
+# recreates its database, so `make evals-behavioral` must not clobber a `make test` run.
+TEST_DB = os.environ.get("WARDEN_TEST_DB", "warden_evals")
 
 # github.open_pr is only registered by build_registry() when a repo and a token are both
 # set (ADR-025's "absent, not refusing" shape). Case 3 needs the tool to exist so the
@@ -748,7 +750,7 @@ async def _amain(dataset_path: pathlib.Path, *, should_write_metrics: bool) -> i
             duration = time.monotonic() - started
             rows.append((case, outcome, duration))
             marker = {"PASS": "PASS", "FAIL": "FAIL", "PENDING": "PEND"}[outcome.state]
-            detail = f" — {outcome.detail}" if outcome.detail else ""
+            detail = f" - {outcome.detail}" if outcome.detail else ""
             print(f"[{marker}] {case.id:>2} {case.key}{detail}")
 
     if should_write_metrics:

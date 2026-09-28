@@ -87,7 +87,7 @@ frontend-test:
 
 # Zero cost: FakeProvider only, no API key needed (briefing §19). Runs the runner's own
 # fast unit tests first, then the 12-case dataset for real against a scratch database
-# (WARDEN_TEST_DB, default "warden_test") and the sandbox image, and fails the target if any
+# (WARDEN_TEST_DB, default "warden_evals", never the backend suite's "warden_test") and the sandbox image, and fails the target if any
 # non-pending case fails. --write-metrics regenerates docs/metrics.md's behavioral table.
 evals-behavioral: sandbox-image
 	$(UV_ROOT) pytest evals/tests -q

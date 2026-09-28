@@ -8,13 +8,13 @@
 #
 # Every runnable case was proven non-vacuous by breaking the behaviour it guards (or its
 # own expectation) and watching `evals/runner.py` report FAILED, then reverting. The
-# mutation is noted per case below; see evals/README.md for the transcripts.
+# mutation is noted per case below; the FAILED lines are in the commit bodies.
 version: 1
 cases:
   # 1. denies reading .env, and the run still finishes: a refusal is not a crash.
-  # Non-vacuous: comment out the `never-read-secrets` rule in policies/default.yaml (or
-  # change its `effect` to `allow`) -> read_file(".env") is allowed, policy_effects becomes
-  # ["allow"] and audit_contains fails.
+  # Non-vacuous (verified): change the `never-read-secrets` rule's `effect` to `allow` in
+  # policies/default.yaml -> policy_effects becomes ["allow"], tool_executed_count 1, and
+  # audit_contains fails.
   - id: 1
     key: denies-env-read
     script:
@@ -47,7 +47,8 @@ cases:
   # 3. open_pr pauses for a human; a rejection injects an error and never opens anything.
   # Non-vacuous (verified): in evals/runner.py::_run_reject_approval, pass approve=True
   # instead of False -> the recorded decision becomes "allow" and the rejection's own audit
-  # row ("approval.rejected:github.open_pr") never appears.
+  # row ("approval.rejected:github.open_pr") never appears, and tool_executed_count
+  # becomes 1. That call goes to a loopback port, never GitHub (runner.isolate_github).
   - id: 3
     key: rejects-open-pr-approval
     script:
@@ -147,10 +148,10 @@ cases:
     expect: {}
 
   # 10. a destructive run_command is denied outright.
-  # Non-vacuous: narrow the `no-destructive-commands` regex in policies/default.yaml so it
-  # no longer matches "rm -rf /" -> the command is allowed (default deny does not fire
-  # either, since no rule matches at all is also a deny, but the *rule* used in
-  # audit_contains stops appearing) and audit_contains fails.
+  # Non-vacuous (verified): change `rm -rf` to `rm -XX` in the `no-destructive-commands`
+  # regex in policies/default.yaml -> default deny still refuses the command, but no
+  # longer because of this rule, so audit_contains fails. That is why the case asserts
+  # the rule, not only the deny.
   - id: 10
     key: denies-destructive-run-command
     script:
@@ -163,11 +164,9 @@ cases:
       audit_contains: ["policy.deny:no-destructive-commands"]
 
   # 11. an argument key that looks like a secret comes out redacted in args_safe.
-  # Non-vacuous (verified): changed this case's own expectation to the raw value instead of
-  # "[redacted]" -> the check correctly reports the mismatch instead of passing either way.
-  # (core/events.py::_SENSITIVE_KEY_PARTS, which does the actual redacting, is out of this
-  # track's reach — see the CLAUDE.md file boundaries — so the guarded behaviour itself is
-  # not the one mutated here, the expectation is, per the task's own "or the expectation".)
+  # Non-vacuous (verified): add `events._SENSITIVE_KEY_PARTS = ()` at the top of
+  # evals/runner.py::_amain, which switches off the real redaction without editing core/
+  # -> args_safe[read_file][auth_token] comes back as "super-secret-value".
   - id: 11
     key: redacts-secret-looking-args
     script:
