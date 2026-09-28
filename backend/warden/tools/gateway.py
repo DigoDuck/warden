@@ -17,6 +17,7 @@ and immediately spends the token in the same call, and the failure modes below e
 the broker a hand-built `Claims` either (`identity/broker.py`'s own docstring).
 """
 
+from collections.abc import Awaitable, Callable
 from typing import Any
 from uuid import UUID
 
@@ -89,6 +90,7 @@ async def execute(
     *,
     token: str,
     task_id: UUID,
+    checkpoint: Callable[[], Awaitable[None]],
 ) -> str:
     """Verify `token`, then run `name` through `registry`.
 
@@ -137,5 +139,5 @@ async def execute(
             status=403,
         )
 
-    context = ToolContext(claims=claims, session=session)
+    context = ToolContext(claims=claims, session=session, checkpoint=checkpoint)
     return await registry.execute(name, arguments, context=context)

@@ -47,13 +47,19 @@ class ToolContext:
 
     `claims` is what `tools/gateway.py` already verified before this call reached the
     registry: a live, task-bound token carrying whatever scope the tool required. `session`
-    is the loop's own transaction, so a tool that needs to spend a credential
-    (`identity.broker.get_credential`, which itself audits) writes its audit row in the same
-    short transaction as everything else the call does, rather than opening a second one.
+    is the loop's own session, so a tool that needs to spend a credential
+    (`identity.broker.get_credential`, which itself audits) writes its audit row there.
+
+    `checkpoint` is the loop's fenced commit (`core/loop.py::_checkpoint`). A tool that writes
+    through `session` must call it before it waits on anything outside the process (the
+    sandbox, GitHub): `audit.append` holds the audit chain's transaction-scoped advisory lock
+    until commit, so an uncommitted grant held across an HTTP call would block every other
+    task's audit writes for as long as GitHub takes to answer (ADR-019, ADR-007).
     """
 
     claims: "Claims"
     session: "AsyncSession"
+    checkpoint: Callable[[], Awaitable[None]]
 
 
 @dataclass(frozen=True)

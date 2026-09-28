@@ -769,7 +769,16 @@ async def _run_tools(
             assert token is not None
             try:
                 output = await gateway.execute(
-                    session, keys, registry, call.name, call.arguments, token=token, task_id=task_id
+                    session,
+                    keys,
+                    registry,
+                    call.name,
+                    call.arguments,
+                    token=token,
+                    task_id=task_id,
+                    # Fenced, like every other commit in this loop: a worker that lost its
+                    # lease must not commit a credential grant either.
+                    checkpoint=lambda: _checkpoint(session, task_id, holder),
                 )
                 error = None
             except ToolError as exc:

@@ -97,7 +97,14 @@ async def test_a_live_task_bound_token_runs_the_tool(session: AsyncSession, keys
     )
 
     output = await gateway.execute(
-        session, keys, _registry(recorder), "plain_tool", {}, token=token, task_id=task.id
+        session,
+        keys,
+        _registry(recorder),
+        "plain_tool",
+        {},
+        token=token,
+        task_id=task.id,
+        checkpoint=session.commit,
     )
 
     assert output == "plain ok"
@@ -114,7 +121,14 @@ async def test_a_tool_that_needs_identity_receives_the_verified_claims(
     )
 
     output = await gateway.execute(
-        session, keys, _registry(recorder), "scoped_tool", {}, token=token, task_id=task.id
+        session,
+        keys,
+        _registry(recorder),
+        "scoped_tool",
+        {},
+        token=token,
+        task_id=task.id,
+        checkpoint=session.commit,
     )
 
     assert output == f"scoped ok as agent:task:{task.id}"
@@ -146,7 +160,14 @@ async def test_an_expired_token_is_never_executed_and_is_audited(
 
     with pytest.raises(ToolError, match="401"):
         await gateway.execute(
-            session, keys, _registry(recorder), "plain_tool", {}, token=token, task_id=task.id
+            session,
+            keys,
+            _registry(recorder),
+            "plain_tool",
+            {},
+            token=token,
+            task_id=task.id,
+            checkpoint=session.commit,
         )
 
     assert recorder.calls == []
@@ -169,7 +190,14 @@ async def test_a_revoked_token_is_never_executed_and_is_audited(
 
     with pytest.raises(ToolError, match="401"):
         await gateway.execute(
-            session, keys, _registry(recorder), "plain_tool", {}, token=token, task_id=task.id
+            session,
+            keys,
+            _registry(recorder),
+            "plain_tool",
+            {},
+            token=token,
+            task_id=task.id,
+            checkpoint=session.commit,
         )
 
     assert recorder.calls == []
@@ -196,6 +224,7 @@ async def test_a_token_minted_for_another_task_is_never_executed(
             {},
             token=token,
             task_id=running_task.id,
+            checkpoint=session.commit,
         )
 
     assert recorder.calls == []
@@ -217,7 +246,14 @@ async def test_a_token_missing_the_required_scope_is_never_executed(
 
     with pytest.raises(ToolError, match="403"):
         await gateway.execute(
-            session, keys, _registry(recorder), "scoped_tool", {}, token=token, task_id=task.id
+            session,
+            keys,
+            _registry(recorder),
+            "scoped_tool",
+            {},
+            token=token,
+            task_id=task.id,
+            checkpoint=session.commit,
         )
 
     assert recorder.calls == []
@@ -236,7 +272,50 @@ async def test_a_tool_with_no_required_scope_is_not_scope_checked(
     token = await identity.issue_agent_token(session, keys, task_id=task.id, scopes=["repo:read"])
 
     output = await gateway.execute(
-        session, keys, _registry(recorder), "plain_tool", {}, token=token, task_id=task.id
+        session,
+        keys,
+        _registry(recorder),
+        "plain_tool",
+        {},
+        token=token,
+        task_id=task.id,
+        checkpoint=session.commit,
     )
 
     assert output == "plain ok"
+
+
+# --- no transaction held open while the tool runs (ADR-019) --------------------------------
+
+
+async def test_the_tool_runs_with_no_transaction_left_open_by_verification(
+    session: AsyncSession, keys: KeyPair
+) -> None:
+    """`identity.verify` reads `issued_tokens`, which begins a transaction on the loop's
+    session. Left open, it would sit idle-in-transaction for as long as the tool runs (a
+    `run_command` in the sandbox can take minutes), exactly what ADR-019 forbids. The tool
+    itself reports what it saw, from inside the call."""
+    task = await _task(session)
+    seen: list[bool] = []
+
+    async def probe(args: object) -> str:
+        seen.append(session.in_transaction())
+        return "ok"
+
+    registry = ToolRegistry()
+    registry.register(name="probe", description="", args_model=_NoArgs, execute=probe)
+    token = await identity.issue_agent_token(session, keys, task_id=task.id, scopes=["tool:probe"])
+    await session.commit()
+
+    await gateway.execute(
+        session,
+        keys,
+        registry,
+        "probe",
+        {},
+        token=token,
+        task_id=task.id,
+        checkpoint=session.commit,
+    )
+
+    assert seen == [False], "the verification read's transaction was still open during the tool"

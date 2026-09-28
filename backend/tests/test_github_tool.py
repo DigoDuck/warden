@@ -17,9 +17,10 @@ import httpx
 import pytest
 from pydantic import SecretStr
 from sqlalchemy import func, select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from warden import identity
+from warden.audit.log import _LOCK_KEY
 from warden.config import Settings
 from warden.core import approvals, queue
 from warden.core.events import read_events
@@ -194,7 +195,11 @@ async def test_open_pr_runs_the_full_git_data_sequence_and_opens_a_pr(
 
     async with fake.client() as client:
         result = await open_pr(
-            sandbox, _settings(), args, ToolContext(claims=claims, session=session), client=client
+            sandbox,
+            _settings(),
+            args,
+            ToolContext(claims=claims, session=session, checkpoint=session.commit),
+            client=client,
         )
 
     assert "opened PR #1" in result
@@ -220,10 +225,18 @@ async def test_open_pr_is_idempotent_for_the_same_task_and_branch(
 
     async with fake.client() as client:
         first = await open_pr(
-            sandbox, _settings(), args, ToolContext(claims=claims, session=session), client=client
+            sandbox,
+            _settings(),
+            args,
+            ToolContext(claims=claims, session=session, checkpoint=session.commit),
+            client=client,
         )
         second = await open_pr(
-            sandbox, _settings(), args, ToolContext(claims=claims, session=session), client=client
+            sandbox,
+            _settings(),
+            args,
+            ToolContext(claims=claims, session=session, checkpoint=session.commit),
+            client=client,
         )
 
     assert first == second
@@ -243,7 +256,11 @@ async def test_open_pr_publishes_the_files_content_read_from_the_sandbox(
 
     async with fake.client() as client:
         await open_pr(
-            sandbox, _settings(), args, ToolContext(claims=claims, session=session), client=client
+            sandbox,
+            _settings(),
+            args,
+            ToolContext(claims=claims, session=session, checkpoint=session.commit),
+            client=client,
         )
 
     blob_post = next(
@@ -263,7 +280,11 @@ async def test_the_pr_body_names_the_task_and_files(
 
     async with fake.client() as client:
         await open_pr(
-            sandbox, _settings(), args, ToolContext(claims=claims, session=session), client=client
+            sandbox,
+            _settings(),
+            args,
+            ToolContext(claims=claims, session=session, checkpoint=session.commit),
+            client=client,
         )
 
     pr_post = next(r for r in fake.requests if r.method == "POST" and r.url.path.endswith("/pulls"))
@@ -271,6 +292,56 @@ async def test_the_pr_body_names_the_task_and_files(
     assert str(claims.task_id) in body
     assert "src/app.py" in body
     assert "Fixed the race condition." in body
+
+
+async def test_no_transaction_or_audit_lock_is_held_while_github_is_called(
+    sandbox: Sandbox,
+    session: AsyncSession,
+    session_factory: async_sessionmaker[AsyncSession],
+    keys: KeyPair,
+) -> None:
+    """`broker.get_credential` appends a `credential.granted` audit row, and `audit.append`
+    takes the chain's transaction-scoped advisory lock. If that transaction is still open
+    while GitHub is being called, every other task's audit write in the whole control plane
+    waits on GitHub's latency (ADR-019: no transaction open while waiting on the outside).
+
+    Observed from a second connection, from inside the fake GitHub, at the moment of each
+    request: the lock must be free and the grant must already be committed."""
+    fake = FakeGitHub()
+    claims = await _claims(session, keys)
+    await session.commit()
+    observed: list[tuple[bool, int]] = []
+
+    async def probing_handler(request: httpx.Request) -> httpx.Response:
+        async with session_factory() as other:
+            # A try-lock, never a blocking one: if the loop's session holds it, this returns
+            # false immediately instead of deadlocking the test. Released by the rollback.
+            free = await other.scalar(select(func.pg_try_advisory_xact_lock(_LOCK_KEY)))
+            granted = await other.scalar(
+                select(func.count())
+                .select_from(AuditLog)
+                .where(
+                    AuditLog.action == "credential.granted",
+                    AuditLog.target_id == str(claims.jti),
+                )
+            )
+            await other.rollback()
+        observed.append((bool(free), int(granted or 0)))
+        return fake.handler(request)
+
+    args = OpenPrArgs(title="t", body="b", branch_slug="no-lock", paths=["src/app.py"])
+    async with httpx.AsyncClient(transport=httpx.MockTransport(probing_handler)) as client:
+        await open_pr(
+            sandbox,
+            _settings(),
+            args,
+            ToolContext(claims=claims, session=session, checkpoint=session.commit),
+            client=client,
+        )
+
+    assert observed, "the fake GitHub was never called"
+    assert all(free for free, _ in observed), "the audit advisory lock was held during HTTP"
+    assert all(granted == 1 for _, granted in observed), "the grant was not committed first"
 
 
 # --- refusals: the token itself, judged by tools/gateway.py, not this module -----------------
@@ -291,7 +362,12 @@ async def test_open_pr_fails_as_a_tool_error_when_the_secret_is_not_configured(
     unconfigured = Settings(github_token=SecretStr(""), github_repo="acme/widgets")
 
     with pytest.raises(ToolError, match="credential denied"):
-        await open_pr(sandbox, unconfigured, args, ToolContext(claims=claims, session=session))
+        await open_pr(
+            sandbox,
+            unconfigured,
+            args,
+            ToolContext(claims=claims, session=session, checkpoint=session.commit),
+        )
 
 
 # --- conditional registration -----------------------------------------------------------------
