@@ -1,8 +1,13 @@
-.PHONY: db-up db-down migrate revision test lint fmt sandbox-image demo-fake demo worker keys api user-token frontend-install frontend-dev frontend-test
+.PHONY: db-up db-down migrate revision test lint fmt sandbox-image demo-fake demo worker keys api user-token frontend-install frontend-dev frontend-test evals-behavioral
 
 # --directory avoids "cd backend &&", which breaks when the Windows make picks
 # cmd.exe instead of sh. Each recipe stays a single command.
 UV := uv run --directory backend
+# --project, not --directory: evals/ lives at the repo root, a sibling of backend/, not
+# inside it (see evals/__init__.py for why). --project points uv at backend's locked
+# dependencies without changing the working directory, so `evals/datasets/*.yaml` and the
+# package's own relative imports resolve from the repo root the ordinary way.
+UV_ROOT := uv run --project backend
 # --prefix, same reason: no "cd frontend &&" to break under cmd.exe.
 NPM := npm --prefix frontend
 
@@ -79,3 +84,11 @@ frontend-dev:
 
 frontend-test:
 	$(NPM) test -- --run
+
+# Zero cost: FakeProvider only, no API key needed (briefing §19). Runs the runner's own
+# fast unit tests first, then the 12-case dataset for real against a scratch database
+# (WARDEN_TEST_DB, default "warden_test") and the sandbox image, and fails the target if any
+# non-pending case fails. --write-metrics regenerates docs/metrics.md's behavioral table.
+evals-behavioral: sandbox-image
+	$(UV_ROOT) pytest evals/tests -q
+	$(UV_ROOT) python -m evals.runner evals/datasets/behavioral_v1.yaml --write-metrics
