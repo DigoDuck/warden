@@ -40,6 +40,23 @@ def list_widgets() -> list[Widget]:
     return list(_WIDGETS.values())
 
 
+# Declared before /widgets/{widget_id}: FastAPI/Starlette match routes in
+# declaration order, and a path converter isn't pinned to int in the route
+# string below, so "search" or "stats" would otherwise be swallowed by the
+# {widget_id} route first and rejected as an invalid int.
+@app.get("/widgets/search")
+def search_widgets(q: str = "") -> list[Widget]:
+    """Return widgets whose name contains the query string."""
+    return [widget for widget in _WIDGETS.values() if q in widget.name]
+
+
+@app.get("/widgets/stats")
+def widget_stats() -> dict[str, float]:
+    """Return the average widget price, in cents."""
+    total = sum(widget.price_cents for widget in _WIDGETS.values())
+    return {"average_price_cents": total}
+
+
 @app.get("/widgets/{widget_id}")
 def get_widget(widget_id: int) -> Widget:
     widget = _WIDGETS.get(widget_id)
