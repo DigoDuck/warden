@@ -46,6 +46,9 @@ def test_request_is_logged_with_method_path_and_status(caplog) -> None:
     assert "GET" in joined
     assert "/widgets" in joined
     assert "200" in joined
+    # "exactly one log record" per request: count the records that mention it.
+    mentions = [record for record in caplog.records if "/widgets" in record.getMessage()]
+    assert len(mentions) == 1
 
 
 def test_support_key_header_value_never_reaches_the_log(caplog) -> None:
