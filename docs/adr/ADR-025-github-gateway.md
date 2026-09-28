@@ -52,9 +52,23 @@ qualquer que seja o status final. Nenhum sobrevive ao fim da tarefa que o emitiu
    quanto um forjado.
 3. Se a tool declarou `required_scope` no registro (`registry.register(..., required_scope=
    "github:pr:open")`), exige que o token carregue esse escopo.
-4. Só então chama `registry.execute`, passando um `ToolContext(claims, session)` para as
-   tools que pediram identidade (`needs_identity=True` no registro — hoje só `github.open_pr`;
-   toda tool existente mantém a assinatura de um argumento só).
+4. Fecha a transação que a leitura de `verify()` abriu, com o commit cercado do loop
+   (`checkpoint`), e só então chama `registry.execute`, passando um
+   `ToolContext(claims, session, checkpoint)` para as tools que pediram identidade
+   (`needs_identity=True` no registro — hoje só `github.open_pr`; toda tool existente mantém a
+   assinatura de um argumento só).
+
+**Nenhuma transação aberta durante a tool (correção da revisão).** A primeira versão deixava
+aberta a transação da leitura de `verify()` durante toda a execução da tool, e
+`github.open_pr` gravava o `credential.granted` do broker e seguia para o sandbox e para o
+GitHub sem commitar. `audit.append` segura o advisory lock da cadeia de audit até o fim da
+transação (ADR-007), então cada chamada ao GitHub travava a escrita de audit de todas as outras
+tarefas pelo tempo que o GitHub levasse para responder: exatamente o defeito que a ADR-019
+proíbe. Agora o gateway commita depois de verificar, e `open_pr` chama `context.checkpoint()`
+logo depois de receber a credencial, antes de qualquer leitura no sandbox ou request HTTP. O
+checkpoint é o cercado (`_checkpoint` com `holder`): um worker que perdeu o lease para ali,
+antes de a tool rodar. Os testes observam o estado real de uma segunda conexão, de dentro do
+GitHub falso: o lock livre e o grant já commitado.
 
 Qualquer recusa (`InvalidToken` → 401/`tool.auth_failed`, escopo faltando → 403/
 `tool.forbidden`) grava uma linha de audit antes de devolver o erro, e a tool nunca roda. As

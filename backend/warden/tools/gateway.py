@@ -139,5 +139,11 @@ async def execute(
             status=403,
         )
 
+    # `verify()` just read `issued_tokens`, which began a transaction on the loop's session.
+    # End it before the tool runs: a sandbox command can take minutes, and ADR-019 allows no
+    # transaction to stay open while this process waits on something outside it. Nothing is
+    # pending here (checkpoint (c) committed just before), so this only closes the read; it
+    # is the fenced commit, so a worker that lost its lease stops here, before the tool runs.
+    await checkpoint()
     context = ToolContext(claims=claims, session=session, checkpoint=checkpoint)
     return await registry.execute(name, arguments, context=context)

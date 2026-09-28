@@ -139,6 +139,11 @@ async def open_pr(
         )
     except (broker.CredentialDenied, broker.UnknownScope, broker.SecretNotConfigured) as exc:
         raise ToolError(f"github.open_pr: credential denied: {exc}") from exc
+    # Commit the `credential.granted` row now, before any sandbox read or HTTP call:
+    # `audit.append` holds the audit chain's advisory lock until this transaction ends, and
+    # every other task's audit write would otherwise queue behind GitHub's latency. A refusal
+    # above needs no commit here: its row is flushed and the loop's checkpoint (d) commits it.
+    await context.checkpoint()
 
     owner, _, repo = settings.github_repo.partition("/")
     branch = _branch_name(task_id, args.branch_slug)
