@@ -27,8 +27,8 @@ from warden.tools.registry import ToolContext, ToolError
 from warden.tools.sandboxed import ReadFileArgs, read_file
 
 # refs/heads/warden/<task_id[:8]>-<slug>: short enough to read in a branch list, and the
-# `warden/` prefix is this control plane's own namespace, never touched by anything else, so
-# force-updating a ref under it is always safe (see `_upsert_ref`).
+# `warden/` prefix marks it as this control plane's. Updates are fast-forward only (see
+# `open_pr`), so even a branch someone else pushed under this prefix is never rewritten.
 _BRANCH_PREFIX = "warden"
 
 
@@ -64,7 +64,13 @@ def _pr_report(task_id: UUID | None, paths: list[str], summary: str) -> str:
 
 
 async def _request(
-    client: httpx.AsyncClient, method: str, url: str, headers: dict[str, str], **kwargs: Any
+    client: httpx.AsyncClient,
+    method: str,
+    url: str,
+    headers: dict[str, str],
+    *,
+    missing_ok: bool = False,
+    **kwargs: Any,
 ) -> Any:
     """One HTTP call, GitHub's error body surfaced as a `ToolError` the model can react to
     instead of an `httpx` exception taking the whole task down. Never includes the token:
@@ -74,44 +80,14 @@ async def _request(
     """
     try:
         response = await client.request(method, url, headers=headers, **kwargs)
+        if missing_ok and response.status_code == 404:
+            return None
         response.raise_for_status()
     except httpx.HTTPStatusError as exc:
         raise ToolError(f"github.open_pr: {method} {url} failed: {exc}") from exc
     except httpx.HTTPError as exc:
         raise ToolError(f"github.open_pr: could not reach GitHub: {exc}") from exc
     return response.json() if response.content else None
-
-
-async def _upsert_ref(
-    client: httpx.AsyncClient, headers: dict[str, str], ref_url: str, sha: str
-) -> None:
-    """Create the branch, or move it to `sha` if it already exists.
-
-    `force: true` on the update is safe only because `_BRANCH_PREFIX` is this control plane's
-    own namespace: nothing else ever pushes to a `warden/*` branch, so there is no history on
-    it a force-update could ever discard that this same tool did not itself just supersede.
-
-    `ref_url` (the caller's `.../git/ref/heads/<branch>`, singular) is only ever right for the
-    GET: GitHub's own API is inconsistent here, and creating or updating a reference is
-    `POST .../git/refs` / `PATCH .../git/refs/<ref>` (plural), never the singular form the read
-    uses. Reusing `ref_url` for the PATCH too, an earlier version of this function did, sends a
-    real request to a URL the real API does not update, silently failing to move the branch.
-    """
-    existing = await client.get(ref_url, headers=headers)
-    base, _, ref_path = ref_url.rpartition("/git/ref/")
-    if existing.status_code == 404:
-        await _request(
-            client,
-            "POST",
-            f"{base}/git/refs",
-            headers,
-            json={"ref": f"refs/{ref_path}", "sha": sha},
-        )
-        return
-    existing.raise_for_status()
-    await _request(
-        client, "PATCH", f"{base}/git/refs/{ref_path}", headers, json={"sha": sha, "force": True}
-    )
 
 
 async def open_pr(
@@ -154,10 +130,21 @@ async def open_pr(
     repo_url = f"{settings.github_api_url}/repos/{owner}/{repo}"
 
     async def _run(http: httpx.AsyncClient) -> str:
-        base_ref = await _request(http, "GET", f"{repo_url}/git/ref/heads/{args.base}", headers)
-        base_sha = base_ref["object"]["sha"]
-        base_commit = await _request(http, "GET", f"{repo_url}/git/commits/{base_sha}", headers)
-        base_tree_sha = base_commit["tree"]["sha"]
+        # Build on the task's branch when it already exists, on the base branch otherwise.
+        # Never a force-update: rebuilding on the base and force-moving the branch (what an
+        # earlier version did) silently dropped every file an earlier call of this same task
+        # had published from a PR that may already be under review. A fast-forward from the
+        # branch's own head keeps them, and the real API refuses anything else (422).
+        head = await _request(
+            http, "GET", f"{repo_url}/git/ref/heads/{branch}", headers, missing_ok=True
+        )
+        if head is None:
+            base_ref = await _request(http, "GET", f"{repo_url}/git/ref/heads/{args.base}", headers)
+            parent_sha = base_ref["object"]["sha"]
+        else:
+            parent_sha = head["object"]["sha"]
+        parent = await _request(http, "GET", f"{repo_url}/git/commits/{parent_sha}", headers)
+        parent_tree_sha = parent["tree"]["sha"]
 
         tree_entries = []
         for path in args.paths:
@@ -178,16 +165,40 @@ async def open_pr(
             "POST",
             f"{repo_url}/git/trees",
             headers,
-            json={"base_tree": base_tree_sha, "tree": tree_entries},
+            json={"base_tree": parent_tree_sha, "tree": tree_entries},
         )
-        commit = await _request(
-            http,
-            "POST",
-            f"{repo_url}/git/commits",
-            headers,
-            json={"message": f"warden: {args.title}", "tree": tree["sha"], "parents": [base_sha]},
-        )
-        await _upsert_ref(http, headers, f"{repo_url}/git/ref/heads/{branch}", commit["sha"])
+        # Trees are content-addressed: the same files on the same parent give back the
+        # parent's own tree. That is a replay (ADR-019's at-least-once window: GitHub
+        # answered, the process died before `tool.executed` committed), and it leaves the
+        # branch exactly where it is instead of stacking an empty commit per retry.
+        if head is None or tree["sha"] != parent_tree_sha:
+            commit = await _request(
+                http,
+                "POST",
+                f"{repo_url}/git/commits",
+                headers,
+                json={
+                    "message": f"warden: {args.title}",
+                    "tree": tree["sha"],
+                    "parents": [parent_sha],
+                },
+            )
+            if head is None:
+                await _request(
+                    http,
+                    "POST",
+                    f"{repo_url}/git/refs",
+                    headers,
+                    json={"ref": f"refs/heads/{branch}", "sha": commit["sha"]},
+                )
+            else:
+                await _request(
+                    http,
+                    "PATCH",
+                    f"{repo_url}/git/refs/heads/{branch}",
+                    headers,
+                    json={"sha": commit["sha"], "force": False},
+                )
 
         # Idempotency (ADR-025): same task -> same branch -> the same open PR is returned
         # instead of a second one being opened. `head` is qualified with the owner, GitHub's

@@ -99,10 +99,11 @@ alcançar depois, e nenhuma delas é um único choke point. A API HTTP tem exata
 onde o segredo existe em texto claro: o header `Authorization` desta chamada, montado uma vez
 (`credential.reveal()`) e nunca copiado para uma string que este módulo loga ou levanta.
 
-Sequência: ref da branch base → commit base → tree base; um blob por arquivo (lido do sandbox
-da tarefa via `sandboxed.read_file`, sem código novo de container); uma tree nova em cima da
-base; um commit; a branch `warden/<task_id[:8]>-<slug>` criada ou movida para o commit novo
-(`_upsert_ref`); por fim a PR, ou a PR aberta já existente para essa branch.
+Sequência: a branch `warden/<task_id[:8]>-<slug>`, se já existe, senão a branch base → o commit
+dela → a tree dele; um blob por arquivo (lido do sandbox da tarefa via `sandboxed.read_file`,
+sem código novo de container); uma tree nova em cima dessa; um commit cujo pai é a ponta da
+branch; a branch criada, ou avançada em fast-forward (`force: false`); por fim a PR, ou a PR
+aberta já existente para essa branch.
 
 ### Idempotência: a branch é a chave, não uma tabela nova
 
@@ -110,9 +111,16 @@ Mesma tarefa, mesmo `branch_slug` → mesmo nome de branch (`_branch_name` é de
 `task_id` truncado, sem aleatoriedade). Antes de abrir uma PR, `open_pr` pergunta ao GitHub se
 já existe uma PR aberta para essa `head`; se sim, devolve ela em vez de abrir uma segunda. Não
 existe uma segunda estrutura de idempotência (uma tabela, uma chave) porque o nome da branch já
-é a chave, e o GitHub já é a fonte de verdade de "existe uma PR para esta branch". O resto do
-fluxo (blobs, tree, commit, atualização da branch) roda de novo a cada chamada — só o último
-passo, abrir a PR, é o que se repete sem duplicar.
+é a chave, e o GitHub já é a fonte de verdade de "existe uma PR para esta branch".
+
+**Fast-forward, nunca force (correção da revisão).** A primeira versão refazia o commit em cima
+da base a cada chamada e movia a branch com `force: true`. Uma segunda publicação da mesma
+tarefa (o agente corrigiu algo depois de abrir a PR) apagava da PR, sem aviso, os arquivos da
+primeira. Agora o commit novo tem como pai a ponta da própria branch e a atualização é
+fast-forward; a API real recusa qualquer outra coisa com 422. E como trees são endereçadas por
+conteúdo, republicar os mesmos arquivos devolve a mesma tree do pai: nesse caso nenhum commit é
+criado e a branch fica onde está. É o que torna idempotente o replay da janela at-least-once da
+ADR-019 (o GitHub respondeu, o processo morreu antes do `tool.executed`).
 
 ### Escopo dos paths, igual a `apply_patch`
 
@@ -185,10 +193,10 @@ GitHub é uma fonte de verdade só, e é a que já manda.
 - **O que isto não protege:** um segredo colado dentro de um arquivo que `github.open_pr`
   publica (o conteúdo do arquivo vira o corpo de um blob, e nada aqui varre conteúdo de
   arquivo por padrão de segredo — esse é o trabalho de um scanner no repo alvo, gitleaks já
-  está no plano do CI). Nem o `force: true` do `_upsert_ref`: é seguro só porque `warden/*` é
-  namespace exclusivo deste control plane; uma branch de terceiro com esse prefixo teria seu
-  histórico sobrescrito sem aviso — mitigação real é o repositório proteger o padrão
-  `warden/*` nas suas branch protection rules, fora do escopo deste código.
+  está no plano do CI). Nem uma colisão dos 8 primeiros caracteres do `task_id` com o mesmo
+  slug (32 bits, improvável mas possível): a segunda tarefa avançaria a branch da primeira e
+  receberia a PR dela. Nada é reescrito (só fast-forward), mas as duas tarefas se misturam; o
+  remédio, se aparecer, é um prefixo maior do `task_id` no nome da branch.
 - O relatório da PR (`_pr_report`) inclui o `task_id` e a lista de arquivos; não inclui nada do
   `body` além do texto que o próprio agente escreveu, que já passou pela política antes de
   chegar aqui (é o resumo da tarefa, não uma tool call nova).
