@@ -87,3 +87,25 @@ jobs:
       - run: npm run --prefix frontend lint
 
       - run: npm test --prefix frontend -- --run
+
+  target-repo:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: examples/target-repo/uv.lock
+
+      # Same commands examples/target-repo/.github/workflows/ci.yml runs on its own,
+      # so the monorepo stays green today and nothing has to change the day this
+      # folder is split out into its own repository.
+      - run: uv sync --directory examples/target-repo --locked
+
+      - run: uv run --directory examples/target-repo ruff check
+
+      - run: uv run --directory examples/target-repo ruff format --check
+
+      - run: uv run --directory examples/target-repo pytest
