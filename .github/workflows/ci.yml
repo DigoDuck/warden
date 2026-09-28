@@ -96,6 +96,11 @@ jobs:
 
       - run: uv sync --directory backend --locked
 
+      # evals/ is outside backend/, so the `backend` job's ruff and mypy never see it.
+      - run: uv run --project backend ruff check evals/__init__.py evals/checks.py evals/runner.py evals/tests
+      - run: uv run --project backend ruff format --check evals/__init__.py evals/checks.py evals/runner.py evals/tests
+      - run: uv run --project backend mypy --config-file backend/pyproject.toml evals/__init__.py evals/checks.py evals/runner.py evals/tests
+
       # `evals-behavioral`'s own Makefile dependency builds the sandbox image (the same one
       # the `backend` job builds, same reason: no network inside it, so it has to exist
       # before any case that runs a real container).

@@ -36,10 +36,17 @@ sandbox-image:
 test: sandbox-image
 	$(UV) pytest
 
+# evals/ sits outside backend/, so backend's own ruff/mypy roots never see it. Listed by
+# file: evals/datasets/ holds fixture repos (target_repo) that are data, not our code.
+EVALS_PY := evals/__init__.py evals/checks.py evals/runner.py evals/tests
+
 lint:
 	$(UV) ruff check
 	$(UV) ruff format --check
 	$(UV) mypy
+	$(UV_ROOT) ruff check $(EVALS_PY)
+	$(UV_ROOT) ruff format --check $(EVALS_PY)
+	$(UV_ROOT) mypy --config-file backend/pyproject.toml $(EVALS_PY)
 
 fmt:
 	$(UV) ruff format

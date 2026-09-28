@@ -6,6 +6,7 @@ with actual branching logic has fast unit tests (evals/tests/test_checks.py) ins
 ever being exercised end to end.
 """
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import cast
 
@@ -97,7 +98,7 @@ KNOWN_KEYS = frozenset(
 )
 
 
-def check_expectations(expect: dict[str, object], facts: Facts) -> list[str]:
+def check_expectations(expect: Mapping[str, object], facts: Facts) -> list[str]:
     """Compare one case's `expect` block against the facts a real run produced.
 
     Only the keys present in `expect` are checked: a case states what it cares about, not
