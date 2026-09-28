@@ -26,6 +26,7 @@ from warden.identity.jwt import KeyPair
 from warden.models import (
     Approval,
     AuditLog,
+    IssuedToken,
     ModelCall,
     PolicyDecision,
     Task,
@@ -1237,3 +1238,98 @@ async def test_a_cancel_landing_while_the_call_is_being_decided_wins_over_the_pa
             .where(Approval.task_id == task_id, Approval.status == "pending")
         )
         assert pending == 0
+
+
+# --- per-call agent tokens (ADR-025) ---------------------------------------------------------
+
+
+async def test_an_allowed_call_gets_a_per_call_token_revoked_when_the_task_finishes(
+    session: AsyncSession, keys: KeyPair, workspace: pathlib.Path
+) -> None:
+    """Deliverable 1: every ALLOW decision mints a fresh, task-bound agent token before the
+    call executes (tools/gateway.py spends it), and every token the task ever minted is
+    revoked once the run ends, whatever it ends with. `_allow_all()`'s rule carries no
+    scopes, so this exercises the fallback `tool:<name>` scope, not a policy-provided one.
+    """
+    task = await _a_task(session)
+    provider = FakeProvider(
+        [_step("list_files", pattern="**/*.py"), _step("finish", summary="done")]
+    )
+
+    result = await run_task(
+        session,
+        task,
+        provider,
+        FakeWorkspace().registry(),
+        _allow_all(),
+        workspace=workspace,
+        keys=keys,
+    )
+
+    assert result.status == "SUCCEEDED"
+    rows = list(await session.scalars(select(IssuedToken).where(IssuedToken.task_id == task.id)))
+    assert len(rows) == 1
+    assert rows[0].scopes == ["tool:list_files"]
+    assert rows[0].task_id == task.id
+    assert rows[0].revoked_at is not None, "every token must be revoked once the run ends"
+
+
+async def test_the_token_carries_the_policy_scope_when_the_rule_has_one(
+    session: AsyncSession, keys: KeyPair, workspace: pathlib.Path
+) -> None:
+    """The fallback in the test above is exactly that, a fallback: a rule that names a scope
+    is what the minted token actually carries."""
+    task = await _a_task(session)
+    provider = FakeProvider(
+        [_step("read_file", path="src/app.py"), _step("finish", summary="done")]
+    )
+    policy = Policy(
+        [Rule(id="r", effect=Effect.ALLOW, when={"tool": "read_file"}, scopes=["repo:read"])],
+        default=Effect.DENY,
+        policy_hash="test",
+    )
+
+    result = await run_task(
+        session,
+        task,
+        provider,
+        FakeWorkspace().registry(),
+        policy,
+        workspace=workspace,
+        keys=keys,
+    )
+
+    assert result.status == "SUCCEEDED"
+    rows = list(await session.scalars(select(IssuedToken).where(IssuedToken.task_id == task.id)))
+    assert rows[0].scopes == ["repo:read"]
+
+
+# --- two clocks (ADR-025's maintenance item) -------------------------------------------------
+
+
+async def test_started_at_and_finished_at_come_from_the_database_clock(
+    session: AsyncSession, keys: KeyPair, workspace: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On Docker Desktop the database's VM clock can run several seconds behind the host's.
+    `task.started_at`/`task.finished_at` used to be stamped with `_now()` (Python's clock,
+    the host's), so timings shown to users were skewed. Both are database timestamps now, so
+    a Python clock poisoned to a wildly wrong value must not reach either column: only
+    elapsed-time math (`_check_stoppable`'s deadline check) may still read `_now()`.
+    """
+    task = await _a_task(session)
+    monkeypatch.setattr("warden.core.loop._now", lambda: datetime(2000, 1, 1, tzinfo=UTC))
+    before = datetime.now(UTC)
+
+    result = await run_task(
+        session,
+        task,
+        FakeProvider([_step("finish", summary="done")]),
+        FakeWorkspace().registry(),
+        _allow_all(),
+        workspace=workspace,
+        keys=keys,
+    )
+
+    assert result.status == "SUCCEEDED"
+    assert task.started_at is not None and task.started_at >= before
+    assert task.finished_at is not None and task.finished_at >= before
