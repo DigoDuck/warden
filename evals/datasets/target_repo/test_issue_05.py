@@ -23,6 +23,13 @@ def test_min_price_filters_out_cheaper_widgets() -> None:
     assert 80 not in prices  # washer, filtered out
 
 
+def test_min_price_is_inclusive() -> None:
+    # bolt costs exactly 250: ">= min_price", not "> min_price".
+    response = client.get("/widgets", params={"min_price": 250})
+    assert response.status_code == 200
+    assert "bolt" in [widget["name"] for widget in response.json()]
+
+
 def test_min_price_zero_returns_everything() -> None:
     response = client.get("/widgets", params={"min_price": 0})
     assert response.status_code == 200
