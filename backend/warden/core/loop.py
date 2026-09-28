@@ -13,14 +13,14 @@ import pathlib
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from uuid import UUID
 
-from sqlalchemy import text
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from warden import audit
+from warden import audit, identity
 from warden.core import approvals, cancel, events, queue
 from warden.core.replay import ApprovalOutcome, ResumeState
 from warden.identity.jwt import KeyPair
@@ -36,10 +36,18 @@ from warden.providers.base import (
     ToolSchema,
     UserMessage,
 )
+from warden.tools import gateway
 from warden.tools.registry import ToolError, ToolRegistry
 from warden.tools.workspace import normalize_path
 
 FINISH_TOOL = "finish"
+
+# ADR-025: minted right before the call it authorises and spent (tools/gateway.py verifies
+# it) a moment later in the same coroutine, so its live window only has to cover one tool
+# call, never a whole run. Well under identity.jwt.AGENT_TTL_CAP_SECONDS (900s): a cap this
+# far below the ceiling is what makes a token that somehow leaked (a bug in redaction, a
+# provider logging its own request) worthless within seconds, not minutes.
+PER_CALL_TOKEN_TTL_SECONDS = 120
 
 SYSTEM_PROMPT = """You are a software agent working on a repository through tools.
 
@@ -96,19 +104,42 @@ class _RunStopped(Exception):
         super().__init__(f"{status}: {reason}")
 
 
-async def _check_stoppable(session: AsyncSession, task: Task, budget: Budget) -> None:
+async def _db_clock_offset(session: AsyncSession) -> timedelta:
+    """How far the database's clock leads this process's clock, sampled once per `run_task`
+    call (not on every `_check_stoppable`, which would mean a query per iteration and per
+    tool for no benefit: the skew is a fixed property of the machine for the run's whole
+    lifetime, not something that drifts second to second).
+
+    `task.started_at` is always a database timestamp now (`queue.claim`'s own
+    `COALESCE(started_at, now())`, or `run_task`'s fallback below for a caller that skips
+    the queue), so comparing it against `_now()` (this process's clock) in
+    `_check_stoppable` would otherwise inherit whatever skew exists between the two, a few
+    seconds in practice on Docker Desktop, where the database's VM clock runs behind the
+    host's. Adding this offset to `_now()` converts it into the database's frame first.
+    """
+    db_now = await session.scalar(select(func.now()))
+    assert db_now is not None
+    return db_now - _now()
+
+
+async def _check_stoppable(
+    session: AsyncSession, task: Task, budget: Budget, clock_offset: timedelta
+) -> None:
     """Cooperative cancellation (briefing §16) and the wall-clock half of the timeout.
 
     Cancellation is read fresh from the database on every call: the request lands in
     another session entirely (another API request, another worker's heartbeat task), and
     the only way this run finds out is by asking. The deadline needs no such query;
-    `task.started_at` was set once, in this same process, and never mutated afterwards, so
-    comparing it against `_now()` is pure Python.
+    `task.started_at` was set once and never mutated afterwards, so comparing it against
+    `_now()` is pure Python, `clock_offset` and all.
     """
     if await cancel.is_requested(session, task.id):
         raise _RunStopped("CANCELLED", "cancel requested")
     if budget.max_seconds is not None and task.started_at is not None:
-        elapsed = (_now() - task.started_at).total_seconds()
+        # `_now() + clock_offset` is `_now()` expressed in the database's clock frame, the
+        # same one `task.started_at` is in (see `_db_clock_offset`): comparing like with
+        # like is what keeps this deadline accurate regardless of any skew between the two.
+        elapsed = (_now() + clock_offset - task.started_at).total_seconds()
         if elapsed > budget.max_seconds:
             raise _RunStopped(
                 "TIMED_OUT", f"reached max_seconds ({budget.max_seconds}) after {elapsed:.0f}s"
@@ -202,6 +233,12 @@ async def run_task(
         # budget grows by exactly that much instead of the clock learning about pauses.
         budget = replace(budget, max_seconds=budget.max_seconds + resume.paused_seconds)
 
+    # Sampled once, not on every `_check_stoppable` (see its own docstring). Skipped
+    # entirely when there is no deadline to check against: a query this run will never use.
+    clock_offset = (
+        await _db_clock_offset(session) if budget.max_seconds is not None else timedelta(0)
+    )
+
     user = await session.get(User, task.user_id)
     user_ref = UserRef(id=task.user_id, role=user.role if user else "worker")
 
@@ -221,7 +258,14 @@ async def run_task(
     if resume is None:
         messages: list[Message] = [UserMessage(text=task.spec)]
         first_iteration = 1
-        task.started_at = _now()
+        if task.started_at is None:
+            # `queue.claim()` already stamps this with the database's own clock
+            # (`COALESCE(started_at, now())`) before `run_task` ever sees a claimed task.
+            # This branch only fires for a caller that skips the queue (demo.py, a
+            # loop-level test calling `run_task` directly): it still has to be the
+            # database's clock, not `_now()`, so `_check_stoppable` is comparing like with
+            # like (the two-clocks bug this fixes).
+            task.started_at = await session.scalar(select(func.now()))
         await events.append_event(
             session,
             task.id,
@@ -266,6 +310,8 @@ async def run_task(
                 holder,
                 task,
                 budget,
+                keys,
+                clock_offset,
                 # The one pending call (at most: `approvals`' partial unique index allows
                 # only one open question per task) a human has since decided, if any.
                 # Everything else in `resume.pending_tool_calls` is decided normally,
@@ -285,7 +331,7 @@ async def run_task(
             # before every tool: a cancelled or expired run must not start another model
             # call, which is exactly what stopping *here*, before `provider.generate`,
             # guarantees.
-            await _check_stoppable(session, task, budget)
+            await _check_stoppable(session, task, budget, clock_offset)
             await events.append_event(session, task.id, events.ITERATION_STARTED, {"n": iteration})
             # No transaction is held across a model call. An uncommitted `task_events` row
             # holds a key-share lock on its task through the foreign key, and `claim()`
@@ -411,6 +457,8 @@ async def run_task(
                 holder,
                 task,
                 budget,
+                keys,
+                clock_offset,
             )
             messages.append(ToolResultsMessage(results=results))
     except _RunStopped as stopped:
@@ -565,6 +613,8 @@ async def _run_tools(
     holder: str | None,
     task: Task,
     budget: Budget,
+    keys: KeyPair,
+    clock_offset: timedelta,
     approval_decisions: dict[str, ApprovalOutcome] | None = None,
 ) -> list[ToolResult]:
     """Decide on every call, execute the allowed ones, and answer all of them.
@@ -604,7 +654,7 @@ async def _run_tools(
     approval_decisions = approval_decisions or {}
     results: list[ToolResult] = []
     for call in calls:
-        await _check_stoppable(session, task, budget)
+        await _check_stoppable(session, task, budget, clock_offset)
 
         outcome = approval_decisions.get(call.id)
 
@@ -691,6 +741,23 @@ async def _run_tools(
                     "reason": decision.reason,
                 },
             )
+
+        # ADR-025: a per-call agent token, minted only for a call that is actually about to
+        # run (ALLOW, whether from a fresh decision or from an approval that just overrode
+        # one), inside the same short transaction as checkpoint (c) below. `decision.scopes`
+        # is empty for a rule that names none (`_allow_all()`-shaped policies, most of the
+        # test suite): `tool:<name>` is the fallback, narrow enough to say what the token is
+        # for without inventing a scope the policy never granted. tools/gateway.py verifies
+        # this exact token, a moment later, before the call is allowed to reach the registry.
+        token: str | None = None
+        if decision.effect is Effect.ALLOW:
+            token = await identity.issue_agent_token(
+                session,
+                keys,
+                task_id=task_id,
+                scopes=decision.scopes or [f"tool:{call.name}"],
+                ttl_seconds=PER_CALL_TOKEN_TTL_SECONDS,
+            )
         await _checkpoint(session, task_id, holder)
 
         if decision.effect is Effect.REQUIRE_APPROVAL:
@@ -699,8 +766,11 @@ async def _run_tools(
 
         started = time.monotonic()
         if decision.effect is Effect.ALLOW:
+            assert token is not None
             try:
-                output = await registry.execute(call.name, call.arguments)
+                output = await gateway.execute(
+                    session, keys, registry, call.name, call.arguments, token=token, task_id=task_id
+                )
                 error = None
             except ToolError as exc:
                 # Bad arguments and tool-level refusals are normal in an agent loop: the
@@ -776,7 +846,12 @@ async def _finish(
 ) -> RunResult:
     task.status = status
     task.spent = {"usd": str(spent)}
-    task.finished_at = _now()
+    # Database clock, not `_now()` (the two-clocks bug): see `_db_clock_offset`'s docstring.
+    task.finished_at = await session.scalar(select(func.now()))
+    # ADR-025: every token this task ever minted stops working the instant the run ends,
+    # whatever it ends with. A revoked token cannot be replayed against the gateway even if
+    # something outside the run's own transaction (a slow retry, a bug) still holds it.
+    await identity.revoke_all_for_task(session, task.id)
     await events.append_event(
         session,
         task.id,

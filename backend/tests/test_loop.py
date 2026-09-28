@@ -1310,11 +1310,14 @@ async def test_the_token_carries_the_policy_scope_when_the_rule_has_one(
 async def test_started_at_and_finished_at_come_from_the_database_clock(
     session: AsyncSession, keys: KeyPair, workspace: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """On Docker Desktop the database's VM clock can run several seconds behind the host's.
+    """On Docker Desktop the database's VM clock can run several seconds behind the host's
+    (confirmed on the machine this test was written on: a plain `select(func.now())` came
+    back about six seconds behind `datetime.now(UTC)`, the exact skew this fix exists for).
     `task.started_at`/`task.finished_at` used to be stamped with `_now()` (Python's clock,
     the host's), so timings shown to users were skewed. Both are database timestamps now, so
-    a Python clock poisoned to a wildly wrong value must not reach either column: only
-    elapsed-time math (`_check_stoppable`'s deadline check) may still read `_now()`.
+    a Python clock poisoned to a wildly wrong value (26 years off, not a few seconds) must
+    not reach either column: only elapsed-time math (`_check_stoppable`'s deadline check)
+    may still read `_now()`.
     """
     task = await _a_task(session)
     monkeypatch.setattr("warden.core.loop._now", lambda: datetime(2000, 1, 1, tzinfo=UTC))
@@ -1331,5 +1334,10 @@ async def test_started_at_and_finished_at_come_from_the_database_clock(
     )
 
     assert result.status == "SUCCEEDED"
-    assert task.started_at is not None and task.started_at >= before
-    assert task.finished_at is not None and task.finished_at >= before
+    # Within a generous minute of the host's clock, not exactly equal to it: real skew
+    # between the two clocks is expected and is not the bug. The poisoned `_now()` would
+    # miss by decades, which this margin still catches easily.
+    assert task.started_at is not None
+    assert abs((task.started_at - before).total_seconds()) < 60
+    assert task.finished_at is not None
+    assert abs((task.finished_at - before).total_seconds()) < 60
