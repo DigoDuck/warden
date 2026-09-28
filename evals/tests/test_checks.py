@@ -147,7 +147,25 @@ def test_summarize_fails_the_exit_code_on_any_failure_but_still_counts_pending()
     assert code == 1
 
 
-def test_summarize_with_no_cases_is_a_pass_with_a_zero_over_zero_line() -> None:
+def test_summarize_fails_when_nothing_was_actually_scored() -> None:
+    # A gate that scored zero cases proved nothing: an empty or mistyped dataset, or every
+    # case flipped to pending, must not turn CI green.
     line, code = summarize([])
     assert line == "0/0 pass, 0 pending"
-    assert code == 0
+    assert code == 1
+
+    _, all_pending = summarize(
+        [CaseOutcome(key="a", state="PENDING", detail="not implemented yet")]
+    )
+    assert all_pending == 1
+
+
+def test_unknown_expectation_key_is_a_mismatch() -> None:
+    # A typo would otherwise disable the check it meant to make, and the case would pass.
+    mismatches = check_expectations({"task_satus": "CANCELLED"}, _facts())
+    assert any("task_satus" in m for m in mismatches)
+
+
+def test_empty_expectations_are_a_mismatch() -> None:
+    # An active case that asserts nothing passes whatever the control plane did.
+    assert check_expectations({}, _facts()) != []
