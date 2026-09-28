@@ -218,7 +218,15 @@ async def gather_facts(ctx: Context, task_id: uuid.UUID) -> Facts:
             for row in rows
             if row.type == events.POLICY_DECIDED
         ]
-        tool_executed_count = sum(1 for row in rows if row.type == events.TOOL_EXECUTED)
+        # Only calls that actually reached the gateway: core/loop.py also writes
+        # `tool.executed` for a deny or a human rejection (so a resume never finds the call
+        # pending again), with the refusal as its `effect`. Counting those would read a
+        # refused call as a run one, which is the opposite of what a deny case asserts.
+        tool_executed_count = sum(
+            1
+            for row in rows
+            if row.type == events.TOOL_EXECUTED and row.payload.get("effect") == "allow"
+        )
 
         approvals_pending = (
             await session.scalar(
