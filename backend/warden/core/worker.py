@@ -336,13 +336,21 @@ class Worker:
         self._stopping.set()
 
     async def run_once(self) -> RunResult | None:
-        """Claim one task and run it. None means the queue was empty."""
-        async with self._sessions() as session:
-            task = await queue.claim(session, self.id, lease_seconds=self._lease_seconds)
-            await session.commit()
-            if task is None:
-                return None
-            task_id = task.id
+        """Claim one task and run it. None means the queue was empty, or the database was
+        briefly unreachable while claiming (see the `except` below): `run_forever` treats
+        both the same way, an idle poll's worth of backoff before trying again, which is
+        what turns a downed database (seen for real when Docker Desktop restarts) into a
+        worker that keeps polling instead of one that dies.
+        """
+        try:
+            async with self._sessions() as session:
+                task = await queue.claim(session, self.id, lease_seconds=self._lease_seconds)
+                await session.commit()
+        except _TRANSIENT_DB_ERRORS:
+            return None
+        if task is None:
+            return None
+        task_id = task.id
 
         beat = asyncio.create_task(_beat(self._sessions, task_id, self.id, self._lease_seconds))
         # The workspace volume is named after the task, so a sandbox created here attaches
