@@ -198,6 +198,9 @@ async def test_a_run_stopped_mid_verification_resumes_without_calling_the_model(
     worker process during verification.
     """
     task = await _a_task(session)
+    # Captured now: the rollback below expires every loaded attribute, and reading `task.id`
+    # afterwards would be a lazy load, which an AsyncSession refuses (MissingGreenlet).
+    task_id = task.id
 
     class _DiesAtTypes(_Checks):
         async def check(self, kind: str) -> dict[str, Any]:
@@ -221,7 +224,7 @@ async def test_a_run_stopped_mid_verification_resumes_without_calling_the_model(
     else:
         raise AssertionError("the first run should have stopped at types")
 
-    refreshed = await session.get(Task, task.id)
+    refreshed = await session.get(Task, task_id)
     assert refreshed is not None
     await session.refresh(refreshed)
     assert refreshed.status == "VERIFYING"
@@ -232,7 +235,7 @@ async def test_a_run_stopped_mid_verification_resumes_without_calling_the_model(
         async def generate(self, *args: object, **kwargs: object) -> Completion:
             raise AssertionError("a resumed verification must not call the model")
 
-    resume = rebuild(await read_events(session, task.id))
+    resume = rebuild(await read_events(session, task_id))
     checks = _Checks()
     result = await run_task(
         session,
@@ -249,8 +252,8 @@ async def test_a_run_stopped_mid_verification_resumes_without_calling_the_model(
     assert result.status == "SUCCEEDED"
     assert result.summary == "resumable"
     assert checks.asked == ["types", "tests"]
-    assert await _evidence_kinds(session, task.id) == ["diff", "lint", "types", "tests"]
+    assert await _evidence_kinds(session, task_id) == ["diff", "lint", "types", "tests"]
     model_calls = await session.scalar(
-        select(func.count()).select_from(ModelCall).where(ModelCall.task_id == task.id)
+        select(func.count()).select_from(ModelCall).where(ModelCall.task_id == task_id)
     )
     assert model_calls == 1
