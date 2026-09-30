@@ -16,7 +16,7 @@ from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from warden.identity import broker
-from warden.models import ModelCall, PolicyDecision, TaskEvent, ToolCall
+from warden.models import Evidence, ModelCall, PolicyDecision, TaskEvent, ToolCall
 from warden.policy.engine import Decision
 from warden.providers.base import Completion
 from warden.providers.base import ToolCall as ProviderToolCall
@@ -39,6 +39,13 @@ CANCEL_REQUESTED = "cancel.requested"
 APPROVAL_REQUESTED = "approval.requested"
 APPROVAL_GRANTED = "approval.granted"
 APPROVAL_REJECTED = "approval.rejected"
+# ADR-026: the control plane's own checks after the agent finishes. `verify.started` carries
+# the agent's summary and iteration count, because a worker that resumes in the middle of
+# verification has to finish the task with them and never calls the model again to get them.
+# One `verify.recorded` per check, committed with its `evidence` row, so replay knows which
+# checks are already done.
+VERIFY_STARTED = "verify.started"
+VERIFY_RECORDED = "verify.recorded"
 
 _SENSITIVE_KEY_PARTS = ("token", "key", "secret", "password", "credential", "authorization")
 _MAX_ARG_CHARS = 2_000
@@ -203,5 +210,19 @@ async def record_policy_decision(
             policy_hash=decision.policy_hash,
         )
     )
+    await session.flush()
+    return row
+
+
+async def record_evidence(
+    session: AsyncSession, task_id: UUID, kind: str, payload: dict[str, Any]
+) -> Evidence:
+    """Persist one check's result (ADR-026).
+
+    The payload holds output of code the agent wrote (a test that prints, a diff of files it
+    edited), so it goes through the same redaction as every event payload before it reaches
+    the database.
+    """
+    session.add(row := Evidence(task_id=task_id, kind=kind, payload=_redact_value(payload)))
     await session.flush()
     return row

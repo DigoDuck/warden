@@ -44,6 +44,20 @@ class ApprovalOutcome:
     note: str | None = None
 
 
+@dataclass(frozen=True)
+class VerificationState:
+    """A run that got as far as verification (ADR-026) before it stopped.
+
+    Carries what `verify.started` recorded, so the resumed worker finishes the task with the
+    agent's own summary and iteration count without asking the model for them again, and
+    the checks already recorded, so it runs only the ones that are missing.
+    """
+
+    summary: str | None
+    iterations: int
+    recorded: frozenset[str]
+
+
 @dataclass
 class ResumeState:
     """Everything the loop needs to carry on as if it had never stopped."""
@@ -69,6 +83,9 @@ class ResumeState:
     # `core/loop.py` subtracts it from the wall clock before comparing against max_seconds
     # (ADR-022): the budget is the agent's time, not the reviewer's.
     paused_seconds: float = 0.0
+    # Set once the agent has finished and verification began. `core/loop.py` then skips the
+    # agent loop entirely: the conversation is over, only the control plane's checks remain.
+    verification: VerificationState | None = None
 
     @property
     def is_mid_iteration(self) -> bool:
@@ -114,6 +131,9 @@ def rebuild(task_events: Sequence[TaskEvent]) -> ResumeState:
         if requested_at is not None and event.created_at is not None:
             state.paused_seconds += (event.created_at - requested_at).total_seconds()
 
+    verify_started: dict[str, Any] | None = None
+    verify_recorded: set[str] = set()
+
     for event in sorted(task_events, key=lambda e: e.seq):
         payload: dict[str, Any] = dict(event.payload or {})
 
@@ -147,6 +167,12 @@ def rebuild(task_events: Sequence[TaskEvent]) -> ResumeState:
         elif event.type == ev.TASK_FINISHED:
             state.finished = True
 
+        elif event.type == ev.VERIFY_STARTED:
+            verify_started = payload
+
+        elif event.type == ev.VERIFY_RECORDED:
+            verify_recorded.add(str(payload["kind"]))
+
         elif event.type == ev.APPROVAL_REQUESTED:
             if event.created_at is not None:
                 asked_at[str(payload["id"])] = event.created_at
@@ -165,6 +191,14 @@ def rebuild(task_events: Sequence[TaskEvent]) -> ResumeState:
                 approval_id=str(payload["approval_id"]),
                 note=str(note) if note is not None else None,
             )
+
+    if verify_started is not None:
+        summary = verify_started.get("summary")
+        state.verification = VerificationState(
+            summary=str(summary) if summary is not None else None,
+            iterations=int(verify_started.get("iterations", iteration)),
+            recorded=frozenset(verify_recorded),
+        )
 
     # Whatever is left belongs to the iteration that was cut short.
     pending = [item for item in requested if item["id"] not in executed]

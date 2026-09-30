@@ -398,6 +398,30 @@ class Sandbox:
     def _put_file_sync(self, relative_path: str, data: bytes) -> None:
         self._container.put_archive(MOUNT_ROOT, _file_tar(relative_path, data).getvalue())
 
+    async def export_workspace(self, *, max_bytes: int) -> bytes:
+        """The workspace as a tar, exactly as the container holds it now (ADR-026).
+
+        Read through the daemon's archive endpoint, not by running anything inside the
+        container: nothing the agent left in the workspace gets to execute while its own
+        diff is taken. Works on a stopped container too, so a check that timed out and got
+        the container killed does not also cost the diff.
+
+        The bytes are untrusted input (the agent chose every name and link in there). This
+        method only moves them; `verify/runner.py` reads them in memory and never extracts
+        them to disk. Past `max_bytes` it stops reading instead of buffering whatever the
+        agent wrote.
+        """
+        return await asyncio.to_thread(self._export_sync, max_bytes)
+
+    def _export_sync(self, max_bytes: int) -> bytes:
+        stream, _stat = self._container.get_archive(WORKSPACE)
+        buffer = bytearray()
+        for chunk in stream:
+            buffer.extend(chunk)
+            if len(buffer) > max_bytes:
+                raise SandboxError(f"workspace archive exceeds {max_bytes} bytes")
+        return bytes(buffer)
+
     def _kill_sync(self) -> None:
         # Already gone or already stopped; either way the deadline is satisfied.
         with contextlib.suppress(NotFound, docker.errors.APIError):

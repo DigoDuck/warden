@@ -86,6 +86,18 @@ class TaskEventPage(BaseModel):
     next_after: int | None
 
 
+class EvidenceOut(BaseModel):
+    kind: str
+    # Returned as `verify/runner.py` recorded it (DiffEvidence or CommandEvidence, both with
+    # a `status`). Kept as a plain dict here so a new kind does not need an API change.
+    payload: dict[str, Any]
+    created_at: datetime
+
+
+class EvidenceListOut(BaseModel):
+    evidence: list[EvidenceOut]
+
+
 class AuditVerifyOut(BaseModel):
     ok: bool
     rows_checked: int

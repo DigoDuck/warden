@@ -44,6 +44,7 @@ from warden.sandbox.docker import (
 )
 from warden.tools.registry import ToolRegistry
 from warden.tools.sandboxed import build_registry
+from warden.verify.runner import EvidenceCollector, Verifier
 
 HEARTBEAT_FRACTION = 0.4
 IDLE_POLL_SECONDS = 1.0
@@ -217,6 +218,7 @@ async def run_claimed_task(
     keys: KeyPair,
     budget: Budget | None = None,
     holder: str | None = None,
+    verifier: EvidenceCollector | None = None,
 ) -> RunResult:
     """Run a task from wherever it left off.
 
@@ -242,6 +244,7 @@ async def run_claimed_task(
         budget=budget,
         resume=resume,
         holder=holder,
+        verifier=verifier,
     )
 
 
@@ -388,6 +391,11 @@ class Worker:
                         keys=self._keys,
                         budget=budget,
                         holder=self.id,
+                        # Seeded from the same directory and with the same exclusions as the
+                        # sandbox itself, so the diff compares like with like (ADR-026).
+                        verifier=Verifier(
+                            sandbox, self._workspace, exclude=never_readable(self._policy)
+                        ),
                     )
                 except queue.LeaseLost:
                     # Another worker already reclaimed this task. Every checkpoint fences

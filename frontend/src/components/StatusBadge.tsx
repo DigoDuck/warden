@@ -3,6 +3,7 @@ import {
   CheckCircle,
   Clock,
   Hand,
+  ListChecks,
   Loader,
   TimerOff,
   Wallet,
@@ -24,6 +25,8 @@ interface StatusEntry {
 export const TASK_STATUS_ENTRIES: Record<string, StatusEntry> = {
   QUEUED: { tone: "muted", icon: Clock, label: "Na fila" },
   RUNNING: { tone: "info", icon: Loader, label: "Executando" },
+  // ADR-026: the agent finished and the control plane is running its own checks.
+  VERIFYING: { tone: "info", icon: ListChecks, label: "Verificando" },
   WAITING_APPROVAL: { tone: "warn", icon: Hand, label: "Aguardando aprovação" },
   SUCCEEDED: { tone: "ok", icon: CheckCircle, label: "Concluída" },
   FAILED: { tone: "danger", icon: XCircle, label: "Falhou" },

@@ -63,6 +63,7 @@ Status de tarefa:
 |---|---|---|---|
 | QUEUED | `--fg-muted` | `clock` | Na fila |
 | RUNNING | `--info` `#38BDF8` | `loader` (estático) | Executando |
+| VERIFYING | `--info` `#38BDF8` | `list-checks` | Verificando |
 | WAITING_APPROVAL | `--warn` | `hand` | Aguardando aprovação |
 | SUCCEEDED | `--ok` | `check-circle` | Concluída |
 | FAILED | `--danger` | `x-circle` | Falhou |

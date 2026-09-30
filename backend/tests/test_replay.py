@@ -281,3 +281,37 @@ def test_raw_content_is_never_inspected() -> None:
         )
     )
     assert state.messages[-1].raw_content is opaque  # type: ignore[union-attr]
+
+
+# --- verification (ADR-026): the agent is done, only the control plane's checks remain ------
+
+
+def test_a_run_that_never_reached_verification_has_none() -> None:
+    state = rebuild(
+        _events(
+            (ev.TASK_CREATED, {"spec": "x"}),
+            (ev.ITERATION_STARTED, {"n": 1}),
+            _model_called([]),
+        )
+    )
+    assert state.verification is None
+
+
+def test_a_run_interrupted_mid_verification_reports_what_is_left() -> None:
+    state = rebuild(
+        _events(
+            (ev.TASK_CREATED, {"spec": "x"}),
+            (ev.ITERATION_STARTED, {"n": 3}),
+            _model_called([]),
+            (ev.VERIFY_STARTED, {"summary": "fixed the bug", "iterations": 3}),
+            (ev.VERIFY_RECORDED, {"kind": "diff", "status": "ok"}),
+            (ev.VERIFY_RECORDED, {"kind": "lint", "status": "passed"}),
+        )
+    )
+    assert state.verification is not None
+    assert state.verification.summary == "fixed the bug"
+    assert state.verification.iterations == 3
+    assert state.verification.recorded == frozenset({"diff", "lint"})
+    assert state.finished is False
+    # Nothing pending from the agent's side: resuming must not look like a mid-iteration.
+    assert not state.is_mid_iteration

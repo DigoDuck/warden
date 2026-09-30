@@ -23,6 +23,11 @@ from warden.models import Task
 
 DEFAULT_LEASE_SECONDS = 60
 
+# A worker holds a lease on RUNNING and on VERIFYING. VERIFYING (ADR-026) is the control
+# plane checking a task the agent already finished, still inside the same worker's run: it
+# can crash like RUNNING, so every statement below reclaims, heartbeats and releases it
+# exactly like RUNNING.
+
 # Claims the oldest runnable task and marks it in one statement, so there is no window
 # between choosing a row and owning it.
 _CLAIM = text("""
@@ -34,7 +39,7 @@ _CLAIM = text("""
      WHERE id = (
            SELECT id FROM tasks
             WHERE status = 'QUEUED'
-               OR (status = 'RUNNING' AND claimed_until < now())
+               OR (status IN ('RUNNING', 'VERIFYING') AND claimed_until < now())
             ORDER BY created_at
               FOR UPDATE SKIP LOCKED
             LIMIT 1
@@ -49,7 +54,7 @@ _HEARTBEAT = text("""
        SET claimed_until = now() + make_interval(secs => :lease_seconds)
      WHERE id = :task_id
        AND claimed_by = :worker_id
-       AND status = 'RUNNING'
+       AND status IN ('RUNNING', 'VERIFYING')
     RETURNING id
 """)
 
@@ -166,7 +171,8 @@ async def release(session: AsyncSession, task_id: UUID, worker_id: str) -> bool:
         text("""
             UPDATE tasks
                SET status = 'QUEUED', claimed_by = NULL, claimed_until = NULL
-             WHERE id = :task_id AND claimed_by = :worker_id AND status = 'RUNNING'
+             WHERE id = :task_id AND claimed_by = :worker_id
+               AND status IN ('RUNNING', 'VERIFYING')
             RETURNING id
         """),
         {"task_id": task_id, "worker_id": worker_id},

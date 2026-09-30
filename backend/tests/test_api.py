@@ -24,7 +24,7 @@ from warden import audit, identity
 from warden.api.app import create_app
 from warden.core import events, queue
 from warden.identity.jwt import ALGORITHM, KeyPair
-from warden.models import AuditLog, Task, TaskEvent, User
+from warden.models import AuditLog, Evidence, Task, TaskEvent, User
 
 
 @pytest.fixture
@@ -220,6 +220,7 @@ async def test_an_agent_token_is_refused_even_with_a_matching_scope_name(
         ("GET", f"/tasks/{uuid.uuid4()}", ["tasks:write", "audit:read"]),
         ("GET", f"/tasks/{uuid.uuid4()}/events", ["tasks:write", "audit:read"]),
         ("GET", f"/tasks/{uuid.uuid4()}/stream", ["tasks:write", "audit:read"]),
+        ("GET", f"/tasks/{uuid.uuid4()}/evidence", ["tasks:write", "audit:read"]),
         ("GET", "/audit/verify", ["tasks:write", "tasks:read"]),
         ("POST", f"/tasks/{uuid.uuid4()}/cancel", ["tasks:read", "audit:read"]),
     ],
@@ -514,6 +515,49 @@ async def test_events_are_paginated_by_seq(
     assert body2["next_after"] is None
 
 
+# --- GET /tasks/{id}/evidence (ADR-026) -----------------------------------------------------
+
+
+async def test_evidence_lists_what_the_verifier_recorded(
+    client: AsyncClient, session_factory: async_sessionmaker[AsyncSession], keys: KeyPair
+) -> None:
+    user = await _user(session_factory)
+    token = await _user_token(session_factory, keys, user, ["tasks:write", "tasks:read"])
+    task_id = uuid.UUID(await _submit(client, token))
+
+    empty = await client.get(f"/tasks/{task_id}/evidence", headers=_auth(token))
+    assert empty.status_code == 200
+    assert empty.json() == {"evidence": []}
+
+    async with session_factory() as session:
+        await events.record_evidence(
+            session, task_id, "tests", {"kind": "tests", "status": "failed", "passed": False}
+        )
+        await session.commit()
+
+    response = await client.get(f"/tasks/{task_id}/evidence", headers=_auth(token))
+    assert response.status_code == 200
+    [row] = response.json()["evidence"]
+    assert row["kind"] == "tests"
+    assert row["payload"]["status"] == "failed"
+
+
+async def test_another_users_evidence_is_404(
+    client: AsyncClient, session_factory: async_sessionmaker[AsyncSession], keys: KeyPair
+) -> None:
+    owner = await _user_token(session_factory, keys, await _user(session_factory), ["tasks:write"])
+    task_id = await _submit(client, owner)
+    async with session_factory() as session:
+        session.add(Evidence(task_id=uuid.UUID(task_id), kind="diff", payload={"status": "ok"}))
+        await session.commit()
+
+    stranger = await _user_token(
+        session_factory, keys, await _user(session_factory), ["tasks:read"]
+    )
+    response = await client.get(f"/tasks/{task_id}/evidence", headers=_auth(stranger))
+    assert response.status_code == 404
+
+
 # --- POST /tasks/{id}/cancel ------------------------------------------------------------------
 
 
@@ -555,6 +599,25 @@ async def test_cancelling_a_running_task_only_marks_it(
 
     assert response.status_code == 202
     assert response.json()["status"] == "RUNNING"
+
+
+async def test_cancelling_a_verifying_task_only_marks_it(
+    client: AsyncClient, session_factory: async_sessionmaker[AsyncSession], keys: KeyPair
+) -> None:
+    """ADR-026: a worker still holds a VERIFYING task, so it gets the marker like RUNNING."""
+    token = await _user_token(session_factory, keys, await _user(session_factory), ["tasks:write"])
+    task_id = await _submit(client, token)
+    await _claim(session_factory, task_id)
+    async with session_factory() as session:
+        await session.execute(
+            text("UPDATE tasks SET status = 'VERIFYING' WHERE id = :id"), {"id": task_id}
+        )
+        await session.commit()
+
+    response = await client.post(f"/tasks/{task_id}/cancel", headers=_auth(token))
+
+    assert response.status_code == 202
+    assert response.json()["status"] == "VERIFYING"
 
 
 async def test_cancelling_a_running_task_twice_keeps_answering_202(

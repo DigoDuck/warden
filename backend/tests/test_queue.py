@@ -169,6 +169,45 @@ async def test_release_puts_the_task_back_immediately(session: AsyncSession) -> 
     assert back is not None and back.id == task.id
 
 
+# --- VERIFYING (ADR-026): leased exactly like RUNNING ---------------------------------------
+
+
+async def _verifying(session: AsyncSession, worker: str) -> Task:
+    """A claimed task that the loop has moved on to verification."""
+    user = await _a_user(session)
+    await queue.enqueue(session, user_id=user.id, spec="work", idempotency_key=str(uuid.uuid4()))
+    task = await queue.claim(session, worker)
+    assert task is not None
+    await session.execute(
+        text("UPDATE tasks SET status = 'VERIFYING' WHERE id = :id"), {"id": task.id}
+    )
+    await session.flush()
+    return task
+
+
+async def test_a_verifying_task_with_a_live_lease_is_not_claimed(session: AsyncSession) -> None:
+    await _verifying(session, "worker-a")
+    assert await queue.claim(session, "worker-b") is None
+
+
+async def test_a_verifying_task_whose_worker_died_is_reclaimed(session: AsyncSession) -> None:
+    """A crash during verification must not strand the task in VERIFYING forever."""
+    task = await _verifying(session, "worker-dead")
+    await queue.expire_lease_now(session, task.id)
+
+    reclaimed = await queue.claim(session, "worker-live")
+    assert reclaimed is not None and reclaimed.id == task.id
+
+
+async def test_a_verifying_task_can_be_heartbeated_and_released(session: AsyncSession) -> None:
+    task = await _verifying(session, "worker-a")
+    assert await queue.heartbeat(session, task.id, "worker-a") is True
+    assert await queue.release(session, task.id, "worker-a") is True
+
+    back = await queue.claim(session, "worker-b")
+    assert back is not None and back.id == task.id
+
+
 async def test_concurrent_workers_take_different_tasks(
     session: AsyncSession, session_factory: async_sessionmaker[AsyncSession]
 ) -> None:

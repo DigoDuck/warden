@@ -6,6 +6,7 @@ import { StatusBadge } from "./StatusBadge";
 const STATUSES_AND_LABELS: [string, string][] = [
   ["QUEUED", "Na fila"],
   ["RUNNING", "Executando"],
+  ["VERIFYING", "Verificando"],
   ["WAITING_APPROVAL", "Aguardando aprovação"],
   ["SUCCEEDED", "Concluída"],
   ["FAILED", "Falhou"],
