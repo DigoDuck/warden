@@ -24,7 +24,7 @@ class CancelOutcome(StrEnum):
     """
 
     CANCELLED = "cancelled"  # was QUEUED and unclaimed: finished on the spot.
-    MARKED = "marked"  # was RUNNING: the loop will see the marker and stop cooperatively.
+    MARKED = "marked"  # was RUNNING/VERIFYING: the loop sees the marker and stops.
     ALREADY_TERMINAL = "already_terminal"
     NOT_FOUND = "not_found"
 
@@ -42,7 +42,8 @@ class CancelOutcome(StrEnum):
 # WAITING_APPROVAL (ADR-022) is cancelled the same instant way as QUEUED, not marked: the
 # lease was already released when the task paused (`core/loop.py::_pause_for_approval`), so
 # there is no worker left to cooperate with a marker, exactly as there is none for a QUEUED
-# task nobody has claimed yet.
+# task nobody has claimed yet. VERIFYING (ADR-026) is marked like RUNNING: a worker holds it,
+# and `core/loop.py::_verify_and_finish` checks the marker around every check.
 _REQUEST_CANCEL = text("""
     UPDATE tasks
        SET status = CASE
@@ -54,11 +55,11 @@ _REQUEST_CANCEL = text("""
                ELSE finished_at
            END,
            cancel_requested_at = CASE
-               WHEN status = 'RUNNING' THEN COALESCE(cancel_requested_at, now())
+               WHEN status IN ('RUNNING', 'VERIFYING') THEN COALESCE(cancel_requested_at, now())
                ELSE cancel_requested_at
            END
      WHERE id = :task_id
-       AND status IN ('QUEUED', 'RUNNING', 'WAITING_APPROVAL')
+       AND status IN ('QUEUED', 'RUNNING', 'VERIFYING', 'WAITING_APPROVAL')
     RETURNING status
 """)
 

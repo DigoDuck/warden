@@ -14,17 +14,20 @@ import sys
 from decimal import Decimal
 from uuid import uuid4
 
+from sqlalchemy import select
+
 from warden.config import get_settings
 from warden.core import events
 from warden.core.loop import Budget, run_task
 from warden.db import make_engine, make_session_factory
 from warden.identity.jwt import load_keys
+from warden.models import Evidence, User
 from warden.models import Task as TaskRow
-from warden.models import User
 from warden.policy.engine import load_policy, never_readable
 from warden.providers.base import ModelProvider
 from warden.sandbox.docker import Sandbox, SandboxProfile, discard_workspace_volume
 from warden.tools.sandboxed import build_registry
+from warden.verify.runner import Verifier
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 WORKSPACE = REPO_ROOT / "examples" / "target-repo"
@@ -103,6 +106,7 @@ async def main(kind: str) -> int:
                 keys=keys,
                 workspace=WORKSPACE,
                 budget=DEMO_BUDGET,
+                verifier=Verifier(sandbox, WORKSPACE, exclude=never_readable(policy)),
             )
             await session.commit()
         finally:
@@ -115,6 +119,12 @@ async def main(kind: str) -> int:
         print("events recorded in the database:")
         for event in recorded:
             print(f"  {event.seq:>3}  {event.type:<20} {event.payload}")
+
+        # The control plane's own checks (ADR-026), read back like the events above.
+        evidence = await session.scalars(select(Evidence).where(Evidence.task_id == task.id))
+        print("\nevidence collected by the verifier:")
+        for row in evidence:
+            print(f"  {row.kind:<6} {row.payload.get('status')}")
 
         print(f"\nstatus     {result.status}")
         print(f"iterations {result.iterations}")

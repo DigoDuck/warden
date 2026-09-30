@@ -312,3 +312,36 @@ class AuditLog(Base):
     details: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
     prev_hash: Mapped[str] = mapped_column(CHAR(64))
     hash: Mapped[str] = mapped_column(CHAR(64))
+
+
+# What `verify/runner.py` collects. A CHECK rather than an Enum type, same as `tasks.status`:
+# `sast`, `http` and `screenshot` (briefing §13) join this list with the migration that
+# first writes them, not before.
+EVIDENCE_KINDS = ("diff", "lint", "types", "tests")
+
+
+class Evidence(Base):
+    """One deterministic check the control plane ran on a finished task (ADR-026).
+
+    Collected by the control plane itself after the agent calls `finish`, never taken from
+    the agent's own report. `UNIQUE(task_id, kind)` is what makes verification safe to
+    resume: a worker that dies halfway through and a second one that picks the task up can
+    never both record the same check, whatever the application code does.
+    """
+
+    __tablename__ = "evidence"
+    __table_args__ = (
+        CheckConstraint(
+            "kind IN (" + ", ".join(f"'{k}'" for k in EVIDENCE_KINDS) + ")",
+            name="ck_evidence_kind",
+        ),
+        UniqueConstraint("task_id", "kind", name="uq_evidence_task_kind"),
+    )
+
+    id: Mapped[uuid.UUID] = _pk()
+    task_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("tasks.id", ondelete="CASCADE"), index=True
+    )
+    kind: Mapped[str] = mapped_column(String(32))
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

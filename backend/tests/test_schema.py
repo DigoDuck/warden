@@ -11,7 +11,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from warden.models import Task, TaskEvent, User
+from warden.models import Evidence, Task, TaskEvent, User
 
 EXPECTED_TABLES = {
     "users",
@@ -78,5 +78,31 @@ async def test_status_check_rejects_unknown_state(session: AsyncSession) -> None
             status="ALMOST_DONE",
         )
     )
+    with pytest.raises(IntegrityError):
+        await session.flush()
+
+
+async def test_evidence_is_unique_per_task_and_kind(session: AsyncSession) -> None:
+    """ADR-026: a resumed verification can never record the same check twice."""
+    user = await _a_user(session)
+    task = Task(idempotency_key=str(uuid.uuid4()), user_id=user.id, spec="anything")
+    session.add(task)
+    await session.flush()
+
+    session.add(Evidence(task_id=task.id, kind="tests", payload={"passed": True}))
+    await session.flush()
+
+    session.add(Evidence(task_id=task.id, kind="tests", payload={"passed": False}))
+    with pytest.raises(IntegrityError):
+        await session.flush()
+
+
+async def test_evidence_kind_check_rejects_unknown_kind(session: AsyncSession) -> None:
+    user = await _a_user(session)
+    task = Task(idempotency_key=str(uuid.uuid4()), user_id=user.id, spec="anything")
+    session.add(task)
+    await session.flush()
+
+    session.add(Evidence(task_id=task.id, kind="vibes", payload={}))
     with pytest.raises(IntegrityError):
         await session.flush()

@@ -308,7 +308,7 @@ async def _run_probe(sandbox: Sandbox, script: str, argument: str, *, what: str)
     return result.output
 
 
-def _truncate(output: str) -> str:
+def truncate_output(output: str) -> str:
     """Keep both ends of long output rather than just the head.
 
     A test failure worth seeing is as likely to be the last line (the assertion) as the
@@ -488,7 +488,7 @@ async def run_command(sandbox: Sandbox, args: RunCommandArgs) -> str:
     result = await _exec_or_timeout_error(sandbox, argv, kill_after=args.timeout_seconds)
     # A non-zero exit is not a refusal: the model has to see the failing output to react to
     # it, same as a human running the command would.
-    return f"exit code: {result.exit_code}\n{_truncate(result.output)}"
+    return f"exit code: {result.exit_code}\n{truncate_output(result.output)}"
 
 
 async def run_tests(sandbox: Sandbox, args: RunTestsArgs) -> str:
@@ -502,7 +502,7 @@ async def run_tests(sandbox: Sandbox, args: RunTestsArgs) -> str:
     result = await _exec_or_timeout_error(sandbox, argv, kill_after=RUN_TESTS_TIMEOUT)
     # A failing test is a normal result, not a refusal: pytest's own exit code already says
     # so, and the model needs the failure to fix it.
-    return f"exit code: {result.exit_code}\n{_truncate(result.output)}"
+    return f"exit code: {result.exit_code}\n{truncate_output(result.output)}"
 
 
 def build_registry(sandbox: Sandbox) -> ToolRegistry:

@@ -39,6 +39,7 @@ from warden.providers.base import (
 from warden.tools import gateway
 from warden.tools.registry import ToolError, ToolRegistry
 from warden.tools.workspace import normalize_path
+from warden.verify.runner import EvidenceCollector
 
 FINISH_TOOL = "finish"
 
@@ -224,7 +225,15 @@ async def run_task(
     budget: Budget | None = None,
     resume: ResumeState | None = None,
     holder: str | None = None,
+    verifier: EvidenceCollector | None = None,
 ) -> RunResult:
+    """Run (or resume) a task until it ends.
+
+    `verifier` is the control plane's own check of the finished work (ADR-026). The worker
+    and the demo always pass one, bound to the task's sandbox. None skips verification and
+    finishes the moment the agent does, which is what the loop-level tests use: they run
+    fake tools with no container to verify against.
+    """
     budget = budget or Budget()
     spent = resume.spent if resume else Decimal("0")
     if resume and resume.paused_seconds and budget.max_seconds is not None:
@@ -287,6 +296,23 @@ async def run_task(
     current_iteration = first_iteration
 
     try:
+        if resume is not None and resume.verification is not None:
+            # The agent already finished before the interruption (ADR-026). Its conversation
+            # is over and must not be continued: no model call, no tool, only the checks
+            # that were not recorded yet.
+            current_iteration = resume.verification.iterations
+            return await _verify_and_finish(
+                session,
+                task,
+                resume.verification.iterations,
+                spent,
+                holder,
+                summary=resume.verification.summary,
+                verifier=verifier,
+                recorded=resume.verification.recorded,
+                already_started=True,
+            )
+
         if resume is not None and resume.is_mid_iteration:
             # The interrupted iteration is finished, not restarted: its assistant turn is
             # already in the messages and its tool_use blocks are still unanswered. Running
@@ -417,9 +443,16 @@ async def run_task(
 
             if completion.stop_reason == "end_turn":
                 # The model stopped talking without calling `finish`. The summary is
-                # whatever it said, and the task is done rather than stuck.
-                return await _finish(
-                    session, task, "SUCCEEDED", iteration, spent, holder, summary=completion.text
+                # whatever it said, and the task is done rather than stuck. Verified all the
+                # same: how the agent said it was done does not change what gets checked.
+                return await _verify_and_finish(
+                    session,
+                    task,
+                    iteration,
+                    spent,
+                    holder,
+                    summary=completion.text,
+                    verifier=verifier,
                 )
 
             finish_call = next(
@@ -438,8 +471,8 @@ async def run_task(
                     session, task.id, iteration, finish_call, decision="allow"
                 )
                 summary = str(finish_call.arguments.get("summary", "")) or completion.text
-                return await _finish(
-                    session, task, "SUCCEEDED", iteration, spent, holder, summary=summary
+                return await _verify_and_finish(
+                    session, task, iteration, spent, holder, summary=summary, verifier=verifier
                 )
 
             # Checkpoint (b): every tool.requested for this turn, committed together with
@@ -840,6 +873,79 @@ async def _run_tools(
         if await cancel.is_requested(session, task_id):
             raise _RunStopped("CANCELLED", "cancel requested while a tool was running")
     return results
+
+
+async def _verify_and_finish(
+    session: AsyncSession,
+    task: Task,
+    iterations: int,
+    spent: Decimal,
+    holder: str | None,
+    *,
+    summary: str | None,
+    verifier: EvidenceCollector | None,
+    recorded: frozenset[str] = frozenset(),
+    already_started: bool = False,
+) -> RunResult:
+    """RUNNING -> VERIFYING -> SUCCEEDED (briefing §16, ADR-026).
+
+    The agent's `finish` is a claim, not a result. Before the task ends, the control plane
+    runs its own fixed checks and records each one as `evidence`. What it finds does not
+    change the final status yet: SUCCEEDED means "the agent finished and the evidence is on
+    record". Whether the evidence is good enough is the verdict's job (ADR-010), and deciding
+    it here too would define "success" in two places.
+
+    Durability has the same shape as the agent loop's. `verify.started` is committed first,
+    carrying the summary and iteration count, so a worker that dies from here on resumes
+    straight into verification and never pays for another model call (`core/replay.py`).
+    Then one checkpoint per check: its `evidence` row and its `verify.recorded` event commit
+    together, so a check is either on record or not run yet, never half of each. The
+    `UNIQUE(task_id, kind)` constraint makes "never recorded twice" the database's promise,
+    not only this loop's.
+
+    Only cancellation stops verification, not the max_seconds deadline: the deadline is the
+    agent's budget, and a task whose agent finished at 299 of 300 seconds must not be marked
+    TIMED_OUT because the control plane's own checks took time. Each check carries its own
+    fixed `kill_after` instead, so none of them can hang the task.
+    """
+    if verifier is None:
+        return await _finish(session, task, "SUCCEEDED", iterations, spent, holder, summary=summary)
+
+    task.status = "VERIFYING"
+    if not already_started:
+        await events.append_event(
+            session,
+            task.id,
+            events.VERIFY_STARTED,
+            {"summary": summary, "iterations": iterations},
+        )
+    await _checkpoint(session, task.id, holder)
+
+    for kind in verifier.kinds:
+        if kind in recorded:
+            continue
+        if await cancel.is_requested(session, task.id):
+            raise _RunStopped("CANCELLED", "cancel requested during verification")
+
+        payload = await verifier.check(kind)
+
+        # Same reasoning as the check after every tool in `_run_tools`: `worker.py`'s cancel
+        # watcher kills the container out from under a running check, and the collector
+        # reports that as an ordinary "error". Recording it would put evidence of a kill on
+        # file as if it were evidence about the work.
+        if await cancel.is_requested(session, task.id):
+            raise _RunStopped("CANCELLED", "cancel requested during verification")
+
+        await events.record_evidence(session, task.id, kind, payload)
+        await events.append_event(
+            session,
+            task.id,
+            events.VERIFY_RECORDED,
+            {"kind": kind, "status": payload.get("status")},
+        )
+        await _checkpoint(session, task.id, holder)
+
+    return await _finish(session, task, "SUCCEEDED", iterations, spent, holder, summary=summary)
 
 
 async def _finish(

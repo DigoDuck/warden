@@ -1,4 +1,5 @@
-"""POST /tasks, GET /tasks, GET /tasks/{id}, GET /tasks/{id}/events, GET /tasks/{id}/stream.
+"""POST /tasks, GET /tasks, GET /tasks/{id}, GET /tasks/{id}/events, GET /tasks/{id}/stream,
+GET /tasks/{id}/evidence.
 
 No agent logic here (briefing §10): this module validates input, calls
 `core.queue.enqueue`, and reads rows back. It never touches a provider, a sandbox or the
@@ -23,6 +24,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from warden import audit
 from warden.api.deps import SessionDep, require_scope
 from warden.api.schemas import (
+    EvidenceListOut,
+    EvidenceOut,
     TaskCreate,
     TaskEventOut,
     TaskEventPage,
@@ -34,7 +37,7 @@ from warden.core import cancel, queue
 from warden.core import events as core_events
 from warden.core.events import ITERATION_STARTED
 from warden.identity import Claims
-from warden.models import TASK_STATUSES, AuditLog, ModelCall, Task, TaskEvent
+from warden.models import TASK_STATUSES, AuditLog, Evidence, ModelCall, Task, TaskEvent
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
 
@@ -320,6 +323,32 @@ async def get_task_events(
     # changed. See ADR-020.
     next_after = events[-1].seq if len(events) == limit else None
     return TaskEventPage(events=events, next_after=next_after)
+
+
+@router.get("/{task_id}/evidence", response_model=EvidenceListOut)
+async def get_task_evidence(
+    task_id: uuid.UUID,
+    session: SessionDep,
+    claims: Annotated[Claims, Depends(require_scope("tasks:read"))],
+) -> EvidenceListOut:
+    """What the control plane's own checks found once the agent finished (ADR-026).
+
+    Empty for a task that has not reached verification yet, or never will (cancelled,
+    timed out). At most one row per kind, which the database guarantees.
+    """
+    user_id = _user_id_of(claims)
+    await _task_or_404(session, task_id, claims, user_id)
+    rows = (
+        await session.scalars(
+            select(Evidence).where(Evidence.task_id == task_id).order_by(Evidence.created_at)
+        )
+    ).all()
+    return EvidenceListOut(
+        evidence=[
+            EvidenceOut(kind=row.kind, payload=row.payload, created_at=row.created_at)
+            for row in rows
+        ]
+    )
 
 
 # How often the stream polls the database for new events, and how often it sends a

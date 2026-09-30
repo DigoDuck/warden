@@ -4,6 +4,7 @@
 export const TASK_STATUSES = [
   "QUEUED",
   "RUNNING",
+  "VERIFYING",
   "WAITING_APPROVAL",
   "SUCCEEDED",
   "FAILED",
