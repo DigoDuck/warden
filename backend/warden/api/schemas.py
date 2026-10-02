@@ -35,6 +35,18 @@ class TaskCreate(BaseModel):
     budget: BudgetIn | None = None
 
 
+class VerdictOut(BaseModel):
+    """The independent reviewer's verdict (ADR-010). Model output, not a fact: a client
+    must label it as such. The control plane's own decision is `TaskOut.status`."""
+
+    passed: bool
+    findings: list[str]
+    verifier: str
+    # Set when the reviewer's answer was not a well-formed verdict. Then `passed` is False.
+    malformed_reason: str | None
+    created_at: datetime
+
+
 class TaskOut(BaseModel):
     id: uuid.UUID
     status: str
@@ -45,6 +57,12 @@ class TaskOut(BaseModel):
     finished_at: datetime | None
     cost_usd: Decimal
     iterations: int
+    # What the coder said when it finished (read from the event log; no column). Model
+    # output, never evidence. None until the agent finishes, and for a task that ended
+    # before it did.
+    summary: str | None = None
+    # None until the reviewer has answered.
+    verdict: VerdictOut | None = None
 
 
 class TaskListItemOut(BaseModel):

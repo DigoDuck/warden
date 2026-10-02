@@ -32,12 +32,21 @@ from warden.api.schemas import (
     TaskListItemOut,
     TaskListOut,
     TaskOut,
+    VerdictOut,
 )
 from warden.core import cancel, queue
 from warden.core import events as core_events
-from warden.core.events import ITERATION_STARTED
+from warden.core.events import ITERATION_STARTED, VERIFY_STARTED
 from warden.identity import Claims
-from warden.models import TASK_STATUSES, AuditLog, Evidence, ModelCall, Task, TaskEvent
+from warden.models import (
+    TASK_STATUSES,
+    AuditLog,
+    Evidence,
+    ModelCall,
+    Task,
+    TaskEvent,
+    Verdict,
+)
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
 
@@ -84,6 +93,17 @@ async def _to_task_out(session: AsyncSession, task: Task) -> TaskOut:
         .select_from(TaskEvent)
         .where(TaskEvent.task_id == task.id, TaskEvent.type == ITERATION_STARTED)
     )
+    # The coder's own words live in the event log (`verify.started` carries them so a resumed
+    # worker can finish the task), so reading them costs no new column.
+    summary_payload = await session.scalar(
+        select(TaskEvent.payload)
+        .where(TaskEvent.task_id == task.id, TaskEvent.type == VERIFY_STARTED)
+        .limit(1)
+    )
+    summary = (summary_payload or {}).get("summary")
+    verdict = await session.scalar(
+        select(Verdict).where(Verdict.task_id == task.id, Verdict.verifier == "independent")
+    )
     return TaskOut(
         id=task.id,
         status=task.status,
@@ -94,6 +114,18 @@ async def _to_task_out(session: AsyncSession, task: Task) -> TaskOut:
         finished_at=task.finished_at,
         cost_usd=Decimal(cost or 0),
         iterations=iterations or 0,
+        summary=str(summary) if summary is not None else None,
+        verdict=(
+            VerdictOut(
+                passed=verdict.passed,
+                findings=list(verdict.findings),
+                verifier=verdict.verifier,
+                malformed_reason=verdict.malformed_reason,
+                created_at=verdict.created_at,
+            )
+            if verdict is not None
+            else None
+        ),
     )
 
 
