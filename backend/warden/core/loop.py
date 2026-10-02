@@ -10,8 +10,9 @@ approved or rejected, exactly the way a crash resumes one (core/replay.py's pend
 """
 
 import pathlib
+import re
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -712,6 +713,131 @@ async def _pause_for_approval(
     await _checkpoint(session, task.id, holder)
 
 
+async def _record_policy_decision(
+    session: AsyncSession,
+    task_id: UUID,
+    call: ToolCall,
+    decision: Decision,
+    judged_paths: list[str | None],
+    outcome: ApprovalOutcome | None,
+) -> None:
+    """`policy.decided` for one call, plus the audit row when it is a deny. Shared by the
+    agent's calls (`_run_tools`) and the control plane's own publication (`_publish`), so both
+    leave the same trail."""
+    await events.append_event(
+        session,
+        task_id,
+        events.POLICY_DECIDED,
+        {
+            "tool": call.name,
+            "id": call.id,
+            "effect": decision.effect.value,
+            "matched_rules": decision.matched_rules,
+            "policy_hash": decision.policy_hash[:12],
+            # Every path judged, in the order they were evaluated. One entry for a
+            # single-path tool, several for a multi-path one, so a reader of the audit
+            # trail does not have to guess which of a patch's files decided the call.
+            "paths": judged_paths,
+            **({"approval_id": outcome.approval_id} if outcome is not None else {}),
+        },
+    )
+    if decision.effect is Effect.DENY:
+        await audit.append(
+            session,
+            actor_type="system",
+            actor_id="loop",
+            action="policy.deny",
+            target_type="task",
+            target_id=str(task_id),
+            details={
+                "tool": call.name,
+                "matched_rules": decision.matched_rules,
+                "reason": decision.reason,
+            },
+        )
+
+
+async def _record_execution(
+    session: AsyncSession,
+    task_id: UUID,
+    iteration: int,
+    call: ToolCall,
+    decision: Decision,
+    output: str,
+    error: str | None,
+    duration_ms: int,
+) -> None:
+    """The `tool_calls` and `policy_decisions` rows and the `tool.executed` event of a call
+    that ran (or was refused). The caller checkpoints: row and event commit together, so a
+    completed call is never mistaken for one still pending."""
+    row = await events.record_tool_call(
+        session,
+        task_id,
+        iteration,
+        call,
+        decision=decision.effect.value,
+        result_summary=output[:500],
+        error=error,
+        duration_ms=duration_ms,
+    )
+    await events.record_policy_decision(session, row.id, decision)
+    await events.append_event(
+        session,
+        task_id,
+        events.TOOL_EXECUTED,
+        {
+            "tool": call.name,
+            "id": call.id,
+            "ok": error is None,
+            "effect": decision.effect.value,
+            "duration_ms": duration_ms,
+            # The full output, not the 500-character summary in `tool_calls`. That one
+            # is for a human reading the timeline; this one has to rebuild the exact
+            # tool_result the model already saw.
+            "output": output,
+            "is_error": error is not None,
+        },
+    )
+
+
+async def _record_rejection(
+    session: AsyncSession,
+    task_id: UUID,
+    iteration: int,
+    call: ToolCall,
+    outcome: ApprovalOutcome,
+    output: str,
+) -> None:
+    """A human said no to this call: the rows and the `tool.executed` event that say so, so a
+    later resume never finds the call pending again. No policy decision row: rejecting is a
+    human decision, not a policy one. The caller checkpoints."""
+    await events.record_tool_call(
+        session,
+        task_id,
+        iteration,
+        call,
+        decision="rejected",
+        result_summary=output[:500],
+        error=output,
+        duration_ms=0,
+    )
+    await events.append_event(
+        session,
+        task_id,
+        events.TOOL_EXECUTED,
+        {
+            "tool": call.name,
+            "id": call.id,
+            "ok": False,
+            "effect": "rejected",
+            "duration_ms": 0,
+            "output": output,
+            "is_error": True,
+            "approval_id": outcome.approval_id,
+        },
+    )
+
+
 async def _run_tools(
     session: AsyncSession,
     task_id: UUID,
@@ -776,31 +902,7 @@ async def _run_tools(
             # a different approach. `tool.executed` still has to be written, or a third
             # resume would find this call pending all over again.
             output = f"Rejected by a human reviewer: {outcome.note}"
-            await events.record_tool_call(
-                session,
-                task_id,
-                iteration,
-                call,
-                decision="rejected",
-                result_summary=output[:500],
-                error=output,
-                duration_ms=0,
-            )
-            await events.append_event(
-                session,
-                task_id,
-                events.TOOL_EXECUTED,
-                {
-                    "tool": call.name,
-                    "id": call.id,
-                    "ok": False,
-                    "effect": "rejected",
-                    "duration_ms": 0,
-                    "output": output,
-                    "is_error": True,
-                    "approval_id": outcome.approval_id,
-                },
-            )
+            await _record_rejection(session, task_id, iteration, call, outcome, output)
             await _checkpoint(session, task_id, holder)
             results.append(ToolResult(tool_call_id=call.id, content=output, is_error=True))
             if await cancel.is_requested(session, task_id):
@@ -821,37 +923,7 @@ async def _run_tools(
                 }
             )
 
-        await events.append_event(
-            session,
-            task_id,
-            events.POLICY_DECIDED,
-            {
-                "tool": call.name,
-                "id": call.id,
-                "effect": decision.effect.value,
-                "matched_rules": decision.matched_rules,
-                "policy_hash": decision.policy_hash[:12],
-                # Every path judged, in the order they were evaluated. One entry for a
-                # single-path tool, several for a multi-path one, so a reader of the audit
-                # trail does not have to guess which of a patch's files decided the call.
-                "paths": judged_paths,
-                **({"approval_id": outcome.approval_id} if outcome is not None else {}),
-            },
-        )
-        if decision.effect is Effect.DENY:
-            await audit.append(
-                session,
-                actor_type="system",
-                actor_id="loop",
-                action="policy.deny",
-                target_type="task",
-                target_id=str(task_id),
-                details={
-                    "tool": call.name,
-                    "matched_rules": decision.matched_rules,
-                    "reason": decision.reason,
-                },
-            )
+        await _record_policy_decision(session, task_id, call, decision, judged_paths, outcome)
 
         # ADR-025: a per-call agent token, minted only for a call that is actually about to
         # run (ALLOW, whether from a fresh decision or from an approval that just overrode
@@ -913,33 +985,8 @@ async def _run_tools(
             error = output
 
         duration_ms = int((time.monotonic() - started) * 1000)
-        row = await events.record_tool_call(
-            session,
-            task_id,
-            iteration,
-            call,
-            decision=decision.effect.value,
-            result_summary=output[:500],
-            error=error,
-            duration_ms=duration_ms,
-        )
-        await events.record_policy_decision(session, row.id, decision)
-        await events.append_event(
-            session,
-            task_id,
-            events.TOOL_EXECUTED,
-            {
-                "tool": call.name,
-                "id": call.id,
-                "ok": error is None,
-                "effect": decision.effect.value,
-                "duration_ms": duration_ms,
-                # The full output, not the 500-character summary in `tool_calls`. That one
-                # is for a human reading the timeline; this one has to rebuild the exact
-                # tool_result the model already saw.
-                "output": output,
-                "is_error": error is not None,
-            },
+        await _record_execution(
+            session, task_id, iteration, call, decision, output, error, duration_ms
         )
         await _checkpoint(session, task_id, holder)
 
@@ -1004,6 +1051,9 @@ async def _verify_and_finish(
     marked TIMED_OUT because the control plane's own checks and review took time. Each check
     carries its own fixed `kill_after` instead, so none of them can hang the task. The
     reviewer's cost is recorded and counted in the task's cost, just never enforced.
+
+    When the verdict approves and a `publication` is given, the control plane then proposes the
+    verified diff as a pull request before the task ends (`_publish`, ADR-028).
     """
     if verifier is None:
         return await _finish(session, task, "SUCCEEDED", iterations, spent, holder, summary=summary)
@@ -1080,7 +1130,19 @@ async def _verify_and_finish(
     evidence = await _recorded_evidence(session, task.id)
     resolution = decide(verdict.passed, verdict.malformed_reason, evidence)
     if resolution.status == "SUCCEEDED" and publication is not None:
-        resolution = await _publish(session, task, publication)
+        assert verifier is not None  # run_task refuses a publisher without one
+        resolution = await _publish(
+            session,
+            task,
+            publication,
+            verifier=verifier,
+            evidence=evidence,
+            verdict=verdict,
+            summary=summary,
+            spent=spent,
+            iterations=iterations,
+            holder=holder,
+        )
     return await _finish(
         session,
         task,
@@ -1093,9 +1155,266 @@ async def _verify_and_finish(
     )
 
 
-async def _publish(session: AsyncSession, task: Task, publication: _Publication) -> Resolution:
-    """SKELETON (ADR-028): the publication phase."""
+# ---------------------------------------------------------------------------------------
+# The publication phase (ADR-028)
+# ---------------------------------------------------------------------------------------
+
+
+def _publish_title(spec: str) -> str:
+    """First non-blank line of the spec, the way a commit subject is the first line."""
+    lines = [line.strip() for line in spec.splitlines() if line.strip()]
+    return (lines[0] if lines else "Warden changes")[:100]
+
+
+def _publish_slug(title: str) -> str:
+    """`OpenPrArgs.branch_slug` is `^[a-z0-9][a-z0-9-]{0,40}$`: lowercase, hyphenated, 41 at
+    most, and it must not end up empty or starting with a hyphen after the cut."""
+    slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:41].strip("-")
+    return slug or "changes"
+
+
+def _publish_report(
+    evidence: Mapping[str, Mapping[str, Any]],
+    verdict: Verdict,
+    summary: str | None,
+    spent: Decimal,
+) -> str:
+    """The body a human reads in the pull request: what the control plane measured, what the
+    independent reviewer said, what it cost, and, last and labelled, what the agent claims.
+    `tools/github.py::_pr_report` puts the task id and the file list in front of it."""
+    diff = evidence.get("diff", {})
+    rows = [
+        f"| diff | {diff.get('files_changed', 0)} file(s), "
+        f"+{diff.get('additions', 0)} -{diff.get('deletions', 0)} |"
+    ]
+    rows += [
+        f"| {kind} | {evidence.get(kind, {}).get('status', 'missing')} |"
+        for kind in ("lint", "types", "tests")
+    ]
+    findings = "".join(f"\n- {finding}" for finding in verdict.findings)
+    claimed = "\n".join(f"> {line}" for line in (summary or "(none)").strip().splitlines())
+    return (
+        "**Verification** (run by the control plane, not by the agent)\n\n"
+        "| Check | Result |\n|---|---|\n" + "\n".join(rows) + "\n\n"
+        f"**Independent verdict:** approved{findings}\n\n"
+        f"**Cost:** ${spent}\n\n"
+        f"**Agent summary** (generated by the agent, not verified):\n\n{claimed}"
+    )
+
+
+def _file_signature(diff: Mapping[str, Any]) -> list[tuple[Any, Any, Any]]:
+    """What identifies a diff for the tamper check: each file's path, kind of change and
+    final-content digest, in the diff's own (sorted) order."""
+    return [(f["path"], f["change"], f.get("sha256")) for f in diff.get("files", [])]
+
+
+def _publication_outcome(result: Mapping[str, Any]) -> Resolution:
+    """The task's end, derived from the publish call's recorded `tool.executed`. One mapping
+    for both the live run and a resume that finds the call already finished: a worker that
+    died between writing the result and writing `task.finished` ends the task the same way."""
+    output = str(result.get("output", ""))
+    if result.get("effect") == "rejected":
+        return Resolution("CANCELLED", output)
+    if result.get("is_error"):
+        return Resolution("FAILED", output)
     return Resolution("SUCCEEDED", None)
+
+
+async def _publish(
+    session: AsyncSession,
+    task: Task,
+    publication: _Publication,
+    *,
+    verifier: EvidenceCollector,
+    evidence: Mapping[str, Mapping[str, Any]],
+    verdict: Verdict,
+    summary: str | None,
+    spent: Decimal,
+    iterations: int,
+    holder: str | None,
+) -> Resolution:
+    """After an approving verdict, propose the verified diff as a pull request (ADR-028).
+
+    The model never asks for this: the agent's registry has no `github.open_pr`. The control
+    plane builds the call itself, from the diff evidence and the verdict, and judges it like
+    any other call: the real policy by path, then a human (`open-pr-needs-human`). This reuses
+    the pieces `_run_tools` is made of, not `_run_tools`, because two things it does are wrong
+    here: it enforces `max_seconds` (the agent's budget, not the publication's, the same
+    reasoning as ADR-026) and it answers a rejection to a model, when there is no agent turn
+    left to read it. A rejection here ends the task CANCELLED instead.
+
+    Returns the task's final resolution. Raises `_RunStopped("WAITING_APPROVAL")` to park the
+    task for a human, like an agent call does (`run_task` handles it the same way).
+    """
+    call = publication.call
+    if call is None:
+        diff = evidence.get("diff", {})
+        files = diff.get("files", [])
+        if diff.get("status") != "ok":
+            return await _skip_publication(session, task.id, "the diff evidence is unavailable")
+        if not files:
+            return Resolution("SUCCEEDED", None)  # nothing changed, nothing to publish
+        # ponytail: `github.open_pr` creates UTF-8 blobs only. A deletion would need a tree
+        # entry with `sha: null`, and a binary file a base64 blob; until that exists a change
+        # it cannot carry in full is not published in part (a partial PR is a wrong PR).
+        unsupported = [f["path"] for f in files if f["change"] == "removed" or f["binary"]]
+        if unsupported:
+            return await _skip_publication(
+                session,
+                task.id,
+                "open_pr cannot publish removed or binary files: " + ", ".join(unsupported),
+            )
+
+        title = _publish_title(task.spec)
+        call = ToolCall(
+            # Deterministic, not random: it is the key of `uq_approvals_task_tool_call` and
+            # of the resume, so the same task always asks the same question under one id.
+            id=f"publish-{task.id}",
+            name="github.open_pr",
+            arguments={
+                "title": title,
+                "branch_slug": _publish_slug(title),
+                "paths": [f["path"] for f in files],
+                "body": _publish_report(evidence, verdict, summary, spent),
+            },
+        )
+        # Committed before it is decided: a resume replays this event (`core/replay.py`) and
+        # reuses these exact arguments, so the question a human was asked never changes under
+        # them, whatever the spend or the clock did in between.
+        await events.append_event(
+            session,
+            task.id,
+            events.PUBLISH_REQUESTED,
+            {"id": call.id, "tool": call.name, "arguments": call.arguments},
+        )
+        await _checkpoint(session, task.id, holder)
+
+    if publication.result is not None:
+        return _publication_outcome(publication.result)
+
+    # Cancel is the only stop that applies here, checked before deciding and again before
+    # executing; `max_seconds` and `max_usd` are the agent's (ADR-026).
+    if await cancel.is_requested(session, task.id):
+        raise _RunStopped("CANCELLED", "cancel requested before the publication was decided")
+
+    outcome = publication.approval_decisions.get(call.id)
+    if outcome is not None and outcome.status == "rejected":
+        output = f"publication rejected by a human reviewer: {outcome.note}"
+        await _record_rejection(session, task.id, iterations, call, outcome, output)
+        await _checkpoint(session, task.id, holder)
+        return Resolution("CANCELLED", output)
+
+    decision, judged_paths = await _decide(
+        call, publication.registry, publication.policy, publication.user, task.id
+    )
+    if outcome is not None and outcome.status == "approved" and decision.effect is not Effect.DENY:
+        # Same rule as an agent call: an approval satisfies ALLOW and an unchanged
+        # REQUIRE_APPROVAL, never a DENY the policy added since.
+        decision = decision.model_copy(
+            update={
+                "effect": Effect.ALLOW,
+                "reason": f"approved by a human reviewer (approval {outcome.approval_id})",
+            }
+        )
+    await _record_policy_decision(session, task.id, call, decision, judged_paths, outcome)
+
+    if decision.effect is Effect.DENY:
+        output = (
+            f"the policy refused to publish the verified change: {decision.reason} "
+            f"(matched rules: {', '.join(decision.matched_rules) or 'none'})"
+        )
+        await _record_execution(session, task.id, iterations, call, decision, output, output, 0)
+        await _checkpoint(session, task.id, holder)
+        return Resolution("FAILED", output)
+
+    if decision.effect is Effect.REQUIRE_APPROVAL:
+        await _checkpoint(session, task.id, holder)
+        await _pause_for_approval(session, task, call, decision, holder)
+        raise _RunStopped("WAITING_APPROVAL", decision.reason)
+
+    # ALLOW, by policy or by a human. Before anything is sent, prove the workspace still holds
+    # what was verified: the volume survives the pause, and `pytest` ran the agent's code after
+    # the diff was taken, so a test could have rewritten a file since. Exporting again is the
+    # same read the verifier does (no code runs in the container), and the digests make "the
+    # same files" a comparison instead of a hope. Nothing executes in the container between
+    # this and `open_pr` reading the files.
+    current = await verifier.check("diff")
+    if await cancel.is_requested(session, task.id):
+        # A cancel kills the container mid-export and the collector reports that as an error:
+        # a kill, not a tampering.
+        raise _RunStopped("CANCELLED", "cancel requested before the publication ran")
+    if current.get("status") != "ok" or _file_signature(current) != _file_signature(
+        evidence.get("diff", {})
+    ):
+        output = (
+            "the workspace changed after verification: refusing to publish what was not verified"
+        )
+        await audit.append(
+            session,
+            actor_type="system",
+            actor_id="loop",
+            action="publish.workspace_changed",
+            target_type="task",
+            target_id=str(task.id),
+            details={"tool": call.name, "reason": output},
+        )
+        await _checkpoint(session, task.id, holder)
+        return Resolution("FAILED", output)
+
+    # Same mint-and-spend shape as an agent call (ADR-025): a token scoped by the decision,
+    # live for one call, spent at the gateway a moment later.
+    token = await identity.issue_agent_token(
+        session,
+        publication.keys,
+        task_id=task.id,
+        scopes=decision.scopes or [f"tool:{call.name}"],
+        ttl_seconds=PER_CALL_TOKEN_TTL_SECONDS,
+    )
+    await _checkpoint(session, task.id, holder)
+
+    started = time.monotonic()
+    error: str | None = None
+    try:
+        output = await gateway.execute(
+            session,
+            publication.keys,
+            publication.registry,
+            call.name,
+            call.arguments,
+            token=token,
+            task_id=task.id,
+            checkpoint=lambda: _checkpoint(session, task.id, holder),
+        )
+    except ToolError as exc:
+        # GitHub refused or was unreachable. No retry: backoff is week 8's. The task fails
+        # with the message, and a replay of the same call is safe anyway (idempotent branch).
+        output = error = str(exc)
+    except Exception:
+        # Only a cancel kills the sandbox under a running call; anything else is a bug.
+        if not await cancel.is_requested(session, task.id):
+            raise
+        raise _RunStopped("CANCELLED", "cancel requested while the pull request was opened")  # noqa: B904
+
+    await _record_execution(
+        session,
+        task.id,
+        iterations,
+        call,
+        decision,
+        output,
+        error,
+        int((time.monotonic() - started) * 1000),
+    )
+    await _checkpoint(session, task.id, holder)
+    return Resolution("FAILED", error) if error is not None else Resolution("SUCCEEDED", None)
+
+
+async def _skip_publication(session: AsyncSession, task_id: UUID, why: str) -> Resolution:
+    """The verified work is fine, there is just no pull request to open for it. Appended, not
+    checkpointed: `_finish` commits it in the same transaction as `task.finished`, so a crash
+    leaves both or neither and a resume simply decides again."""
+    await events.append_event(session, task_id, events.PUBLISH_SKIPPED, {"reason": why})
+    return Resolution("SUCCEEDED", f"no pull request: {why}")
 
 
 async def _finish(
