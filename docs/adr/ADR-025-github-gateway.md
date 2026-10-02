@@ -200,3 +200,11 @@ GitHub é uma fonte de verdade só, e é a que já manda.
 - O relatório da PR (`_pr_report`) inclui o `task_id` e a lista de arquivos; não inclui nada do
   `body` além do texto que o próprio agente escreveu, que já passou pela política antes de
   chegar aqui (é o resumo da tarefa, não uma tool call nova).
+
+## Adendo (ADR-028)
+
+`github.open_pr` deixou de ser oferecida ao modelo. `build_registry` não a registra mais; ela
+vive em `build_publish_registry`, que o control plane usa na fase de publicação depois do
+verdict, com os mesmos `path_inspector`, escopo e token por chamada descritos aqui. O trecho
+"só aparece no registry quando `github_repo` e `github_token` estão configurados" vale agora
+para esse registry: sem as duas variáveis não há fase de publicação.

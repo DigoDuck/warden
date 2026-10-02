@@ -191,3 +191,9 @@ modelo decidiria sobre um fato determinístico. O reviewer só pode apertar o ga
   para o reviewer.
 - O Timeline da UI ainda mostra os eventos `verify.*` como JSON cru; uma apresentação própria
   fica para quando a aba Execução for revisada.
+
+## Adendo (ADR-028)
+
+A pendência de "mover `github.open_pr` para depois do verdict" foi resolvida na ADR-028: o
+control plane propõe o PR com o diff verificado depois de um verdict que aprova, e o agente não
+tem mais a tool.

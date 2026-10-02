@@ -225,3 +225,10 @@ sobreviver, e já sobrevive, porque `WAITING_APPROVAL` não é terminal.
   estende o `max_seconds` por esse total. `task.started_at` continua intocado: o relógio não
   aprende sobre pausas, o orçamento é que cresce. O tempo entre a decisão e o próximo claim
   (fila) ainda conta, igual ao de qualquer resume; normalmente são segundos.
+
+## Adendo (ADR-028)
+
+A decisão "rejeitar não cancela a tarefa" vale para chamadas **do agente**, que têm um próximo
+turno do modelo para ler a recusa. A publicação do control plane depois do verdict (ADR-028)
+não tem esse turno: rejeitá-la encerra a tarefa CANCELLED, com a nota no `reason` do
+`task.finished`.
