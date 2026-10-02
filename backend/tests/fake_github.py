@@ -3,6 +3,8 @@ open a pull request (test_github_tool.py, test_publish*.py): never the real netw
 
 import hashlib
 import json
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import httpx
 
@@ -89,3 +91,64 @@ class FakeGitHub:
 
     def client(self) -> httpx.AsyncClient:
         return httpx.AsyncClient(transport=httpx.MockTransport(self.handler))
+
+
+class FakeGitHubServer:
+    """`FakeGitHub` behind a real loopback socket, for the one test whose client lives in
+    another OS process (a worker that gets killed): a `MockTransport` cannot cross that line.
+
+    `block_first` parks the first request until `release` is set. That is what makes "the
+    worker dies while GitHub is being called" something a test can aim at instead of race.
+    """
+
+    def __init__(self, fake: FakeGitHub, *, block_first: bool = False) -> None:
+        self.fake = fake
+        self.first_request = threading.Event()
+        self.release = threading.Event()
+        self._block_first = block_first
+        self._lock = threading.Lock()
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def _serve(self) -> None:
+                body = self.rfile.read(int(self.headers.get("content-length") or 0))
+                request = httpx.Request(
+                    self.command, f"http://127.0.0.1{self.path}", content=body or None
+                )
+                with outer._lock:
+                    first = not outer.first_request.is_set()
+                    outer.first_request.set()
+                if first and outer._block_first:
+                    outer.release.wait(timeout=180)
+                with outer._lock:
+                    response = outer.fake.handler(request)
+                payload = response.content
+                try:
+                    self.send_response(response.status_code)
+                    self.send_header("content-type", "application/json")
+                    self.send_header("content-length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                except OSError:
+                    pass  # the client was killed while it waited: nobody is listening any more
+
+            do_GET = do_POST = do_PATCH = _serve
+
+            def log_message(self, *args: object) -> None:
+                pass
+
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._server.daemon_threads = True
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self._server.server_address[1]}"
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self.release.set()
+        self._server.shutdown()
+        self._server.server_close()
