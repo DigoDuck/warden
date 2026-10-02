@@ -111,3 +111,12 @@ check. A troca foi feita durante a implementação, pelo motivo acima.
   verdict. Isso será corrigido no PR do verdict, não aqui.
 - Semgrep (`sast`) não está na imagem do sandbox. Ele entra na semana 11, com a migração que
   adiciona o kind ao CHECK.
+
+## Adendo (ADR-010)
+
+O verdict e a definição de sucesso chegaram na ADR-010: a partir dela, a tarefa só termina
+SUCCEEDED se o verdict do reviewer independente for bem formado e aprovar **e** os checks
+`lint`, `types` e `tests` tiverem passado; do contrário termina FAILED. O trecho "Evidência não é
+verdict" acima descreve o estado deste PR e foi superado.
+A correção da ordem com `open_pr` ("será corrigido no PR do verdict") ficou para um PR
+seguinte; ver "Consequências" da ADR-010.
