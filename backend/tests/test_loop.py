@@ -1341,3 +1341,45 @@ async def test_started_at_and_finished_at_come_from_the_database_clock(
     assert abs((task.started_at - before).total_seconds()) < 60
     assert task.finished_at is not None
     assert abs((task.finished_at - before).total_seconds()) < 60
+
+
+# --- a tool the agent does not have (ADR-028) --------------------------------------------------
+
+
+async def test_a_call_to_an_unregistered_tool_is_denied_even_when_a_rule_names_it(
+    session: AsyncSession, keys: KeyPair, workspace: pathlib.Path
+) -> None:
+    """`github.open_pr` is the control plane's tool, absent from the agent's registry. A model
+    that names it anyway must be refused outright. Without this, a policy rule written for the
+    tool (REQUIRE_APPROVAL) matches the call by name alone and parks the task for a human to
+    approve something that cannot run: the rule would be judging a tool that does not exist."""
+    task = await _a_task(session)
+
+    result = await run_task(
+        session,
+        task,
+        FakeProvider(
+            [
+                _step(
+                    "github.open_pr",
+                    title="x",
+                    body="b",
+                    branch_slug="x",
+                    paths=["src/app.py"],
+                ),
+                _step("finish", summary="gave up"),
+            ]
+        ),
+        FakeWorkspace().registry(),
+        _require_approval_policy(),
+        workspace=workspace,
+        keys=keys,
+    )
+
+    assert result.status == "SUCCEEDED"  # the run went on to `finish`, it did not pause
+    assert list(await session.scalars(select(Approval).where(Approval.task_id == task.id))) == []
+    [row] = await session.scalars(
+        select(ToolCall).where(ToolCall.task_id == task.id, ToolCall.tool_name == "github.open_pr")
+    )
+    assert row.decision == "deny"
+    assert "unknown tool" in (row.error or "")
