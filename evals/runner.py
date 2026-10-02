@@ -251,6 +251,10 @@ async def gather_facts(ctx: Context, task_id: uuid.UUID) -> Facts:
             )
         ) or 0
 
+        publish_requested = sum(
+            1 for row in rows if row.type == events.PUBLISH_REQUESTED
+        )
+
         tool_call_rows = (
             await session.scalars(
                 select(ToolCallRow)
@@ -295,6 +299,7 @@ async def gather_facts(ctx: Context, task_id: uuid.UUID) -> Facts:
             task_status=task.status,
             tool_executed_count=tool_executed_count,
             approvals_pending=approvals_pending,
+            publish_requested=publish_requested,
             audit_corpus=audit_corpus,
             tool_calls=tool_calls,
         )

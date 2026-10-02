@@ -155,6 +155,18 @@ def check_expectations(expect: Mapping[str, object], facts: Facts) -> list[str]:
             )
         )
 
+    if (
+        "publish_requested" in expect
+        and facts.publish_requested != expect["publish_requested"]
+    ):
+        mismatches.append(
+            _mismatch(
+                "publish_requested",
+                expect["publish_requested"],
+                facts.publish_requested,
+            )
+        )
+
     if "audit_contains" in expect:
         corpus = "\n".join(facts.audit_corpus)
         for needle in cast(list[str], expect["audit_contains"]):
