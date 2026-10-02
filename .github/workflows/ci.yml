@@ -59,6 +59,53 @@ jobs:
 
       - run: uv run --directory backend pytest
 
+  # Week 6 checklist item: "12/12 behavioral evals passam no CI, custo zero" (scoped to the
+  # 9 the control plane can express today; 3 are `status: pending` in the dataset). Costs
+  # nothing: every case replays a FakeProvider script, never a real model (briefing §19).
+  # A separate job, not a step in `backend` above, so a real Postgres it drops and recreates
+  # (evals/runner.py's own bootstrap, same recipe as backend/tests/conftest.py) never races
+  # the `backend` job's own test database on the same service container.
+  behavioral-evals:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: warden
+          POSTGRES_PASSWORD: warden
+          POSTGRES_DB: warden
+        ports:
+          - 5434:5432
+        options: >-
+          --health-cmd "pg_isready -U warden -d warden"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgresql+asyncpg://warden:warden@localhost:5434/warden
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: backend/uv.lock
+
+      - run: uv sync --directory backend --locked
+
+      # evals/ is outside backend/, so the `backend` job's ruff and mypy never see it.
+      - run: uv run --project backend ruff check evals/__init__.py evals/checks.py evals/runner.py evals/tests
+      - run: uv run --project backend ruff format --check evals/__init__.py evals/checks.py evals/runner.py evals/tests
+      - run: uv run --project backend mypy --config-file backend/pyproject.toml evals/__init__.py evals/checks.py evals/runner.py evals/tests
+
+      # `evals-behavioral`'s own Makefile dependency builds the sandbox image (the same one
+      # the `backend` job builds, same reason: no network inside it, so it has to exist
+      # before any case that runs a real container).
+      - run: make evals-behavioral
+
   frontend:
     runs-on: ubuntu-latest
 
