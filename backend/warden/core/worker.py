@@ -323,6 +323,7 @@ class Worker:
         lease_seconds: int = queue.DEFAULT_LEASE_SECONDS,
         budget: Budget | None = None,
         profile: SandboxProfile | None = None,
+        keep_workspaces: bool = False,
     ) -> None:
         self._sessions = session_factory
         self._provider_factory = provider_factory
@@ -336,6 +337,11 @@ class Worker:
         self._lease_seconds = lease_seconds
         self._budget = budget
         self._profile = profile or SandboxProfile()
+        # Only the capability evals set this (evals/coding.py): the hidden acceptance test has
+        # to run against the agent's final workspace, which this worker would otherwise throw
+        # away the moment the task is terminal. Whoever sets it owns the volume and must
+        # discard it; the janitor (`discard_orphaned_workspace_volumes`) is the backstop.
+        self._keep_workspaces = keep_workspaces
         self.id = worker_id()
         self._stopping = asyncio.Event()
 
@@ -429,7 +435,7 @@ class Worker:
             # The container always goes. The workspace only goes when the task is over: a
             # task between workers still needs what it changed before it was interrupted.
             await sandbox.destroy()
-            if not lease_lost:
+            if not lease_lost and not self._keep_workspaces:
                 async with self._sessions() as session:
                     finished = await session.get(Task, task_id)
                     if finished is not None and finished.status in TERMINAL_STATUSES:

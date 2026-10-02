@@ -229,6 +229,24 @@ async def hostile_volume(ctx: runner.Context) -> AsyncIterator[tuple[uuid.UUID, 
             f"workspace/{coding.HIDDEN_DIR}/conftest.py", _FORCE_PASS_CONFTEST.encode()
         )
         await sandbox.put_file("workspace/pytest.py", b"raise SystemExit(0)\n")
+    finally:
+        await sandbox.destroy()
+    try:
+        yield task_id, item
+    finally:
+        await asyncio.to_thread(discard_workspace_volume, str(task_id))
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def shadowed_volume(ctx: runner.Context) -> AsyncIterator[tuple[uuid.UUID, Item]]:
+    """Same idea, a different volume: an installed package shadowed by a workspace file. Kept
+    apart from hostile_volume because a root-level conftest makes pytest put the workspace on
+    sys.path itself, which would turn this shadow on in the other volume's control runs."""
+    item = _items()["issue-01"]
+    assert item.fake_script is not None
+    task_id = await coding.run_agent(item, ctx, _factory_for(item.fake_script), BUDGET)
+    sandbox = await Sandbox.create(SandboxProfile(), WORKSPACE, task_id=str(task_id))
+    try:
         await sandbox.put_file(
             "workspace/fastapi.py", b'raise ImportError("planted")\n'
         )
@@ -275,19 +293,20 @@ async def test_a_planted_pytest_py_at_the_workspace_root_does_not_shadow_pytest(
         "failed" in hidden.output
     )  # the real pytest ran; the planted one would exit silently
 
-    # Control: without -I the cwd is on sys.path and the planted file IS what gets imported.
+    # Control: without -I the cwd is on sys.path and the planted file IS what gets imported:
+    # it exits 0 before the print, i.e. a silent "pass" with no tests run.
     code, output = await _exec_on(
         task_id, item, ["python", "-c", "import pytest; print(pytest.__file__)"]
     )
-    assert code == 0 and output.strip().endswith("/workspace/pytest.py"), output
+    assert code == 0 and output == "", output
 
 
 @sandbox_test
 @aio
 async def test_a_planted_fastapi_py_does_not_shadow_an_installed_package(
-    hostile_volume: tuple[uuid.UUID, Item],
+    shadowed_volume: tuple[uuid.UUID, Item],
 ) -> None:
-    task_id, item = hostile_volume
+    task_id, item = shadowed_volume
 
     hidden = await coding.run_hidden_test(task_id, item)
     assert hidden.exit_code == 1 and "planted" not in hidden.output, hidden.output

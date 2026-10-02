@@ -1,4 +1,4 @@
-.PHONY: db-up db-down migrate revision test lint fmt sandbox-image demo-fake demo worker keys api user-token frontend-install frontend-dev frontend-test evals-behavioral
+.PHONY: db-up db-down migrate revision test lint fmt sandbox-image demo-fake demo worker keys api user-token frontend-install frontend-dev frontend-test evals-behavioral evals-coding
 
 # --directory avoids "cd backend &&", which breaks when the Windows make picks
 # cmd.exe instead of sh. Each recipe stays a single command.
@@ -38,7 +38,7 @@ test: sandbox-image
 
 # evals/ sits outside backend/, so backend's own ruff/mypy roots never see it. Listed by
 # file: evals/datasets/ holds fixture repos (target_repo) that are data, not our code.
-EVALS_PY := evals/__init__.py evals/checks.py evals/runner.py evals/tests
+EVALS_PY := evals/__init__.py evals/checks.py evals/runner.py evals/coding.py evals/coding_checks.py evals/tests
 
 lint:
 	$(UV) ruff check
@@ -99,3 +99,18 @@ frontend-test:
 evals-behavioral: sandbox-image
 	$(UV_ROOT) pytest evals/tests -q
 	$(UV_ROOT) python -m evals.runner evals/datasets/behavioral_v1.yaml --write-metrics
+
+# Capability evals (briefing §19/§46-48): the ten coding_v1 issues as REAL tasks through the
+# production path, scored by hidden acceptance tests. PROVIDER=anthropic (default) calls the
+# real API, spends money (capped: $1/task, $5 total, see evals/coding.py) and publishes the
+# table to docs/metrics.md. PROVIDER=fake replays scripts, costs nothing, publishes nothing
+# (the runner refuses --write-metrics for it). Own scratch database (WARDEN_TEST_DB, default
+# "warden_evals_coding"). Not part of CI: it needs a key.
+PROVIDER ?= anthropic
+ifeq ($(PROVIDER),anthropic)
+CODING_METRICS := --write-metrics
+endif
+
+evals-coding: sandbox-image
+	$(UV_ROOT) pytest evals/tests/test_coding_checks.py -q
+	$(UV_ROOT) python -m evals.coding --provider $(PROVIDER) $(CODING_METRICS)
