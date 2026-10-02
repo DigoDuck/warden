@@ -89,6 +89,7 @@ class FileChange(BaseModel):
     additions: int
     deletions: int
     binary: bool
+    sha256: str | None = None
 
 
 class DiffEvidence(BaseModel):
