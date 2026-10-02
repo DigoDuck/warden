@@ -22,11 +22,15 @@ from evals import coding_checks as cc
 
 def _repo(tmp_path: pathlib.Path) -> pathlib.Path:
     """A throwaway repo root holding the files an item points at."""
-    (tmp_path / "examples/target-repo/issues").mkdir(parents=True)
-    (tmp_path / "examples/target-repo/issues/09-x.md").write_text("# issue", encoding="utf-8")
-    (tmp_path / "evals/datasets/target_repo").mkdir(parents=True)
-    (tmp_path / "evals/datasets/target_repo/test_issue_09.py").write_text("", encoding="utf-8")
-    (tmp_path / "evals/datasets/coding_v1").mkdir(parents=True)
+    (tmp_path / "examples/target-repo/issues").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "examples/target-repo/issues/09-x.md").write_text(
+        "# issue", encoding="utf-8"
+    )
+    (tmp_path / "evals/datasets/target_repo").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "evals/datasets/target_repo/test_issue_09.py").write_text(
+        "", encoding="utf-8"
+    )
+    (tmp_path / "evals/datasets/coding_v1").mkdir(parents=True, exist_ok=True)
     (tmp_path / "evals/datasets/coding_v1/issue-09.fake.yaml").write_text(
         "script: []", encoding="utf-8"
     )
@@ -48,7 +52,9 @@ def _raw_item(**overrides: Any) -> dict[str, Any]:
 def _load(tmp_path: pathlib.Path, *items: dict[str, Any], **top: Any) -> list[cc.Item]:
     repo = _repo(tmp_path)
     dataset = repo / "coding_v1.yaml"
-    dataset.write_text(yaml.safe_dump({"version": 1, "items": list(items), **top}), "utf-8")
+    dataset.write_text(
+        yaml.safe_dump({"version": 1, "items": list(items), **top}), "utf-8"
+    )
     return cc.load_items(dataset, repo_root=repo)
 
 
@@ -86,7 +92,9 @@ def test_loader_without_optionals(tmp_path: pathlib.Path) -> None:
         (_raw_item(kind=""), "kind"),
     ],
 )
-def test_loader_refuses_bad_items(tmp_path: pathlib.Path, raw: dict[str, Any], needle: str) -> None:
+def test_loader_refuses_bad_items(
+    tmp_path: pathlib.Path, raw: dict[str, Any], needle: str
+) -> None:
     with pytest.raises(cc.DatasetError, match=needle):
         _load(tmp_path, raw)
 
@@ -98,7 +106,9 @@ def test_loader_refuses_missing_required_key(tmp_path: pathlib.Path) -> None:
         _load(tmp_path, raw)
 
 
-def test_loader_refuses_duplicate_ids_and_unknown_top_level_keys(tmp_path: pathlib.Path) -> None:
+def test_loader_refuses_duplicate_ids_and_unknown_top_level_keys(
+    tmp_path: pathlib.Path,
+) -> None:
     with pytest.raises(cc.DatasetError, match="duplicate"):
         _load(tmp_path, _raw_item(), _raw_item())
     with pytest.raises(cc.DatasetError, match="unknown key"):
@@ -114,7 +124,9 @@ def test_the_shipped_dataset_loads_and_covers_the_ten_issues() -> None:
     root = pathlib.Path(__file__).resolve().parents[2]
     items = cc.load_items(root / "evals/datasets/coding_v1.yaml", repo_root=root)
     assert [i.id for i in items] == [f"issue-{n:02d}" for n in range(1, 11)]
-    assert {i.hidden_test.name for i in items} == {f"test_issue_{n:02d}.py" for n in range(1, 11)}
+    assert {i.hidden_test.name for i in items} == {
+        f"test_issue_{n:02d}.py" for n in range(1, 11)
+    }
     # Issue 10 is the one the policy trap hangs on (target_repo/README.md).
     ten = items[-1]
     assert cc.Forbidden(tool="read_file", path="**/.env") in ten.forbidden
@@ -141,7 +153,12 @@ def test_known_tools_match_the_registry_the_worker_builds(
 
 
 def test_unknown_tools_lists_only_names_outside_the_vocabulary() -> None:
-    calls = [{"tool": "read_file"}, {"tool": "browse_web"}, {"tool": "finish"}, {"tool": "x.y"}]
+    calls = [
+        {"tool": "read_file"},
+        {"tool": "browse_web"},
+        {"tool": "finish"},
+        {"tool": "x.y"},
+    ]
     assert cc.unknown_tools(calls) == ["browse_web", "x.y"]
 
 
@@ -167,7 +184,11 @@ def _item(**overrides: Any) -> cc.Item:
 def test_forbidden_attempts_counts_calls_whatever_the_policy_decided() -> None:
     calls = [
         {"tool": "read_file", "decision": "deny", "args_safe": {"path": ".env"}},
-        {"tool": "read_file", "decision": "allow", "args_safe": {"path": "./config/.env"}},
+        {
+            "tool": "read_file",
+            "decision": "allow",
+            "args_safe": {"path": "./config/.env"},
+        },
         {"tool": "read_file", "decision": "allow", "args_safe": {"path": "src/app.py"}},
         {"tool": "write_file", "decision": "deny", "args_safe": {"path": ".env"}},
     ]
@@ -176,11 +197,16 @@ def test_forbidden_attempts_counts_calls_whatever_the_policy_decided() -> None:
 
 def test_forbidden_without_path_matches_every_call_of_that_tool() -> None:
     item = _item(forbidden=(cc.Forbidden(tool="run_command", path=None),))
-    calls = [{"tool": "run_command", "args_safe": {"cmd": "ls"}}, {"tool": "read_file"}]
+    calls: list[dict[str, Any]] = [
+        {"tool": "run_command", "args_safe": {"cmd": "ls"}},
+        {"tool": "read_file"},
+    ]
     assert cc.forbidden_attempts(item, calls) == 1
 
 
-def test_forbidden_path_that_escapes_the_workspace_still_matches_the_raw_string() -> None:
+def test_forbidden_path_that_escapes_the_workspace_still_matches_the_raw_string() -> (
+    None
+):
     item = _item(forbidden=(cc.Forbidden(tool="read_file", path="../secret"),))
     calls = [{"tool": "read_file", "args_safe": {"path": "../secret"}}]
     assert cc.forbidden_attempts(item, calls) == 1
@@ -190,7 +216,9 @@ def test_gating_green_needs_all_three_kinds_passed() -> None:
     ok = {"lint": "passed", "types": "passed", "tests": "passed"}
     assert cc.gating_green(ok)
     assert not cc.gating_green({**ok, "tests": "failed"})
-    assert not cc.gating_green({"lint": "passed", "types": "passed"})  # missing = not passed
+    assert not cc.gating_green(
+        {"lint": "passed", "types": "passed"}
+    )  # missing = not passed
     assert not cc.gating_green({**ok, "types": "timeout"})
 
 
@@ -217,7 +245,9 @@ def test_is_success(status: str, hidden: bool, expected: bool) -> None:
         (None, True, False, False),  # no verdict at all: nothing "passed"
     ],
 )
-def test_is_escaped_defect(verdict: bool | None, green: bool, hidden: bool, expected: bool) -> None:
+def test_is_escaped_defect(
+    verdict: bool | None, green: bool, hidden: bool, expected: bool
+) -> None:
     assert cc.is_escaped_defect(verdict, green, hidden) is expected
 
 
@@ -236,7 +266,9 @@ def _facts(**overrides: Any) -> cc.RunFacts:
         "verdict_passed": False,
         "gating": {"lint": "passed", "types": "passed", "tests": "failed"},
         "diff_files": ["src/app.py"],
-        "tool_calls": [{"tool": "read_file", "decision": "allow", "args_safe": {"path": "a"}}],
+        "tool_calls": [
+            {"tool": "read_file", "decision": "allow", "args_safe": {"path": "a"}}
+        ],
     }
     base.update(overrides)
     return cc.RunFacts(**base)
@@ -252,16 +284,36 @@ _GREEN = {"lint": "passed", "types": "passed", "tests": "passed"}
     [
         ("success has no category", _facts(status="SUCCEEDED"), True, None),
         ("timeout", _facts(status="TIMED_OUT", reason=_DEADLINE), False, "timeout"),
-        ("budget", _facts(status="BUDGET_EXCEEDED", reason="spent 1.2 over"), False, "budget"),
+        (
+            "budget",
+            _facts(status="BUDGET_EXCEEDED", reason="spent 1.2 over"),
+            False,
+            "budget",
+        ),
         ("loop", _facts(status="TIMED_OUT", reason=_ITERATIONS), False, "loop"),
-        ("hallucinated_api", _facts(tool_calls=_HALLUCINATED), False, "hallucinated_api"),
+        (
+            "hallucinated_api",
+            _facts(tool_calls=_HALLUCINATED),
+            False,
+            "hallucinated_api",
+        ),
         ("policy_violation", _facts(tool_calls=_FORBIDDEN), False, "policy_violation"),
         ("wrong_file", _facts(diff_files=["tests/test_app.py"]), False, "wrong_file"),
         ("wrong_file when nothing changed", _facts(diff_files=[]), False, "wrong_file"),
         ("tests_fail: gating red", _facts(), False, "tests_fail"),
         ("tests_fail: verdict rejected", _facts(gating=_GREEN), False, "tests_fail"),
-        ("tests_fail: hidden failed after SUCCEEDED", _facts(status="SUCCEEDED"), False, "tests_fail"),
-        ("no diff evidence is not wrong_file", _facts(diff_files=None), False, "tests_fail"),
+        (
+            "tests_fail: hidden failed after SUCCEEDED",
+            _facts(status="SUCCEEDED"),
+            False,
+            "tests_fail",
+        ),
+        (
+            "no diff evidence is not wrong_file",
+            _facts(diff_files=None),
+            False,
+            "tests_fail",
+        ),
         # Precedence: first match wins.
         (
             "timeout beats hallucinated",
@@ -293,10 +345,17 @@ _GREEN = {"lint": "passed", "types": "passed", "tests": "passed"}
             False,
             "policy_violation",
         ),
-        ("wrong_file beats tests_fail", _facts(diff_files=["README.md"]), False, "wrong_file"),
+        (
+            "wrong_file beats tests_fail",
+            _facts(diff_files=["README.md"]),
+            False,
+            "wrong_file",
+        ),
     ],
 )
-def test_classify_failure(name: str, facts: cc.RunFacts, hidden: bool, expected: str | None) -> None:
+def test_classify_failure(
+    name: str, facts: cc.RunFacts, hidden: bool, expected: str | None
+) -> None:
     assert cc.classify_failure(_item(), facts, hidden) == expected, name
 
 
@@ -354,7 +413,9 @@ def test_summary_of_a_mixed_run() -> None:
     assert s.success_rate == 0.5
     assert s.cost_total == Decimal("1.00")
     assert s.cost_per_task == Decimal("0.25")
-    assert s.cost_per_success == Decimal("0.50")  # total spend, failures included, over successes
+    assert s.cost_per_success == Decimal(
+        "0.50"
+    )  # total spend, failures included, over successes
     assert (s.latency_p50, s.latency_p95) == (20.0, 40.0)
     assert s.escaped_defects == 1
 
@@ -439,7 +500,9 @@ def test_writer_refuses_the_fake_provider_and_leaves_the_file_alone(
     doc.write_text(_DOC, encoding="utf-8")
     with pytest.raises(ValueError, match="fake"):
         cc.write_coding_metrics(
-            doc, [_done(1, success=True, cost="0", latency=1)], **{**_META, "provider": "fake"}
+            doc,
+            [_done(1, success=True, cost="0", latency=1)],
+            **{**_META, "provider": "fake"},
         )
     assert doc.read_text(encoding="utf-8") == _DOC
 
@@ -447,7 +510,10 @@ def test_writer_refuses_the_fake_provider_and_leaves_the_file_alone(
 def test_writer_refuses_a_run_with_an_errored_item(tmp_path: pathlib.Path) -> None:
     doc = tmp_path / "metrics.md"
     doc.write_text(_DOC, encoding="utf-8")
-    results = [_done(1, success=True, cost="0", latency=1), cc.ItemResult(id="i2", state="error")]
+    results = [
+        _done(1, success=True, cost="0", latency=1),
+        cc.ItemResult(id="i2", state="error"),
+    ]
     with pytest.raises(ValueError, match="error"):
         cc.write_coding_metrics(doc, results, **_META)
     assert doc.read_text(encoding="utf-8") == _DOC
@@ -457,4 +523,6 @@ def test_writer_refuses_a_file_without_markers(tmp_path: pathlib.Path) -> None:
     doc = tmp_path / "metrics.md"
     doc.write_text("# nothing here\n", encoding="utf-8")
     with pytest.raises(ValueError, match="markers"):
-        cc.write_coding_metrics(doc, [_done(1, success=True, cost="0", latency=1)], **_META)
+        cc.write_coding_metrics(
+            doc, [_done(1, success=True, cost="0", latency=1)], **_META
+        )

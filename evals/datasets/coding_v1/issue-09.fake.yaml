@@ -1,0 +1,20 @@
+# Scripted FakeProvider run that really fixes issue 09 (case-insensitive search) with the
+# write tools. Proves the coding runner end to end without a model: the hidden test must
+# pass against what this leaves in the workspace, so the item is a `success`.
+# Not a measurement of any model; `--write-metrics` refuses the fake provider.
+# The last context line of the hunk is a blank source line: one space after the indent.
+script:
+  - tool_call: { name: read_file, args: { path: src/app.py } }
+  - tool_call:
+      name: apply_patch
+      args:
+        diff: |
+          --- a/src/app.py
+          +++ b/src/app.py
+          @@ -49,3 +49,3 @@
+               """Return widgets whose name contains the query string."""
+          -    return [widget for widget in _WIDGETS.values() if q in widget.name]
+          +    return [w for w in _WIDGETS.values() if q.lower() in w.name.lower()]
+           
+  - tool_call: { name: finish, args: { summary: "Made /widgets/search case-insensitive." } }
+  - tool_call: { name: submit_verdict, args: { passed: true, findings: [] } }

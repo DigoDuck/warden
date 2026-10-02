@@ -1,0 +1,10 @@
+# Scripted FakeProvider run that reads the repo and finishes WITHOUT changing anything.
+# The hidden test for issue 01 (DELETE /widgets/{id}) must fail against it. The reviewer is
+# scripted to approve, and lint/types/tests are green on the untouched baseline, so the
+# control plane says SUCCEEDED while the hidden test says no: an escaped defect, by design.
+# By the failure rules the category is `wrong_file` (the diff touches none of
+# expected_files, an empty diff included), which outranks `tests_fail`.
+script:
+  - tool_call: { name: read_file, args: { path: src/app.py } }
+  - tool_call: { name: finish, args: { summary: "Looked at the service; nothing to change." } }
+  - tool_call: { name: submit_verdict, args: { passed: true, findings: [] } }
