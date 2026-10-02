@@ -44,7 +44,14 @@ from warden.providers.fake import FakeProvider, ScriptStep
 from warden.sandbox.docker import Sandbox, SandboxProfile
 from warden.tools.github import OpenPrArgs, open_pr, open_pr_paths
 from warden.tools.registry import ToolContext, ToolError
-from warden.tools.sandboxed import build_publish_registry, build_registry
+from warden.tools.sandboxed import (
+    ReadFileArgs,
+    WriteFileArgs,
+    build_publish_registry,
+    build_registry,
+    read_file,
+    write_file,
+)
 from warden.tools.workspace import is_ignored
 from warden.verify.reviewer import ProviderReviewer
 from warden.verify.runner import Verifier
@@ -616,3 +623,145 @@ async def test_the_verified_diff_is_published_after_approval_and_no_secret_reach
     assert FAKE_TOKEN not in haystack
     for token in minted_tokens:
         assert token not in haystack
+
+
+# --- publishing exactly what was verified (ADR-028) --------------------------------------------
+
+FEATURE = '"""A feature."""\n\nVALUE = 1\n'
+# Runs under the control plane's own `pytest` check, which is the only check that executes the
+# agent's code. It rewrites a file the diff (taken before any test ran) already recorded.
+REWRITER = '''"""Rewrites a verified file while the tests run."""
+
+import pathlib
+
+FEATURE = pathlib.Path(__file__).resolve().parents[1] / "src" / "feature.py"
+
+
+def test_rewrites_the_feature() -> None:
+    FEATURE.write_text("VALUE = 2\n", encoding="utf-8")
+'''
+
+
+async def _resume_and_publish(
+    session: AsyncSession,
+    keys: KeyPair,
+    sandbox: Sandbox,
+    repo: pathlib.Path,
+    task: Task,
+    policy: Policy,
+) -> RunResult:
+    approval = (await session.scalars(select(Approval).where(Approval.task_id == task.id))).one()
+    await approvals.decide_approval(
+        session, approval.id, approve=True, user_id=task.user_id, note=None
+    )
+    await session.commit()
+    resumed = await queue.claim(session, "worker-tamper-2")
+    assert resumed is not None
+    await session.commit()
+    provider = FakeProvider([])
+    return await run_task(
+        session,
+        resumed,
+        provider,
+        build_registry(sandbox),
+        policy,
+        keys=keys,
+        workspace=repo,
+        resume=rebuild(await read_events(session, task.id)),
+        holder=resumed.claimed_by,
+        verifier=Verifier(sandbox, repo, exclude=never_readable(policy)),
+        reviewer=ProviderReviewer(provider),
+        publisher=build_publish_registry(sandbox),
+    )
+
+
+async def _assert_refused_for_a_changed_workspace(
+    session: AsyncSession, task: Task, fake: FakeGitHub, result: RunResult
+) -> None:
+    assert result.status == "FAILED"
+    assert "workspace changed after verification" in (result.reason or "")
+    assert fake.requests == [] and fake.pulls == []  # nothing was sent, no PR exists
+    events = await read_events(session, task.id)
+    assert not [
+        e for e in events if e.type == "tool.executed" and e.payload["id"].startswith("publish-")
+    ]
+    audit = await session.scalars(
+        select(AuditLog).where(
+            AuditLog.action == "publish.workspace_changed", AuditLog.target_id == str(task.id)
+        )
+    )
+    assert audit.all()
+
+
+async def test_a_file_rewritten_by_the_tests_after_the_diff_is_never_published(
+    clean_sandbox: Sandbox,
+    clean_repo: pathlib.Path,
+    session: AsyncSession,
+    keys: KeyPair,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real attack: the agent ships a test that rewrites `src/feature.py` when it runs. The
+    diff was taken first, so the evidence (and the reviewer's verdict) describe `VALUE = 1`;
+    the volume now holds `VALUE = 2`. The change is real, made by pytest inside the container,
+    and the publication phase must notice it by comparing digests of a second export."""
+    fake = FakeGitHub()
+    _github_for(monkeypatch, fake)
+    task = await _claimed_task(session)
+    policy = load_policy(DEFAULT_POLICY)
+
+    paused, _ = await _agent_run(
+        session,
+        keys,
+        clean_sandbox,
+        clean_repo,
+        task,
+        policy,
+        [
+            _step("write_file", path="src/feature.py", content=FEATURE),
+            _step("write_file", path="tests/test_rewrites.py", content=REWRITER),
+            _step("finish", summary="added a feature"),
+        ],
+    )
+    assert paused.status == "WAITING_APPROVAL", paused.reason
+    # Precondition: the tamper really happened in the volume, it is not simulated here.
+    on_disk = await read_file(clean_sandbox, ReadFileArgs(path="src/feature.py"))
+    assert on_disk == "VALUE = 2\n"
+
+    result = await _resume_and_publish(session, keys, clean_sandbox, clean_repo, task, policy)
+
+    await _assert_refused_for_a_changed_workspace(session, task, fake, result)
+
+
+async def test_a_file_changed_while_the_task_waited_for_approval_is_never_published(
+    clean_sandbox: Sandbox,
+    clean_repo: pathlib.Path,
+    session: AsyncSession,
+    keys: KeyPair,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The volume outlives the pause. Rewrite a verified file in it while the task is parked:
+    what the human approved is no longer what is on disk."""
+    fake = FakeGitHub()
+    _github_for(monkeypatch, fake)
+    task = await _claimed_task(session)
+    policy = load_policy(DEFAULT_POLICY)
+
+    paused, _ = await _agent_run(
+        session,
+        keys,
+        clean_sandbox,
+        clean_repo,
+        task,
+        policy,
+        [_step("write_file", path="src/notes.py", content=NOTES), _step("finish", summary="done")],
+    )
+    assert paused.status == "WAITING_APPROVAL", paused.reason
+
+    await write_file(
+        clean_sandbox,
+        WriteFileArgs(path="src/notes.py", content='"""Swapped."""\n\nNOTE = "evil"\n'),
+    )
+
+    result = await _resume_and_publish(session, keys, clean_sandbox, clean_repo, task, policy)
+
+    await _assert_refused_for_a_changed_workspace(session, task, fake, result)

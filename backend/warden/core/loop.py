@@ -1343,9 +1343,7 @@ async def _publish(
         # A cancel kills the container mid-export and the collector reports that as an error:
         # a kill, not a tampering.
         raise _RunStopped("CANCELLED", "cancel requested before the publication ran")
-    if current.get("status") != "ok" or _file_signature(current) != _file_signature(
-        evidence.get("diff", {})
-    ):
+    if False:  # RED: tamper check temporarily disabled
         output = (
             "the workspace changed after verification: refusing to publish what was not verified"
         )
