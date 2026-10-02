@@ -10,13 +10,14 @@ never touches the network, so the assertions are about what warden sent, not abo
 import json
 import os
 import pathlib
+import shutil
 import uuid
 from collections.abc import AsyncIterator
 
 import httpx
 import pytest
 from pydantic import SecretStr
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from tests.fake_github import FakeGitHub
@@ -25,17 +26,28 @@ from warden.audit.log import _LOCK_KEY
 from warden.config import Settings
 from warden.core import approvals, queue
 from warden.core.events import read_events
-from warden.core.loop import run_task
+from warden.core.loop import RunResult, run_task
 from warden.core.replay import rebuild
 from warden.identity.jwt import KeyPair
 from warden.models import Approval, AuditLog, Task, ToolCall, User
-from warden.policy.engine import Effect, PolicyContext, UserRef, combine, load_policy
+from warden.policy.engine import (
+    Effect,
+    Policy,
+    PolicyContext,
+    UserRef,
+    combine,
+    load_policy,
+    never_readable,
+)
 from warden.providers.base import ToolCall as ProviderToolCall
 from warden.providers.fake import FakeProvider, ScriptStep
 from warden.sandbox.docker import Sandbox, SandboxProfile
 from warden.tools.github import OpenPrArgs, open_pr, open_pr_paths
 from warden.tools.registry import ToolContext, ToolError
 from warden.tools.sandboxed import build_publish_registry, build_registry
+from warden.tools.workspace import is_ignored
+from warden.verify.reviewer import ProviderReviewer
+from warden.verify.runner import Verifier
 
 pytestmark = pytest.mark.sandbox
 
@@ -56,6 +68,17 @@ def docker_available() -> None:
         if os.environ.get("CI"):
             raise RuntimeError(f"CI requires a working Docker daemon: {exc}") from exc
         pytest.skip(f"Docker is not available on this machine: {exc}")
+
+
+@pytest.fixture(autouse=True)
+async def _empty_queue(session: AsyncSession) -> AsyncIterator[None]:
+    """`_claims()` commits QUEUED tasks, and `queue.claim` hands out the oldest one, so without
+    this the end-to-end test could claim a task another test left behind instead of its own."""
+    await session.execute(text("TRUNCATE tasks, users CASCADE"))
+    await session.commit()
+    yield
+    await session.execute(text("TRUNCATE tasks, users CASCADE"))
+    await session.commit()
 
 
 @pytest.fixture
@@ -401,7 +424,7 @@ async def _claimed_task(session: AsyncSession) -> Task:
     session.add(user)
     await session.flush()
     await queue.enqueue(
-        session, user_id=user.id, spec="open a pr", idempotency_key=str(uuid.uuid4())
+        session, user_id=user.id, spec="Add a notes module", idempotency_key=str(uuid.uuid4())
     )
     await session.commit()
     claimed = await queue.claim(session, "worker-e2e")
@@ -409,43 +432,39 @@ async def _claimed_task(session: AsyncSession) -> Task:
     return claimed
 
 
-def _open_pr_step() -> ScriptStep:
+NOTES = '"""Notes the agent added."""\n\nNOTE = "hello"\n'
+
+
+def _step(name: str, **arguments: object) -> ScriptStep:
     return ScriptStep(
-        tool_calls=[
-            ProviderToolCall(
-                id="call-open-pr",
-                name="github.open_pr",
-                arguments={
-                    "title": "Add a feature",
-                    "body": "Closes the ticket.",
-                    "branch_slug": "e2e",
-                    "paths": ["src/app.py"],
-                },
-            )
-        ]
+        tool_calls=[ProviderToolCall(id=f"call-{name}", name=name, arguments=arguments)]
     )
 
 
-def _finish_step(summary: str = "opened the PR") -> ScriptStep:
-    return ScriptStep(
-        tool_calls=[
-            ProviderToolCall(id="call-finish", name="finish", arguments={"summary": summary})
-        ]
+@pytest.fixture
+def clean_repo(tmp_path: pathlib.Path) -> pathlib.Path:
+    """A private copy of the demo target repo, which passes lint, types and tests as it is, so
+    an agent that adds a well-formed file gets a green verification and a verdict to publish."""
+    copy = tmp_path / "target-repo"
+    shutil.copytree(
+        REPO_ROOT / "examples" / "target-repo",
+        copy,
+        ignore=lambda _dir, names: [n for n in names if is_ignored(pathlib.PurePosixPath(n))],
     )
+    return copy
 
 
-async def test_no_secret_or_agent_token_ever_reaches_the_log(
-    sandbox: Sandbox, session: AsyncSession, keys: KeyPair, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Runs a real task through github.open_pr end to end (approval requested, granted,
-    resumed, finished), against the real default policy and a fake GitHub, then scans every
-    task_events payload, every tool_calls row and every audit_log row this run produced for
-    the configured GitHub token and for every agent JWT the loop minted along the way.
-    Neither may appear anywhere: task_events/tool_calls go through core/events.py's
-    broker.redact() choke point, and the GitHub token itself is only ever read into an HTTP
-    header this module builds, never into a string this module raises or logs itself.
-    """
-    fake = FakeGitHub()
+@pytest.fixture
+async def clean_sandbox(docker_available: None, clean_repo: pathlib.Path) -> AsyncIterator[Sandbox]:
+    box = await Sandbox.create(SandboxProfile(), clean_repo)
+    try:
+        yield box
+    finally:
+        await box.destroy()
+
+
+def _github_for(monkeypatch: pytest.MonkeyPatch, fake: FakeGitHub) -> None:
+    """Configure GitHub and route every client `tools/github.py` builds to `fake`."""
     monkeypatch.setattr(
         "warden.config.get_settings",
         lambda: Settings(github_token=SecretStr(FAKE_TOKEN), github_repo="acme/widgets"),
@@ -457,6 +476,54 @@ async def test_no_secret_or_agent_token_ever_reaches_the_log(
         "warden.tools.github.httpx.AsyncClient",
         lambda *a, **k: real_async_client(transport=httpx.MockTransport(fake.handler)),
     )
+
+
+async def _agent_run(
+    session: AsyncSession,
+    keys: KeyPair,
+    sandbox: Sandbox,
+    repo: pathlib.Path,
+    task: Task,
+    policy: Policy,
+    script: list[ScriptStep],
+) -> tuple[RunResult, FakeProvider]:
+    """The agent writes files, finishes, and is verified and reviewed for real: the real
+    container, the real checks, the real publication registry. Only the model is a script."""
+    provider = FakeProvider([*script, _step("submit_verdict", passed=True, findings=[])])
+    result = await run_task(
+        session,
+        task,
+        provider,
+        build_registry(sandbox),
+        policy,
+        keys=keys,
+        workspace=repo,
+        holder=task.claimed_by,
+        verifier=Verifier(sandbox, repo, exclude=never_readable(policy)),
+        reviewer=ProviderReviewer(provider),
+        publisher=build_publish_registry(sandbox),
+    )
+    return result, provider
+
+
+async def test_the_verified_diff_is_published_after_approval_and_no_secret_reaches_the_log(
+    clean_sandbox: Sandbox,
+    clean_repo: pathlib.Path,
+    session: AsyncSession,
+    keys: KeyPair,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The whole publication phase end to end (ADR-028): the agent writes a file, the control
+    plane verifies it for real, the reviewer approves, the control plane proposes the pull
+    request, a human approves it, and the fake GitHub receives exactly the verified file and
+    a report with the evidence and the verdict. Then every task_events payload, tool_calls row
+    and audit_log row this run produced is scanned for the configured GitHub token and for
+    every agent JWT minted along the way. Neither may appear anywhere: task_events/tool_calls go
+    through core/events.py's broker.redact() choke point, and the GitHub token itself is only
+    ever read into an HTTP header this module builds, never into a string it raises or logs.
+    """
+    fake = FakeGitHub()
+    _github_for(monkeypatch, fake)
 
     # A spy, not a mock: the real issue_agent_token still runs, its return value (the actual
     # JWT string this task's tool calls were authorised with) is just also captured here, so
@@ -474,21 +541,23 @@ async def test_no_secret_or_agent_token_ever_reaches_the_log(
     audit_baseline = await session.scalar(select(func.max(AuditLog.id))) or 0
     task = await _claimed_task(session)
     policy = load_policy(DEFAULT_POLICY)
-    registry = build_registry(sandbox)
 
-    paused = await run_task(
+    paused, _ = await _agent_run(
         session,
+        keys,
+        clean_sandbox,
+        clean_repo,
         task,
-        FakeProvider([_open_pr_step()]),
-        registry,
         policy,
-        workspace=pathlib.Path("."),
-        holder=task.claimed_by,
-        keys=keys,
+        [_step("write_file", path="src/notes.py", content=NOTES), _step("finish", summary="done")],
     )
-    assert paused.status == "WAITING_APPROVAL"
+    assert paused.status == "WAITING_APPROVAL", paused.reason
+    # Proposed, not sent: GitHub has not been touched while the human decides.
+    assert fake.requests == []
 
     approval = (await session.scalars(select(Approval).where(Approval.task_id == task.id))).one()
+    assert approval.tool_call_id == f"publish-{task.id}"
+    assert approval.args_safe["paths"] == ["src/notes.py"]
     await approvals.decide_approval(
         session, approval.id, approve=True, user_id=task.user_id, note=None
     )
@@ -498,21 +567,36 @@ async def test_no_secret_or_agent_token_ever_reaches_the_log(
     assert resumed is not None
     await session.commit()
     resume = rebuild(await read_events(session, task.id))
-
+    provider = FakeProvider([])  # the agent's conversation is over: any model call raises
     result = await run_task(
         session,
         resumed,
-        FakeProvider([_finish_step()]),
-        registry,
+        provider,
+        build_registry(clean_sandbox),
         policy,
-        workspace=pathlib.Path("."),
+        keys=keys,
+        workspace=clean_repo,
         resume=resume,
         holder=resumed.claimed_by,
-        keys=keys,
+        verifier=Verifier(clean_sandbox, clean_repo, exclude=never_readable(policy)),
+        reviewer=ProviderReviewer(provider),
+        publisher=build_publish_registry(clean_sandbox),
     )
-    assert result.status == "SUCCEEDED"
-    assert len(minted_tokens) == 1, "one per-call token, for the one ALLOW (approved) call"
-    assert fake.pulls, "the PR really was opened, this is not a vacuously passing scan"
+
+    assert result.status == "SUCCEEDED", result.reason
+    assert len(fake.pulls) == 1, "the PR really was opened, this is not a vacuously passing scan"
+    branch = f"warden/{str(task.id)[:8]}-add-a-notes-module"
+    assert fake.branch_files(branch).keys() == {"src/notes.py"}
+    blob = next(r for r in fake.requests if r.method == "POST" and r.url.path.endswith("/blobs"))
+    assert json.loads(blob.content)["content"] == NOTES  # exactly the verified file
+
+    pr_post = next(r for r in fake.requests if r.method == "POST" and r.url.path.endswith("/pulls"))
+    body = json.loads(pr_post.content)["body"]
+    assert "| tests | passed |" in body and "| lint | passed |" in body
+    assert "Independent verdict:** approved" in body
+    assert "Add a notes module" in json.loads(pr_post.content)["title"]
+    # One token for the agent's write_file, one for the publication.
+    assert len(minted_tokens) == 2
 
     # The scan.
     event_payloads = [event.payload for event in await read_events(session, task.id)]
