@@ -43,6 +43,12 @@ o pytest procura a configuração a partir do caminho do teste, não do
 diretório atual. O resultado é `ModuleNotFoundError: No module named 'src'`
 em todos os dez, um red pelo motivo errado.
 
+**Quem roda isso de verdade é o runner**: `make evals-coding` (`evals/coding.py`) copia o teste
+para o volume de workspace da tarefa e o executa num sandbox novo, com um argv fixo
+(`python -I`, `--noconftest`, `-c /dev/null`) para que um arquivo plantado pelo agente não
+reescreva o resultado. O porquê de cada flag está no ADR-029. O comando acima é para você
+conferir um teste à mão; o runner nunca monta o comando a partir de saída do modelo.
+
 (ajuste o `../../` para a distância real entre `<workspace>` e este
 diretório — se o workspace for uma cópia solta em outro lugar, use o
 caminho absoluto do teste.)
