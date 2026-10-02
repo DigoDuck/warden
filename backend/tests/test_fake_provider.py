@@ -1,11 +1,12 @@
 """The FakeProvider is what makes the control plane testable for free, so it gets tested."""
 
 import pathlib
+import time
 from decimal import Decimal
 
 import pytest
 
-from warden.providers.base import AssistantMessage, Message, UserMessage
+from warden.providers.base import AssistantMessage, Message, ToolSchema, UserMessage
 from warden.providers.fake import FakeProvider, ScriptExhausted
 from warden.providers.pricing import cost_usd
 
@@ -102,3 +103,36 @@ async def test_a_resume_aware_provider_picks_the_step_from_the_conversation() ->
 
     assert [call.id for call in completion.tool_calls] == ["fake-1-0", "fake-1-1"]
     assert [call.name for call in completion.tool_calls] == ["read_file", "list_files"]
+
+
+VERDICT_SCRIPT = """
+script:
+  - tool_call: { name: finish, args: { summary: "done" } }
+  - tool_call: { name: submit_verdict, args: { passed: true, findings: [] } }
+"""
+
+
+async def test_a_resume_aware_provider_finds_the_reviewers_step_by_content(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The reviewer's request has no assistant turn in it, so counting turns would hand it
+    step 0 (`finish`). Its step is the script's own `submit_verdict`, whatever its position."""
+    script = tmp_path / "script.yaml"
+    script.write_text(VERDICT_SCRIPT, encoding="utf-8")
+    fresh = FakeProvider.from_yaml(script, resume_aware=True)
+    verdict_tool = ToolSchema(name="submit_verdict", description="", input_schema={})
+
+    completion = await fresh.generate([UserMessage(text="spec + evidence")], tools=[verdict_tool])
+
+    assert [call.name for call in completion.tool_calls] == ["submit_verdict"]
+
+
+async def test_a_step_can_take_time_to_answer(tmp_path: pathlib.Path) -> None:
+    """A scripted delay is what lets a test kill a real process inside a model call."""
+    script = tmp_path / "script.yaml"
+    script.write_text("script:\n  - text: slow\n    delay_seconds: 0.2\n", encoding="utf-8")
+    started = time.monotonic()
+
+    await FakeProvider.from_yaml(script).generate(ONE_TURN)
+
+    assert time.monotonic() - started >= 0.15

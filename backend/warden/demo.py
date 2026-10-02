@@ -21,12 +21,13 @@ from warden.core import events
 from warden.core.loop import Budget, run_task
 from warden.db import make_engine, make_session_factory
 from warden.identity.jwt import load_keys
-from warden.models import Evidence, User
+from warden.models import Evidence, User, Verdict
 from warden.models import Task as TaskRow
 from warden.policy.engine import load_policy, never_readable
 from warden.providers.base import ModelProvider
 from warden.sandbox.docker import Sandbox, SandboxProfile, discard_workspace_volume
 from warden.tools.sandboxed import build_registry
+from warden.verify.reviewer import ProviderReviewer
 from warden.verify.runner import Verifier
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -107,6 +108,7 @@ async def main(kind: str) -> int:
                 workspace=WORKSPACE,
                 budget=DEMO_BUDGET,
                 verifier=Verifier(sandbox, WORKSPACE, exclude=never_readable(policy)),
+                reviewer=ProviderReviewer(provider),
             )
             await session.commit()
         finally:
@@ -125,6 +127,13 @@ async def main(kind: str) -> int:
         print("\nevidence collected by the verifier:")
         for row in evidence:
             print(f"  {row.kind:<6} {row.payload.get('status')}")
+
+        # The independent reviewer's verdict (ADR-010): what a model said, not what the
+        # control plane decided. The status below is the control plane's.
+        verdict = await session.scalar(select(Verdict).where(Verdict.task_id == task.id))
+        if verdict is not None:
+            note = f" malformed: {verdict.malformed_reason}" if verdict.malformed_reason else ""
+            print(f"\nreviewer   passed={verdict.passed} findings={verdict.findings}{note}")
 
         print(f"\nstatus     {result.status}")
         print(f"iterations {result.iterations}")

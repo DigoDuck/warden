@@ -12,6 +12,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from warden.providers.base import ToolCall
+from warden.providers.fake import ScriptStep
 from warden.tools.registry import ToolError, ToolRegistry
 
 
@@ -74,3 +76,12 @@ class FakeWorkspace:
 
 def fake_registry(files: dict[str, Any] | None = None) -> ToolRegistry:
     return FakeWorkspace(files).registry()
+
+
+def verdict_step(passed: bool = True) -> ScriptStep:
+    """The scripted reviewer's answer. A worker-driven test that reaches `finish` is verified
+    and then reviewed by the same provider (ADR-010), so its script needs this after `finish`."""
+    call = ToolCall(
+        id="call-verdict", name="submit_verdict", arguments={"passed": passed, "findings": []}
+    )
+    return ScriptStep(tool_calls=[call])

@@ -44,6 +44,7 @@ from warden.sandbox.docker import (
 )
 from warden.tools.registry import ToolRegistry
 from warden.tools.sandboxed import build_registry
+from warden.verify.reviewer import ProviderReviewer, Reviewer
 from warden.verify.runner import EvidenceCollector, Verifier
 
 HEARTBEAT_FRACTION = 0.4
@@ -219,6 +220,7 @@ async def run_claimed_task(
     budget: Budget | None = None,
     holder: str | None = None,
     verifier: EvidenceCollector | None = None,
+    reviewer: Reviewer | None = None,
 ) -> RunResult:
     """Run a task from wherever it left off.
 
@@ -245,6 +247,7 @@ async def run_claimed_task(
         resume=resume,
         holder=holder,
         verifier=verifier,
+        reviewer=reviewer,
     )
 
 
@@ -380,11 +383,15 @@ class Worker:
                 # for on this one task. `merge_budget` decides which of the two wins per
                 # field, and only ever in the caller's favour when it is stricter.
                 budget = merge_budget(self._budget or Budget(), claimed.budget)
+                # One provider for the task, built once: the agent's calls and the reviewer's
+                # go through the same instance, which is also what keeps a scripted
+                # FakeProvider's position consistent between the two (ADR-010).
+                provider = self._provider_factory()
                 try:
                     result = await run_claimed_task(
                         session,
                         claimed,
-                        self._provider_factory(),
+                        provider,
                         self._policy,
                         self._workspace,
                         build_registry(sandbox),
@@ -396,6 +403,7 @@ class Worker:
                         verifier=Verifier(
                             sandbox, self._workspace, exclude=never_readable(self._policy)
                         ),
+                        reviewer=ProviderReviewer(provider),
                     )
                 except queue.LeaseLost:
                     # Another worker already reclaimed this task. Every checkpoint fences

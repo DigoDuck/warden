@@ -14,6 +14,7 @@ import pytest
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from tests.fake_tools import verdict_step
 from warden.core import approvals, queue
 from warden.core.worker import Worker
 from warden.identity.jwt import KeyPair
@@ -59,9 +60,16 @@ async def empty_queue(session: AsyncSession) -> AsyncIterator[None]:
 
 @pytest.fixture
 def workspace(tmp_path: pathlib.Path) -> pathlib.Path:
+    """A repo the control plane's own checks accept: since ADR-010 a task only SUCCEEDS when
+    lint, types and tests pass, and this test's subject (the approval round trip) should not
+    depend on the repo being broken. It has a real passing test because pytest exits 5 on none."""
     root = tmp_path / "repo"
     (root / "src").mkdir(parents=True)
-    (root / "src" / "app.py").write_text("print('hello')\n", encoding="utf-8", newline="\n")
+    (root / "src" / "app.py").write_text('print("hello")\n', encoding="utf-8", newline="\n")
+    (root / "tests").mkdir()
+    (root / "tests" / "test_ok.py").write_text(
+        "def test_ok() -> None:\n    assert True\n", encoding="utf-8", newline="\n"
+    )
     return root
 
 
@@ -153,7 +161,7 @@ async def test_a_real_worker_pauses_releases_and_a_second_one_resumes_after_appr
 
     worker_b = Worker(
         session_factory,
-        lambda: FakeProvider([_finish()]),
+        lambda: FakeProvider([_finish(), verdict_step()]),
         _require_approval_policy(),
         workspace,
         keys,
@@ -161,7 +169,7 @@ async def test_a_real_worker_pauses_releases_and_a_second_one_resumes_after_appr
     finished = await worker_b.run_once()
 
     assert finished is not None
-    assert finished.status == "SUCCEEDED"
+    assert finished.status == "SUCCEEDED", finished.reason
 
     async with session_factory() as probe:
         run_rows = list(
