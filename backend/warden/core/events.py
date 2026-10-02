@@ -49,6 +49,12 @@ VERIFY_RECORDED = "verify.recorded"
 # ADR-010: the independent reviewer's verdict, committed together with its `verdicts` and
 # `model_calls` rows. Replay reads it to know the (paid) review call must not be made again.
 VERIFY_VERDICT = "verify.verdict"
+# ADR-028: the control plane's own publication phase after the verdict. `publish.requested` is
+# the pull request the control plane (not the model) proposes, committed before it is decided;
+# it is its own event type, never `tool.requested`, because replay builds the agent's pending
+# calls from that one. `publish.skipped` records why a verified change was not published.
+PUBLISH_REQUESTED = "publish.requested"
+PUBLISH_SKIPPED = "publish.skipped"
 
 _SENSITIVE_KEY_PARTS = ("token", "key", "secret", "password", "credential", "authorization")
 _MAX_ARG_CHARS = 2_000

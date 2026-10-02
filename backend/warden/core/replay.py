@@ -59,6 +59,10 @@ class VerificationState:
     # True once the reviewer's verdict is committed (ADR-010): the review call is paid for and
     # must not be made again.
     verdict_recorded: bool = False
+    # ADR-028: the pull request the control plane proposed after the verdict, and what became
+    # of it. Both None until `publish.requested` / its `tool.executed` are on record.
+    publish_call: ToolCall | None = None
+    publish_result: dict[str, Any] | None = None
 
 
 @dataclass
