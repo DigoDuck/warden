@@ -3,6 +3,8 @@ import { useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { ApiError, apiFetch } from "../api/client";
 import type { TaskOut } from "../api/types";
+import { DecisionPanel } from "../components/DecisionPanel";
+import { EvidencePanel } from "../components/EvidencePanel";
 import { StatusBadge } from "../components/StatusBadge";
 import { Tabs } from "../components/Tabs";
 import { Timeline } from "../components/Timeline";
@@ -197,6 +199,15 @@ export function TaskDetail() {
                   ),
                 },
                 { id: "custo", label: "Custo", panel: <CustoPanel task={task} /> },
+                {
+                  id: "evidencia",
+                  label: "Evidência",
+                  // `live`: a task still running or verifying keeps producing evidence.
+                  panel: (
+                    <EvidencePanel taskPath={taskPath} live={!TERMINAL_STATUSES.has(task.status)} />
+                  ),
+                },
+                { id: "decisao", label: "Decisão", panel: <DecisionPanel task={task} /> },
               ]}
             />
           </div>
