@@ -557,6 +557,20 @@ def build_registry(sandbox: Sandbox) -> ToolRegistry:
         execute=lambda args: run_tests(sandbox, args),
     )
 
+    return registry
+
+
+def build_publish_registry(sandbox: Sandbox) -> ToolRegistry | None:
+    """The control plane's own registry, holding only `github.open_pr` (ADR-028).
+
+    The model is never given this one: publishing is a phase the loop runs after the verdict,
+    so the agent's `build_registry` does not list it and a hallucinated call to it dies as an
+    unknown tool (`_decide`'s synthesised DENY). Judged and executed exactly like any other
+    tool, with the same `path_inspector`, scope and identity context.
+
+    None when GitHub is not configured: absent, not refusing (ADR-025), so an unconfigured
+    deployment simply has no publication phase.
+    """
     # Imported here, not at module level: warden.tools.github itself imports read_file and
     # ReadFileArgs from this module ("reuse the existing sandboxed read helper, no new
     # container code"), so a top-level import in both directions would be a circular one.
@@ -564,28 +578,22 @@ def build_registry(sandbox: Sandbox) -> ToolRegistry:
     from warden.tools import github
 
     settings = get_settings()
-    # Absent, not refusing (ADR-025): a repo with no github_repo/github_token configured
-    # never sees github.open_pr offered to it at all, the same shape the secret broker
-    # already uses for "not configured" (identity/broker.py::SecretNotConfigured).
-    if settings.github_repo and settings.github_token.get_secret_value():
-        registry.register(
-            name="github.open_pr",
-            description=(
-                "Open a pull request via the GitHub Git Data API, publishing files "
-                "already written in the workspace."
-            ),
-            args_model=github.OpenPrArgs,
-            execute=lambda args, context: github.open_pr(sandbox, settings, args, context),
-            # Judged per path, exactly like apply_patch: a deny on any one path blocks the
-            # whole call before a request is ever made.
-            path_inspector=github.open_pr_paths,
-            required_scope="github:pr:open",
-            needs_identity=True,
-        )
+    if not (settings.github_repo and settings.github_token.get_secret_value()):
+        return None
 
+    registry = ToolRegistry()
+    registry.register(
+        name="github.open_pr",
+        description=(
+            "Open a pull request via the GitHub Git Data API, publishing files "
+            "already written in the workspace."
+        ),
+        args_model=github.OpenPrArgs,
+        execute=lambda args, context: github.open_pr(sandbox, settings, args, context),
+        # Judged per path, exactly like apply_patch: a deny on any one path blocks the
+        # whole call before a request is ever made.
+        path_inspector=github.open_pr_paths,
+        required_scope="github:pr:open",
+        needs_identity=True,
+    )
     return registry
-
-
-def build_publish_registry(sandbox: Sandbox) -> ToolRegistry | None:
-    """SKELETON: the control plane's own registry, holding only `github.open_pr`."""
-    return None
