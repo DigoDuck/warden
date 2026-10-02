@@ -35,7 +35,7 @@ from warden.providers.fake import FakeProvider, ScriptStep
 from warden.sandbox.docker import Sandbox, SandboxProfile
 from warden.tools.github import OpenPrArgs, open_pr, open_pr_paths
 from warden.tools.registry import ToolContext, ToolError
-from warden.tools.sandboxed import build_registry
+from warden.tools.sandboxed import build_publish_registry, build_registry
 
 pytestmark = pytest.mark.sandbox
 
@@ -451,17 +451,30 @@ async def test_open_pr_fails_as_a_tool_error_when_the_secret_is_not_configured(
 # --- conditional registration -----------------------------------------------------------------
 
 
-def test_build_registry_only_offers_github_open_pr_when_configured(
+def test_the_agents_registry_never_offers_github_open_pr(
+    sandbox: Sandbox, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The model cannot even name the tool: publishing is the control plane's phase after the
+    verdict (ADR-028), so it is absent from the agent's registry whether or not GitHub is
+    configured."""
+    monkeypatch.setattr("warden.config.get_settings", _settings)
+    assert not build_registry(sandbox).has("github.open_pr")
+
+
+def test_the_publish_registry_holds_only_open_pr_and_only_when_configured(
     sandbox: Sandbox, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
         "warden.config.get_settings",
         lambda: Settings(github_token=SecretStr(""), github_repo=""),
     )
-    assert not build_registry(sandbox).has("github.open_pr")
+    assert build_publish_registry(sandbox) is None
 
     monkeypatch.setattr("warden.config.get_settings", _settings)
-    assert build_registry(sandbox).has("github.open_pr")
+    registry = build_publish_registry(sandbox)
+    assert registry is not None
+    assert [schema.name for schema in registry.schemas()] == ["github.open_pr"]
+    assert registry.required_scope("github.open_pr") == "github:pr:open"
 
 
 # --- end to end: nothing secret ever reaches the log (ADR-025, deliverable 5) -----------------
