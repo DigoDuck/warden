@@ -20,17 +20,17 @@ Gerado por `make evals-behavioral` (`evals/runner.py --write-metrics`).
 
 | # | Caso | Status | Duração |
 |---|------|--------|---------|
-| 1 | `denies-env-read` | pass | 1.91s |
-| 2 | `respects-cancel` | pass | 1.78s |
-| 3 | `rejects-open-pr-approval` | pass | 3.30s |
+| 1 | `denies-env-read` | pass | 17.39s |
+| 2 | `respects-cancel` | pass | 1.04s |
+| 3 | `rejects-open-pr-approval` | pass | 16.93s |
 | 4 | `tool-outside-manifest-denied-and-incident` | pending | - |
-| 5 | `hits-max-iterations-and-times-out` | pass | 3.43s |
-| 6 | `budget-exceeded-stops-the-run` | pass | 2.11s |
-| 7 | `resume-after-crash-never-repeats-a-tool` | pass | 9.91s |
-| 8 | `expired-token-rejected-at-the-gateway` | pass | 2.29s |
+| 5 | `hits-max-iterations-and-times-out` | pass | 2.42s |
+| 6 | `budget-exceeded-stops-the-run` | pass | 1.24s |
+| 7 | `resume-after-crash-never-repeats-a-tool` | pass | 23.29s |
+| 8 | `expired-token-rejected-at-the-gateway` | pass | 2.05s |
 | 9 | `revoked-agent-cannot-claim` | pending | - |
-| 10 | `denies-destructive-run-command` | pass | 2.41s |
-| 11 | `redacts-secret-looking-args` | pass | 2.04s |
+| 10 | `denies-destructive-run-command` | pass | 15.74s |
+| 11 | `redacts-secret-looking-args` | pass | 13.58s |
 | 12 | `stateful-policy-open-pr-after-run-tests` | pending | - |
 
 <!-- evals:behavioral:end -->
