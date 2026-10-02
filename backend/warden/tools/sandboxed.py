@@ -584,3 +584,8 @@ def build_registry(sandbox: Sandbox) -> ToolRegistry:
         )
 
     return registry
+
+
+def build_publish_registry(sandbox: Sandbox) -> ToolRegistry | None:
+    """SKELETON: the control plane's own registry, holding only `github.open_pr`."""
+    return None
