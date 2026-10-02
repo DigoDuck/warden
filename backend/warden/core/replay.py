@@ -136,6 +136,7 @@ def rebuild(task_events: Sequence[TaskEvent]) -> ResumeState:
 
     verify_started: dict[str, Any] | None = None
     verify_recorded: set[str] = set()
+    verdict_recorded = False
 
     for event in sorted(task_events, key=lambda e: e.seq):
         payload: dict[str, Any] = dict(event.payload or {})
@@ -176,6 +177,13 @@ def rebuild(task_events: Sequence[TaskEvent]) -> ResumeState:
         elif event.type == ev.VERIFY_RECORDED:
             verify_recorded.add(str(payload["kind"]))
 
+        elif event.type == ev.VERIFY_VERDICT:
+            verdict_recorded = True
+            # The review call is billed like any other (the displayed cost counts it), even
+            # though max_usd is not enforced against it. Added back here so the final
+            # `task.spent` of a task that resumed after its verdict does not forget it.
+            state.spent += Decimal(str(payload.get("cost_usd", "0")))
+
         elif event.type == ev.APPROVAL_REQUESTED:
             if event.created_at is not None:
                 asked_at[str(payload["id"])] = event.created_at
@@ -201,6 +209,7 @@ def rebuild(task_events: Sequence[TaskEvent]) -> ResumeState:
             summary=str(summary) if summary is not None else None,
             iterations=int(verify_started.get("iterations", iteration)),
             recorded=frozenset(verify_recorded),
+            verdict_recorded=verdict_recorded,
         )
 
     # Whatever is left belongs to the iteration that was cut short.

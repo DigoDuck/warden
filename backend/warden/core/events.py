@@ -16,7 +16,7 @@ from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from warden.identity import broker
-from warden.models import Evidence, ModelCall, PolicyDecision, TaskEvent, ToolCall
+from warden.models import Evidence, ModelCall, PolicyDecision, TaskEvent, ToolCall, Verdict
 from warden.policy.engine import Decision
 from warden.providers.base import Completion
 from warden.providers.base import ToolCall as ProviderToolCall
@@ -229,5 +229,34 @@ async def record_evidence(
     the database.
     """
     session.add(row := Evidence(task_id=task_id, kind=kind, payload=_redact_value(payload)))
+    await session.flush()
+    return row
+
+
+async def record_verdict(
+    session: AsyncSession,
+    task_id: UUID,
+    *,
+    passed: bool,
+    findings: list[str],
+    malformed_reason: str | None,
+    model_call_id: UUID,
+) -> Verdict:
+    """Persist the independent reviewer's verdict (ADR-010).
+
+    The findings are model text written after reading evidence that came out of the agent's
+    own code, so they pass through the same redaction as every other payload that reaches the
+    database.
+    """
+    session.add(
+        row := Verdict(
+            task_id=task_id,
+            verifier="independent",
+            passed=passed,
+            findings=_redact_value(findings),
+            malformed_reason=_redact_value(malformed_reason),
+            model_call_id=model_call_id,
+        )
+    )
     await session.flush()
     return row

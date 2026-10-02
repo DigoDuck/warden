@@ -15,6 +15,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from typing import Any
 from uuid import UUID
 
 from sqlalchemy import func, select, text
@@ -24,7 +25,7 @@ from warden import audit, identity
 from warden.core import approvals, cancel, events, queue
 from warden.core.replay import ApprovalOutcome, ResumeState
 from warden.identity.jwt import KeyPair
-from warden.models import Task, User
+from warden.models import Evidence, Task, User, Verdict
 from warden.policy.engine import Decision, Effect, Policy, PolicyContext, UserRef, combine
 from warden.providers.base import (
     AssistantMessage,
@@ -39,7 +40,7 @@ from warden.providers.base import (
 from warden.tools import gateway
 from warden.tools.registry import ToolError, ToolRegistry
 from warden.tools.workspace import normalize_path
-from warden.verify.reviewer import Reviewer
+from warden.verify.reviewer import Reviewer, decide, verdict_row_fields
 from warden.verify.runner import EvidenceCollector
 
 FINISH_TOOL = "finish"
@@ -235,7 +236,15 @@ async def run_task(
     and the demo always pass one, bound to the task's sandbox. None skips verification and
     finishes the moment the agent does, which is what the loop-level tests use: they run
     fake tools with no container to verify against.
+
+    `reviewer` (ADR-010) asks an independent model for a verdict once the checks are on record.
+    It goes wherever a verifier goes: a verifier without a reviewer is refused, because that
+    combination would be a way to reach SUCCEEDED without a verdict.
     """
+    if verifier is not None and reviewer is None:
+        raise ValueError(
+            "a verifier needs a reviewer: there is no path to SUCCEEDED without a verdict"
+        )
     budget = budget or Budget()
     spent = resume.spent if resume else Decimal("0")
     if resume and resume.paused_seconds and budget.max_seconds is not None:
@@ -311,7 +320,9 @@ async def run_task(
                 holder,
                 summary=resume.verification.summary,
                 verifier=verifier,
+                reviewer=reviewer,
                 recorded=resume.verification.recorded,
+                verdict_recorded=resume.verification.verdict_recorded,
                 already_started=True,
             )
 
@@ -455,6 +466,7 @@ async def run_task(
                     holder,
                     summary=completion.text,
                     verifier=verifier,
+                    reviewer=reviewer,
                 )
 
             finish_call = next(
@@ -474,7 +486,14 @@ async def run_task(
                 )
                 summary = str(finish_call.arguments.get("summary", "")) or completion.text
                 return await _verify_and_finish(
-                    session, task, iteration, spent, holder, summary=summary, verifier=verifier
+                    session,
+                    task,
+                    iteration,
+                    spent,
+                    holder,
+                    summary=summary,
+                    verifier=verifier,
+                    reviewer=reviewer,
                 )
 
             # Checkpoint (b): every tool.requested for this turn, committed together with
@@ -877,6 +896,13 @@ async def _run_tools(
     return results
 
 
+async def _recorded_evidence(session: AsyncSession, task_id: UUID) -> dict[str, dict[str, Any]]:
+    """The evidence on record, by kind. Read back from the database rather than carried in
+    memory: after a resume the earlier checks were recorded by a worker that no longer exists."""
+    rows = await session.scalars(select(Evidence).where(Evidence.task_id == task_id))
+    return {row.kind: dict(row.payload) for row in rows}
+
+
 async def _verify_and_finish(
     session: AsyncSession,
     task: Task,
@@ -886,32 +912,44 @@ async def _verify_and_finish(
     *,
     summary: str | None,
     verifier: EvidenceCollector | None,
+    reviewer: Reviewer | None,
     recorded: frozenset[str] = frozenset(),
+    verdict_recorded: bool = False,
     already_started: bool = False,
 ) -> RunResult:
-    """RUNNING -> VERIFYING -> SUCCEEDED (briefing §16, ADR-026).
+    """RUNNING -> VERIFYING -> SUCCEEDED | FAILED (briefing §16, ADR-026, ADR-010).
 
     The agent's `finish` is a claim, not a result. Before the task ends, the control plane
-    runs its own fixed checks and records each one as `evidence`. What it finds does not
-    change the final status yet: SUCCEEDED means "the agent finished and the evidence is on
-    record". Whether the evidence is good enough is the verdict's job (ADR-010), and deciding
-    it here too would define "success" in two places.
+    runs its own fixed checks and records each one as `evidence`, then asks an independent
+    reviewer for a verdict that never sees the agent's summary. The final status is
+    `verify.reviewer.decide`'s: SUCCEEDED only if the verdict is well formed and approving AND
+    every gating check passed. The status is decided in that one place, here only applied.
 
     Durability has the same shape as the agent loop's. `verify.started` is committed first,
     carrying the summary and iteration count, so a worker that dies from here on resumes
-    straight into verification and never pays for another model call (`core/replay.py`).
+    straight into verification and never pays for another agent call (`core/replay.py`).
     Then one checkpoint per check: its `evidence` row and its `verify.recorded` event commit
     together, so a check is either on record or not run yet, never half of each. The
     `UNIQUE(task_id, kind)` constraint makes "never recorded twice" the database's promise,
     not only this loop's.
 
-    Only cancellation stops verification, not the max_seconds deadline: the deadline is the
-    agent's budget, and a task whose agent finished at 299 of 300 seconds must not be marked
-    TIMED_OUT because the control plane's own checks took time. Each check carries its own
-    fixed `kill_after` instead, so none of them can hang the task.
+    The review call follows the same rule as the agent's model call: everything is committed
+    BEFORE it, so no transaction is open while the process waits on the network (ADR-019). The
+    verdict row, its `model_calls` row and the `verify.verdict` event commit together AFTER
+    it. A worker that dies between the two leaves no trace of the call, so the resume makes it
+    again: the lost call is paid for twice, and recording it once is what the database
+    enforces (`UNIQUE(task_id, verifier)`). Once the verdict is on record the resume skips the
+    call entirely and goes straight to the final status.
+
+    Only cancellation stops verification, not the max_seconds deadline or max_usd: those are
+    the agent's budget, and a task whose agent finished at 299 of 300 seconds must not be
+    marked TIMED_OUT because the control plane's own checks and review took time. Each check
+    carries its own fixed `kill_after` instead, so none of them can hang the task. The
+    reviewer's cost is recorded and counted in the task's cost, just never enforced.
     """
     if verifier is None:
         return await _finish(session, task, "SUCCEEDED", iterations, spent, holder, summary=summary)
+    assert reviewer is not None  # run_task refuses a verifier without one
 
     task.status = "VERIFYING"
     if not already_started:
@@ -947,7 +985,53 @@ async def _verify_and_finish(
         )
         await _checkpoint(session, task.id, holder)
 
-    return await _finish(session, task, "SUCCEEDED", iterations, spent, holder, summary=summary)
+    if not verdict_recorded:
+        if await cancel.is_requested(session, task.id):
+            raise _RunStopped("CANCELLED", "cancel requested during verification")
+
+        # The reviewer is given the evidence as the database holds it, plus the spec. The
+        # summary is a local variable of this function and is deliberately not passed: the
+        # `Reviewer` protocol has no parameter that could carry it.
+        evidence = await _recorded_evidence(session, task.id)
+        # Commit first (ADR-019): the read above began a transaction, and none may be open
+        # while the reviewer waits on a model.
+        await _checkpoint(session, task.id, holder)
+
+        review = await reviewer.review(task.spec, evidence)
+
+        call = await events.add_model_call(session, task.id, review.completion, purpose="reviewer")
+        fields = verdict_row_fields(review)
+        await events.record_verdict(session, task.id, model_call_id=call.id, **fields)
+        await events.append_event(
+            session,
+            task.id,
+            events.VERIFY_VERDICT,
+            {
+                "passed": fields["passed"],
+                "malformed": review.malformed_reason is not None,
+                "cost_usd": str(call.cost_usd),
+            },
+        )
+        spent += call.cost_usd
+        await _checkpoint(session, task.id, holder)
+
+    verdict = await session.scalar(
+        select(Verdict).where(Verdict.task_id == task.id, Verdict.verifier == "independent")
+    )
+    assert verdict is not None
+    resolution = decide(
+        verdict.passed, verdict.malformed_reason, await _recorded_evidence(session, task.id)
+    )
+    return await _finish(
+        session,
+        task,
+        resolution.status,
+        iterations,
+        spent,
+        holder,
+        summary=summary,
+        reason=resolution.reason,
+    )
 
 
 async def _finish(
