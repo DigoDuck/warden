@@ -39,6 +39,7 @@ from warden.providers.base import (
 from warden.tools import gateway
 from warden.tools.registry import ToolError, ToolRegistry
 from warden.tools.workspace import normalize_path
+from warden.verify.reviewer import Reviewer
 from warden.verify.runner import EvidenceCollector
 
 FINISH_TOOL = "finish"
@@ -226,6 +227,7 @@ async def run_task(
     resume: ResumeState | None = None,
     holder: str | None = None,
     verifier: EvidenceCollector | None = None,
+    reviewer: Reviewer | None = None,
 ) -> RunResult:
     """Run (or resume) a task until it ends.
 

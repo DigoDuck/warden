@@ -56,6 +56,9 @@ class VerificationState:
     summary: str | None
     iterations: int
     recorded: frozenset[str]
+    # True once the reviewer's verdict is committed (ADR-010): the review call is paid for and
+    # must not be made again.
+    verdict_recorded: bool = False
 
 
 @dataclass
