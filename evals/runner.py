@@ -3,10 +3,10 @@ control plane: `queue.enqueue`/`queue.claim`, a real `Worker`, the real sandbox,
 policy engine, the real gateway and the real audit log. The only thing that is not real is
 the model, which is a resume-aware `FakeProvider` replaying each case's script.
 
-Nine of the twelve cases from briefing §46 run for real; three (4, 9, 12) are recorded as
+Ten of the twelve cases from briefing §46 run for real; two (4, 9) are recorded as
 `status: pending` in the dataset because they need features this track does not build
-(capability manifest + incidents, agent lifecycle/revocation, stateful policy) — see each
-case's `reason` in evals/datasets/behavioral_v1.yaml. A pending case is reported, counted,
+(capability manifest + incidents, agent lifecycle/revocation) — see each case's `reason` in
+evals/datasets/behavioral_v1.yaml. A pending case is reported, counted,
 and never fails the exit code; it is never silently skipped.
 
 Two cases (7, 8) do not fit the generic "one Worker.run_once(), then read the database back"
@@ -74,9 +74,9 @@ DEFAULT_METRICS = REPO_ROOT / "docs" / "metrics.md"
 # recreates its database, so `make evals-behavioral` must not clobber a `make test` run.
 TEST_DB = os.environ.get("WARDEN_TEST_DB", "warden_evals")
 
-# github.open_pr is only registered by build_registry() when a repo and a token are both
-# set (ADR-025's "absent, not refusing" shape). Case 3 needs the tool to exist so the
-# policy's require_approval rule pauses the task. While the approval gate works, nothing
+# github.open_pr is only registered by build_publish_registry() when a repo and a token are
+# both set (ADR-025's "absent, not refusing" shape). Case 3 needs the control plane's
+# publication phase to exist so the policy's require_approval rule pauses the task (ADR-028). While the approval gate works, nothing
 # reaches GitHub. But case 3 exists to catch the day it does not, and on that day the call
 # goes through the real gateway with whatever the environment holds. So the values are
 # forced, not defaulted: a PAT exported in the shell must not survive into an eval run, and
@@ -418,8 +418,9 @@ async def _run_cancel(case: Case, ctx: Context) -> uuid.UUID:
 
 
 async def _run_reject_approval(case: Case, ctx: Context) -> uuid.UUID:
-    """Case 3: open_pr pauses the task (REQUIRE_APPROVAL), a human rejects it, and the run
-    resumes to see the injected error rather than the PR ever opening."""
+    """Case 3: after the verdict the control plane proposes the pull request, the policy
+    pauses the task (REQUIRE_APPROVAL), a human rejects it, and the resumed run ends
+    CANCELLED rather than the PR ever opening (ADR-028)."""
     task_id, user_id = await _enqueue(ctx, spec=f"eval: {case.key}", budget=case.budget)
     script_path = _write_script_yaml(ctx.tmp_dir, case.script)
 
