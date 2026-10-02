@@ -169,3 +169,15 @@ def test_unknown_expectation_key_is_a_mismatch() -> None:
 def test_empty_expectations_are_a_mismatch() -> None:
     # An active case that asserts nothing passes whatever the control plane did.
     assert check_expectations({}, _facts()) != []
+
+
+def test_publish_requested_mismatch_is_reported() -> None:
+    expect = {"publish_requested": 0}
+    mismatches = check_expectations(expect, _facts(publish_requested=1))
+    assert any("publish_requested" in m for m in mismatches)
+
+
+def test_publish_requested_match_produces_no_mismatch() -> None:
+    assert (
+        check_expectations({"publish_requested": 1}, _facts(publish_requested=1)) == []
+    )
