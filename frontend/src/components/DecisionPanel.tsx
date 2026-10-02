@@ -3,17 +3,14 @@ import type { TaskOut } from "../api/types";
 import { Badge } from "./Badge";
 import { ProvenanceBadge } from "./ProvenanceBadge";
 import { StatusBadge } from "./StatusBadge";
-
-// Statuses a task never leaves (core/worker.py::TERMINAL_STATUSES). Used only to tell "the
-// verdict has not come yet" apart from "it never will".
-const TERMINAL = new Set(["SUCCEEDED", "FAILED", "CANCELLED", "TIMED_OUT", "BUDGET_EXCEEDED"]);
+import { TERMINAL_STATUSES } from "../lib/taskStatuses";
 
 function Verdict({ task }: { task: TaskOut }) {
   const verdict = task.verdict;
   if (!verdict) {
     return (
       <p className="text-fg-muted">
-        {TERMINAL.has(task.status)
+        {TERMINAL_STATUSES.has(task.status)
           ? "Esta tarefa terminou sem revisão independente."
           : "Ainda sem veredito."}
       </p>
