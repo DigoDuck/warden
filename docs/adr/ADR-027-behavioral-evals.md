@@ -1,4 +1,4 @@
-# ADR-026: behavioral evals como tarefas reais, com casos pendentes visíveis
+# ADR-027: behavioral evals como tarefas reais, com casos pendentes visíveis
 
 **Status:** aceita · **Data:** 2026-09-28 · **PR:** `feat/behavioral-evals`
 
