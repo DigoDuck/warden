@@ -17,6 +17,7 @@ from typing import Any
 from sqlalchemy import (
     CHAR,
     BigInteger,
+    Boolean,
     CheckConstraint,
     DateTime,
     ForeignKey,
@@ -344,4 +345,47 @@ class Evidence(Base):
     )
     kind: Mapped[str] = mapped_column(String(32))
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+# Who produced a verdict. Only `independent` exists today (ADR-010). `coder_self`, the
+# experiment of letting the coder grade itself (briefing §13), joins this list with the
+# migration that first writes it, the same pattern as EVIDENCE_KINDS.
+VERDICT_VERIFIERS = ("independent",)
+
+
+class Verdict(Base):
+    """The independent reviewer's judgement of a finished task (ADR-010).
+
+    Model output, not a fact: the control plane records it and decides what it is worth
+    (`verify.reviewer.decide`). `UNIQUE(task_id, verifier)` is the same promise
+    `uq_evidence_task_kind` makes for evidence: a worker that dies after recording the verdict
+    and a second one that resumes can never both write it, whatever the application does.
+
+    `passed` is NOT NULL on purpose: a response that is not a well-formed verdict is recorded
+    as `passed = false` with `malformed_reason` set, so no code path can read "no verdict" as
+    "approved".
+    """
+
+    __tablename__ = "verdicts"
+    __table_args__ = (
+        CheckConstraint(
+            "verifier IN (" + ", ".join(f"'{v}'" for v in VERDICT_VERIFIERS) + ")",
+            name="ck_verdicts_verifier",
+        ),
+        UniqueConstraint("task_id", "verifier", name="uq_verdicts_task_verifier"),
+    )
+
+    id: Mapped[uuid.UUID] = _pk()
+    task_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("tasks.id", ondelete="CASCADE"), index=True
+    )
+    verifier: Mapped[str] = mapped_column(String(32))
+    passed: Mapped[bool] = mapped_column(Boolean)
+    findings: Mapped[list[str]] = mapped_column(JSONB, default=list)
+    malformed_reason: Mapped[str | None] = mapped_column(Text, default=None)
+    # The reviewer's own `model_calls` row (purpose "reviewer"), for cost and provenance.
+    model_call_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("model_calls.id", ondelete="SET NULL"), default=None
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
