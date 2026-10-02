@@ -369,7 +369,10 @@ def test_the_publish_outcome_and_the_approval_are_replayed() -> None:
         _events(
             *_verified_agent_run(),
             _publish_requested(),
-            (ev.APPROVAL_REQUESTED, {"approval_id": "a1", "tool": "github.open_pr", "id": PUBLISH_ID}),
+            (
+                ev.APPROVAL_REQUESTED,
+                {"approval_id": "a1", "tool": "github.open_pr", "id": PUBLISH_ID},
+            ),
             (ev.APPROVAL_GRANTED, {"approval_id": "a1", "id": PUBLISH_ID}),
             (
                 ev.TOOL_EXECUTED,

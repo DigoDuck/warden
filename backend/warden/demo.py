@@ -26,7 +26,7 @@ from warden.models import Task as TaskRow
 from warden.policy.engine import load_policy, never_readable
 from warden.providers.base import ModelProvider
 from warden.sandbox.docker import Sandbox, SandboxProfile, discard_workspace_volume
-from warden.tools.sandboxed import build_registry
+from warden.tools.sandboxed import build_publish_registry, build_registry
 from warden.verify.reviewer import ProviderReviewer
 from warden.verify.runner import Verifier
 
@@ -109,6 +109,7 @@ async def main(kind: str) -> int:
                 budget=DEMO_BUDGET,
                 verifier=Verifier(sandbox, WORKSPACE, exclude=never_readable(policy)),
                 reviewer=ProviderReviewer(provider),
+                publisher=build_publish_registry(sandbox),
             )
             await session.commit()
         finally:

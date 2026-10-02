@@ -40,7 +40,7 @@ from warden.providers.base import (
 from warden.tools import gateway
 from warden.tools.registry import ToolError, ToolRegistry
 from warden.tools.workspace import normalize_path
-from warden.verify.reviewer import Reviewer, decide, verdict_row_fields
+from warden.verify.reviewer import Resolution, Reviewer, decide, verdict_row_fields
 from warden.verify.runner import EvidenceCollector
 
 FINISH_TOOL = "finish"
@@ -81,6 +81,20 @@ class RunResult:
     cost_usd: Decimal
     summary: str | None = None
     reason: str | None = None
+
+
+@dataclass(frozen=True)
+class _Publication:
+    """What the publication phase (ADR-028) needs, bundled so `_verify_and_finish` does not
+    grow eight parameters. `call` and `result` are what a resume found already on record."""
+
+    registry: ToolRegistry
+    policy: Policy
+    user: UserRef
+    keys: KeyPair
+    approval_decisions: dict[str, ApprovalOutcome]
+    call: ToolCall | None = None
+    result: dict[str, Any] | None = None
 
 
 def _now() -> datetime:
@@ -229,6 +243,7 @@ async def run_task(
     holder: str | None = None,
     verifier: EvidenceCollector | None = None,
     reviewer: Reviewer | None = None,
+    publisher: ToolRegistry | None = None,
 ) -> RunResult:
     """Run (or resume) a task until it ends.
 
@@ -240,11 +255,17 @@ async def run_task(
     `reviewer` (ADR-010) asks an independent model for a verdict once the checks are on record.
     It goes wherever a verifier goes: a verifier without a reviewer is refused, because that
     combination would be a way to reach SUCCEEDED without a verdict.
+
+    `publisher` (ADR-028) is the control plane's own registry, holding the one tool the model
+    never sees: `github.open_pr`. After an approving verdict the loop proposes a pull request
+    with it. It needs a verifier, because what gets published is the diff that was verified.
     """
     if verifier is not None and reviewer is None:
         raise ValueError(
             "a verifier needs a reviewer: there is no path to SUCCEEDED without a verdict"
         )
+    if publisher is not None and verifier is None:
+        raise ValueError("a publisher needs a verifier: only a verified diff may be published")
     budget = budget or Budget()
     spent = resume.spent if resume else Decimal("0")
     if resume and resume.paused_seconds and budget.max_seconds is not None:
@@ -261,6 +282,17 @@ async def run_task(
 
     user = await session.get(User, task.user_id)
     user_ref = UserRef(id=task.user_id, role=user.role if user else "worker")
+    publication = (
+        _Publication(
+            registry=publisher,
+            policy=policy,
+            user=user_ref,
+            keys=keys,
+            approval_decisions=resume.approval_decisions if resume else {},
+        )
+        if publisher is not None
+        else None
+    )
 
     tool_schemas = list(registry.schemas())
     # `finish` is described to the model but never dispatched to the registry: section 15
@@ -324,6 +356,13 @@ async def run_task(
                 recorded=resume.verification.recorded,
                 verdict_recorded=resume.verification.verdict_recorded,
                 already_started=True,
+                publication=replace(
+                    publication,
+                    call=resume.verification.publish_call,
+                    result=resume.verification.publish_result,
+                )
+                if publication is not None
+                else None,
             )
 
         if resume is not None and resume.is_mid_iteration:
@@ -467,6 +506,7 @@ async def run_task(
                     summary=completion.text,
                     verifier=verifier,
                     reviewer=reviewer,
+                    publication=publication,
                 )
 
             finish_call = next(
@@ -494,6 +534,7 @@ async def run_task(
                     summary=summary,
                     verifier=verifier,
                     reviewer=reviewer,
+                    publication=publication,
                 )
 
             # Checkpoint (b): every tool.requested for this turn, committed together with
@@ -932,6 +973,7 @@ async def _verify_and_finish(
     recorded: frozenset[str] = frozenset(),
     verdict_recorded: bool = False,
     already_started: bool = False,
+    publication: _Publication | None = None,
 ) -> RunResult:
     """RUNNING -> VERIFYING -> SUCCEEDED | FAILED (briefing §16, ADR-026, ADR-010).
 
@@ -1035,9 +1077,10 @@ async def _verify_and_finish(
         select(Verdict).where(Verdict.task_id == task.id, Verdict.verifier == "independent")
     )
     assert verdict is not None
-    resolution = decide(
-        verdict.passed, verdict.malformed_reason, await _recorded_evidence(session, task.id)
-    )
+    evidence = await _recorded_evidence(session, task.id)
+    resolution = decide(verdict.passed, verdict.malformed_reason, evidence)
+    if resolution.status == "SUCCEEDED" and publication is not None:
+        resolution = await _publish(session, task, publication)
     return await _finish(
         session,
         task,
@@ -1048,6 +1091,11 @@ async def _verify_and_finish(
         summary=summary,
         reason=resolution.reason,
     )
+
+
+async def _publish(session: AsyncSession, task: Task, publication: _Publication) -> Resolution:
+    """SKELETON (ADR-028): the publication phase."""
+    return Resolution("SUCCEEDED", None)
 
 
 async def _finish(
