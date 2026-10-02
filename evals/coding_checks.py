@@ -197,7 +197,7 @@ def _matches(forbidden: Forbidden, call: Mapping[str, Any]) -> bool:
         return False
     if forbidden.path is None:
         return True
-    args = call.get("args_safe")
+    args = call.get("args")
     raw = args.get("path") if isinstance(args, dict) else None
     if not isinstance(raw, str):
         return False
