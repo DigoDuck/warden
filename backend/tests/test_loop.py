@@ -424,7 +424,7 @@ async def test_require_approval_pauses_the_task_and_releases_the_lease(
         session,
         task,
         provider,
-        FakeWorkspace().registry(),
+        _registry_with_open_pr(_OpenPrCounter()),
         _require_approval_policy(),
         workspace=workspace,
         holder=holder,
@@ -473,7 +473,7 @@ async def test_calls_before_the_paused_one_still_ran_and_calls_after_stay_pendin
         session,
         task,
         provider,
-        FakeWorkspace().registry(),
+        _registry_with_open_pr(_OpenPrCounter()),
         _require_approval_policy(),
         workspace=workspace,
         holder=task.claimed_by,
@@ -537,7 +537,7 @@ async def test_an_approval_request_writes_an_audit_entry(
         session,
         task,
         provider,
-        FakeWorkspace().registry(),
+        _registry_with_open_pr(_OpenPrCounter()),
         _require_approval_policy(),
         workspace=workspace,
         holder=task.claimed_by,
@@ -773,7 +773,7 @@ async def test_an_approval_never_overrides_a_deny_added_after_the_request(
         session,
         task,
         FakeProvider([_step("github.open_pr", title="x")]),
-        FakeWorkspace().registry(),
+        _registry_with_open_pr(_OpenPrCounter()),
         _require_approval_policy(),
         workspace=workspace,
         holder=task.claimed_by,
@@ -810,7 +810,7 @@ async def test_an_approval_never_overrides_a_deny_added_after_the_request(
         session,
         resumed,
         FakeProvider([_step("finish", summary="blocked")]),
-        FakeWorkspace().registry(),
+        _registry_with_open_pr(_OpenPrCounter()),
         stricter_policy,
         workspace=workspace,
         resume=resume,
@@ -851,7 +851,7 @@ async def test_rejecting_a_paused_call_injects_the_note_and_the_loop_continues(
         session,
         task,
         provider,
-        FakeWorkspace().registry(),
+        _registry_with_open_pr(_OpenPrCounter()),
         _require_approval_policy(),
         workspace=workspace,
         holder=task.claimed_by,
@@ -875,7 +875,7 @@ async def test_rejecting_a_paused_call_injects_the_note_and_the_loop_continues(
         session,
         resumed,
         recording,
-        FakeWorkspace().registry(),
+        _registry_with_open_pr(_OpenPrCounter()),
         _require_approval_policy(),
         workspace=workspace,
         resume=resume,
@@ -1204,7 +1204,7 @@ async def test_a_cancel_landing_while_the_call_is_being_decided_wins_over_the_pa
     """
     task = await _claimed_task(session)
     task_id = task.id
-    registry = FakeWorkspace().registry()
+    registry = _registry_with_open_pr(_OpenPrCounter())
     real_touched_paths = registry.touched_paths
 
     async def cancel_while_deciding(name: str, arguments: dict[str, Any]) -> list[str | None]:

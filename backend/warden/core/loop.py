@@ -568,7 +568,23 @@ async def _decide(
     inspector cannot even parse gets a synthesised deny rather than a guess, and it is
     recorded exactly like any other decision, just with no rule and no path behind it: the
     tool never ran, so there is nothing for `matched_rules` to point at.
+
+    The same goes for a tool this registry does not hold (ADR-028). `touched_paths` answers
+    `[None]` for a name it does not know, so without this guard a rule written for the tool
+    (`open-pr-needs-human` matches `github.open_pr` by name alone) would match a call the
+    registry cannot run, and the task would park for a human to approve nothing. What the agent
+    was never given is refused, not escalated.
     """
+    if not registry.has(call.name):
+        return (
+            Decision(
+                effect=Effect.DENY,
+                matched_rules=[],
+                reason=f"unknown tool {call.name!r}: it is not offered to this agent",
+                policy_hash=policy.policy_hash,
+            ),
+            [],
+        )
     try:
         raw_paths = await registry.touched_paths(call.name, call.arguments)
     except ToolError as exc:
