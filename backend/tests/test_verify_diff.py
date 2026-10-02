@@ -5,6 +5,7 @@ the Docker archive endpoint builds one (a `workspace/` prefix on every name), so
 tests exercise is the parsing the verifier actually does, not a hand-made dict.
 """
 
+import hashlib
 import io
 import pathlib
 import tarfile
@@ -153,3 +154,19 @@ def test_a_huge_patch_is_truncated_but_the_counts_stay_complete(
     assert diff.patch_truncated is True
     assert len(diff.patch) == MAX_PATCH_CHARS
     assert diff.additions == 40_000
+
+
+def test_every_surviving_file_carries_the_sha256_of_its_final_content() -> None:
+    """The digest is what lets the publication phase prove the workspace still holds exactly
+    what was verified (ADR-028): text, binary and added files all hash their final bytes, and a
+    removed file has no final content, so no digest."""
+    before = {"a.py": b"x = 1\n", "gone.py": b"y = 2\n", "blob.bin": b"\0old"}
+    after = {"a.py": b"x = 2\n", "new.py": b"z = 3\n", "blob.bin": b"\0new"}
+
+    changes = {change.path: change for change in compute_diff(before, after).files}
+
+    assert changes["a.py"].sha256 == hashlib.sha256(b"x = 2\n").hexdigest()
+    assert changes["new.py"].sha256 == hashlib.sha256(b"z = 3\n").hexdigest()
+    assert changes["blob.bin"].sha256 == hashlib.sha256(b"\0new").hexdigest()
+    assert changes["gone.py"].change == "removed"
+    assert changes["gone.py"].sha256 is None
