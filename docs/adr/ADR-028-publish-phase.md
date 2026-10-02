@@ -99,6 +99,16 @@ e então o PR levaria conteúdo que nem os checks nem o reviewer viram.
 Dois testes causam a mudança de verdade: um teste do agente que reescreve `src/feature.py`
 enquanto o `pytest` roda, e uma escrita no volume enquanto a tarefa espera aprovação.
 
+**Limite conhecido.** "Nada roda no container entre a checagem e a leitura" só é garantido
+quando houve pausa por aprovação, que é o caso da policy padrão (`open-pr-needs-human`): a
+retomada sobe um container novo sobre o volume, e nele nada do agente executa. Se uma policy
+liberar `github.open_pr` com ALLOW direto, a publicação roda no mesmo container da
+verificação, logo depois do `pytest`. Um processo que um teste do agente deixou em segundo
+plano ainda pode estar vivo ali e reescrever um arquivo depois da checagem e antes de
+`open_pr` lê-lo. Fechar isso exige publicar sempre a partir de um container novo, ou a partir
+do próprio tar exportado na checagem; fica para quando alguém precisar de publicação sem
+aprovação humana.
+
 ### Resume
 
 `core/replay.py`: `VerificationState` ganha `publish_call` (de `publish.requested`) e
