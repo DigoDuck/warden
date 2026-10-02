@@ -12,6 +12,7 @@ import asyncio
 import uuid
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 
 import jwt
 import pytest
@@ -25,6 +26,7 @@ from warden.api.app import create_app
 from warden.core import events, queue
 from warden.identity.jwt import ALGORITHM, KeyPair
 from warden.models import AuditLog, Evidence, Task, TaskEvent, User
+from warden.providers.base import Completion, Usage
 
 
 @pytest.fixture
@@ -771,3 +773,71 @@ async def test_healthz_needs_no_token(client: AsyncClient) -> None:
     response = await client.get("/healthz")
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
+
+
+# --- the coder's summary and the verdict on GET /tasks/{id} (ADR-010) -----------------------
+
+
+async def test_a_task_without_a_review_has_no_summary_and_no_verdict(
+    client: AsyncClient, session_factory: async_sessionmaker[AsyncSession], keys: KeyPair
+) -> None:
+    token = await _user_token(
+        session_factory, keys, await _user(session_factory), ["tasks:write", "tasks:read"]
+    )
+    task_id = await _submit(client, token)
+
+    body = (await client.get(f"/tasks/{task_id}", headers=_auth(token))).json()
+
+    assert body["summary"] is None
+    assert body["verdict"] is None
+
+
+async def test_task_out_carries_the_coders_summary_and_the_independent_verdict(
+    client: AsyncClient, session_factory: async_sessionmaker[AsyncSession], keys: KeyPair
+) -> None:
+    """Two separate fields on purpose: the summary is what the coder said (read from the event
+    log, no new column), the verdict is what the independent reviewer said. The API keeps them
+    apart so the UI can label both as model output, and neither as a fact."""
+    token = await _user_token(
+        session_factory, keys, await _user(session_factory), ["tasks:write", "tasks:read"]
+    )
+    task_id = uuid.UUID(await _submit(client, token))
+    async with session_factory() as session:
+        await events.append_event(
+            session,
+            task_id,
+            events.VERIFY_STARTED,
+            {"summary": "I fixed it, everything is perfect", "iterations": 2},
+        )
+        call = await events.add_model_call(
+            session,
+            task_id,
+            Completion(
+                provider="anthropic",
+                model="claude-haiku-4-5",
+                stop_reason="tool_use",
+                usage=Usage(input_tokens=1000, output_tokens=1000),
+            ),
+            purpose="reviewer",
+        )
+        await events.record_verdict(
+            session,
+            task_id,
+            passed=False,
+            findings=["None still crashes average()"],
+            malformed_reason=None,
+            model_call_id=call.id,
+        )
+        await session.commit()
+
+    body = (await client.get(f"/tasks/{task_id}", headers=_auth(token))).json()
+
+    assert body["summary"] == "I fixed it, everything is perfect"
+    verdict = body["verdict"]
+    assert verdict["passed"] is False
+    assert verdict["findings"] == ["None still crashes average()"]
+    assert verdict["verifier"] == "independent"
+    assert verdict["malformed_reason"] is None
+    assert verdict["created_at"]
+    # The reviewer's call is counted in the displayed cost (it is just not budgeted).
+    assert Decimal(str(body["cost_usd"])) > 0

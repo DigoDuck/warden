@@ -484,6 +484,9 @@ script:
   - tool_call:
       name: finish
       args: { summary: "resumed after the crash" }
+  - tool_call:
+      name: submit_verdict
+      args: { passed: true, findings: [] }
 """,
     )
 
@@ -589,9 +592,9 @@ script:
         model_call_count = await session.scalar(
             select(func.count()).select_from(ModelCall).where(ModelCall.task_id == task_id)
         )
-        # One for the interrupted iteration (replayed from the log, not bought again) and
-        # one for the iteration that produced `finish`.
-        assert model_call_count == 2
+        # One for the interrupted iteration (replayed from the log, not bought again), one for
+        # the iteration that produced `finish`, and one for the independent reviewer (ADR-010).
+        assert model_call_count == 3
 
         read_file_calls = await session.scalar(
             select(func.count())

@@ -12,3 +12,14 @@ export const TASK_STATUSES = [
   "TIMED_OUT",
   "BUDGET_EXCEEDED",
 ] as const;
+
+// Statuses a task never leaves (core/worker.py::TERMINAL_STATUSES): the worker never picks
+// such a task up again, so polling stops, cancelling is meaningless (the API answers 409)
+// and a missing verdict will never arrive.
+export const TERMINAL_STATUSES: ReadonlySet<string> = new Set([
+  "SUCCEEDED",
+  "FAILED",
+  "CANCELLED",
+  "TIMED_OUT",
+  "BUDGET_EXCEEDED",
+]);

@@ -1,6 +1,9 @@
 # Script the FakeProvider replays for `make demo-fake`. Same format the behavioural evals
 # use (briefing section 19), so week 6 reuses these files without translation.
 #
+# The last step is the independent reviewer's verdict (ADR-010): after `finish`, the control
+# plane runs its checks and asks the same provider for a verdict, which consumes the next step.
+#
 # Step 2 exists to be refused. The point of the demo is showing that the control plane
 # decides, that the refusal reaches the model, and that the task carries on anyway.
 script:
@@ -13,3 +16,4 @@ script:
         summary: >-
           A small FastAPI widget service: four endpoints (health, list, get, create) over an
           in-memory store, with five tests under tests/. Reading .env was refused by policy.
+  - tool_call: { name: submit_verdict, args: { passed: true, findings: [] } }

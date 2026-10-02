@@ -195,6 +195,71 @@ describe("TaskDetail", () => {
     );
   });
 
+  it("keeps the coder's summary and the reviewer's verdict apart in the Decisão tab", async () => {
+    routeFetch({
+      [`/tasks/${TASK_ID}`]: [
+        task({
+          status: "FAILED",
+          summary: "corrigi o bug",
+          verdict: {
+            passed: false,
+            findings: ["ruff falhou"],
+            verifier: "independent",
+            malformed_reason: null,
+            created_at: "2026-01-01T00:00:02Z",
+          },
+        }),
+      ],
+    });
+    renderAt(`/tarefas/${TASK_ID}`);
+    await screen.findByText("Falhou");
+
+    await userEvent.click(screen.getByRole("tab", { name: "Decisão" }));
+
+    expect(await screen.findByText("corrigi o bug")).toBeInTheDocument();
+    expect(screen.getByText("Gerado")).toBeInTheDocument();
+    expect(screen.getByText("Gerado · revisor independente")).toBeInTheDocument();
+    expect(screen.getByText("Reprovado")).toBeInTheDocument();
+    expect(screen.getByText("ruff falhou")).toBeInTheDocument();
+  });
+
+  it("loads the Evidência tab from /evidence and marks what it shows as Verificado", async () => {
+    routeFetch({
+      [`/tasks/${TASK_ID}`]: [task({ status: "SUCCEEDED" })],
+      [`/tasks/${TASK_ID}/evidence`]: [
+        {
+          evidence: [
+            {
+              kind: "tests",
+              created_at: "2026-01-01T00:00:00Z",
+              payload: {
+                kind: "tests",
+                status: "passed",
+                passed: true,
+                commands: [
+                  {
+                    argv: ["python", "-m", "pytest", "-q"],
+                    exit_code: 0,
+                    output: "5 passed",
+                    duration_ms: 900,
+                  },
+                ],
+              },
+            },
+          ],
+        },
+      ],
+    });
+    renderAt(`/tarefas/${TASK_ID}`);
+    await screen.findByText("Concluída");
+
+    await userEvent.click(screen.getByRole("tab", { name: "Evidência" }));
+
+    expect(await screen.findByText("5 passed")).toBeInTheDocument();
+    expect(screen.getByText("Verificado")).toBeInTheDocument();
+    expect(screen.getByText("Passou")).toBeInTheDocument();
+  });
+
   it("cancels a queued task (200) and reports it was cancelled", async () => {
     routeFetch({
       [`/tasks/${TASK_ID}`]: [task({ status: "QUEUED" })],

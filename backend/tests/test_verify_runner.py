@@ -14,7 +14,7 @@ import shutil
 import subprocess
 import sys
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from typing import Any
 
 import pytest
@@ -26,13 +26,14 @@ from tests.conftest import TEST_DB
 from warden.config import get_settings
 from warden.core import cancel, queue
 from warden.core.events import read_events
+from warden.core.worker import POLICY_FILE as WORKER_POLICY
 from warden.core.worker import WORKSPACE as WORKER_WORKSPACE
 from warden.core.worker import Worker
 from warden.db import with_database
 from warden.identity.jwt import KeyPair
-from warden.models import Evidence, ModelCall, User
+from warden.models import Evidence, ModelCall, User, Verdict
 from warden.policy.engine import Effect, Policy, Rule, load_policy
-from warden.providers.base import Completion
+from warden.providers.base import Completion, Message, ToolSchema, Usage
 from warden.providers.base import ToolCall as ProviderToolCall
 from warden.providers.fake import FakeProvider, ScriptStep
 from warden.sandbox.docker import Sandbox, SandboxProfile, discard_workspace_volume
@@ -98,6 +99,42 @@ def _allow_all() -> Policy:
         default=Effect.DENY,
         policy_hash="test",
     )
+
+
+class _ReviewerOnly:
+    """The provider of a resumed worker: it may be asked for the independent verdict and for
+    nothing else. Any other request means the resume bought the agent's turn again."""
+
+    name = "fake"
+
+    def __init__(self) -> None:
+        self.reviews = 0
+
+    async def generate(
+        self,
+        messages: Sequence[Message],
+        *,
+        tools: Sequence[ToolSchema] | None = None,
+        system: str | None = None,
+        model: str | None = None,
+        max_tokens: int = 16000,
+    ) -> Completion:
+        names = [tool.name for tool in tools or ()]
+        assert names == ["submit_verdict"], f"a resumed worker called the model with {names}"
+        self.reviews += 1
+        return Completion(
+            provider="fake",
+            model="fake-model",
+            stop_reason="tool_use",
+            tool_calls=[
+                ProviderToolCall(
+                    id="resumed-verdict",
+                    name="submit_verdict",
+                    arguments={"passed": True, "findings": []},
+                )
+            ],
+            usage=Usage(),
+        )
 
 
 async def _run_all(verifier: Verifier) -> dict[str, dict[str, Any]]:
@@ -255,7 +292,8 @@ async def test_verification_survives_the_worker_process_being_killed(
     tmp_path: pathlib.Path,
 ) -> None:
     """`kill` on the worker while `tests` runs. The next worker resumes in VERIFYING, never
-    calls the model, and records only what is missing: the database refuses a duplicate."""
+    calls the agent's model, and records only what is missing: the database refuses a
+    duplicate. The only model call it makes is the reviewer's."""
     import docker as docker_sdk
 
     user = User(email=f"{uuid.uuid4()}@warden.test", password_hash="x", role="worker")
@@ -279,6 +317,9 @@ script:
   - tool_call:
       name: finish
       args: {{ summary: "wrote a slow test" }}
+  - tool_call:
+      name: submit_verdict
+      args: {{ passed: true, findings: [] }}
 """,
         encoding="utf-8",
     )
@@ -350,15 +391,10 @@ rules:
         await queue.expire_lease_now(session, task_id)
         await session.commit()
 
-        class _MustNotBeCalled:
-            name = "fake"
-
-            async def generate(self, *args: object, **kwargs: object) -> Completion:
-                raise AssertionError("a resumed verification must not call the model")
-
+        resumed_provider = _ReviewerOnly()
         worker2 = Worker(
             session_factory,
-            _MustNotBeCalled,
+            lambda: resumed_provider,
             load_policy(policy_path),
             WORKER_WORKSPACE,
             keys,
@@ -368,6 +404,7 @@ rules:
         assert result is not None
         assert result.status == "SUCCEEDED"
         assert result.summary == "wrote a slow test"
+        assert resumed_provider.reviews == 1
 
         recorded = (
             await session.scalars(
@@ -383,7 +420,138 @@ rules:
         model_calls = await session.scalar(
             select(func.count()).select_from(ModelCall).where(ModelCall.task_id == task_id)
         )
-        assert model_calls == 2
+        # The agent's two turns (replayed from the log, never bought again) plus the
+        # independent reviewer's single call, made by the second worker.
+        assert model_calls == 3
+        assert client.containers.list(all=True, filters={"label": f"warden.task={task_id}"}) == []
+    finally:
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=15)
+        for stray in client.containers.list(all=True, filters={"label": f"warden.task={task_id}"}):
+            stray.remove(force=True)
+        await asyncio.to_thread(discard_workspace_volume, str(task_id))
+
+
+async def test_the_review_survives_the_worker_process_being_killed_inside_the_call(
+    docker_available: None,
+    empty_queue: None,
+    session: AsyncSession,
+    keys: KeyPair,
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: pathlib.Path,
+) -> None:
+    """`kill` on a real worker while it waits on the reviewer. All four checks are on record
+    and no verdict is. The next worker must not re-run a check or buy the agent's turn again;
+    it calls the reviewer once more (the lost call left no trace to reuse) and the task ends
+    with exactly one verdict row and a decided status.
+
+    The reviewer's answer is scripted to take 60 s, so the kill lands inside the call instead
+    of racing a call that would otherwise finish in a millisecond."""
+    import docker as docker_sdk
+
+    user = User(email=f"{uuid.uuid4()}@warden.test", password_hash="x", role="worker")
+    session.add(user)
+    await session.flush()
+    task = await queue.enqueue(
+        session, user_id=user.id, spec="review probe", idempotency_key=str(uuid.uuid4())
+    )
+    await session.commit()
+    task_id = task.id
+
+    script = tmp_path / "script.yaml"
+    script.write_text(
+        """
+script:
+  - tool_call:
+      name: finish
+      args: { summary: "changed nothing" }
+  - tool_call:
+      name: submit_verdict
+      args: { passed: true, findings: [] }
+    delay_seconds: 60
+""",
+        encoding="utf-8",
+    )
+    key_path = tmp_path / "jwt-private.pem"
+    key_path.write_bytes(
+        keys.private_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+    )
+    env = {
+        **os.environ,
+        "DATABASE_URL": with_database(get_settings().database_url, TEST_DB),
+        "JWT_PRIVATE_KEY_PATH": str(key_path),
+    }
+
+    client = docker_sdk.from_env()
+    proc: subprocess.Popen[bytes] | None = None
+    try:
+        proc = subprocess.Popen(  # noqa: ASYNC220 - same reasoning as test_durability.py
+            [sys.executable, "-m", "warden.core.worker", "--script", str(script)],
+            cwd=str(BACKEND_DIR),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+
+        loop_time = asyncio.get_event_loop().time
+        deadline = loop_time() + 180
+        while loop_time() < deadline:
+            assert proc.poll() is None, "the worker exited before reaching the review"
+            rows = await read_events(session, task_id)
+            if any(e.type == "verify.recorded" and e.payload["kind"] == "tests" for e in rows):
+                break
+            await asyncio.sleep(0.2)
+        else:
+            raise AssertionError("verification never recorded the tests check")
+
+        # A moment for the worker to pass its checkpoint and enter the (60 s) reviewer call.
+        await asyncio.sleep(2)
+        proc.kill()  # TerminateProcess on Windows, SIGKILL on Linux: no cleanup runs.
+        proc.wait(timeout=15)
+        proc = None
+
+        assert sorted(
+            await session.scalars(select(Evidence.kind).where(Evidence.task_id == task_id))
+        ) == [
+            "diff",
+            "lint",
+            "tests",
+            "types",
+        ]
+        assert (
+            await session.scalars(select(Verdict).where(Verdict.task_id == task_id))
+        ).all() == []
+
+        await queue.expire_lease_now(session, task_id)
+        await session.commit()
+
+        resumed_provider = _ReviewerOnly()
+        worker2 = Worker(
+            session_factory,
+            lambda: resumed_provider,
+            load_policy(WORKER_POLICY),
+            WORKER_WORKSPACE,
+            keys,
+        )
+        result = await worker2.run_once()
+
+        assert result is not None
+        # The target repo at baseline passes every check, and the reviewer approved.
+        assert result.status == "SUCCEEDED", result.reason
+        assert resumed_provider.reviews == 1
+
+        verdicts = (await session.scalars(select(Verdict).where(Verdict.task_id == task_id))).all()
+        assert [(v.verifier, v.passed) for v in verdicts] == [("independent", True)]
+        # One agent call (the `finish` turn) and the reviewer's, made by the second worker.
+        purposes = await session.scalars(
+            select(ModelCall.purpose).where(ModelCall.task_id == task_id)
+        )
+        assert sorted(purposes) == ["agent", "reviewer"]
         assert client.containers.list(all=True, filters={"label": f"warden.task={task_id}"}) == []
     finally:
         if proc is not None and proc.poll() is None:

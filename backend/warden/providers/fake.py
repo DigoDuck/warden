@@ -9,6 +9,7 @@ The script format is the one briefing section 19 already defined for behavioural
 week 6 reuses the same YAML files without translation.
 """
 
+import asyncio
 import pathlib
 from collections.abc import Sequence
 from typing import Any
@@ -25,6 +26,7 @@ from warden.providers.base import (
     ToolSchema,
     Usage,
 )
+from warden.verify.reviewer import VERDICT_TOOL
 
 
 class ScriptExhausted(RuntimeError):
@@ -40,6 +42,10 @@ class ScriptStep(BaseModel):
 
     tool_calls: list[ToolCall] = Field(default_factory=list)
     text: str = ""
+    # Seconds the "model" takes to answer. Zero for every normal script; a test that has to
+    # kill a real process in the middle of a model call gives that call a long one, so the
+    # kill lands inside the call instead of racing it.
+    delay_seconds: float = 0.0
 
     @property
     def stop_reason(self) -> StopReason:
@@ -70,7 +76,11 @@ def _parse_step(raw: Any, index: int) -> ScriptStep:
     text = raw.get("text", "")
     if not calls and not text:
         raise ValueError(f"step {index}: needs either a tool call or text")
-    return ScriptStep(tool_calls=calls, text=text)
+    return ScriptStep(tool_calls=calls, text=text, delay_seconds=float(raw.get("delay_seconds", 0)))
+
+
+def _calls_verdict(step: ScriptStep) -> bool:
+    return any(call.name == VERDICT_TOOL for call in step.tool_calls)
 
 
 class FakeProvider:
@@ -123,6 +133,14 @@ class FakeProvider:
             if self._resume_aware
             else self._cursor
         )
+        if self._resume_aware and any(tool.name == VERDICT_TOOL for tool in tools or ()):
+            # The independent reviewer (ADR-010) is a single message with no assistant turn in
+            # it, so counting turns would hand it step 0 of the script. Its step is found by
+            # content instead: the script's own `submit_verdict` call, wherever it sits.
+            index = next(
+                (i for i, step in enumerate(self._script) if _calls_verdict(step)),
+                len(self._script),
+            )
         if index >= len(self._script):
             raise ScriptExhausted(
                 f"script {self._source} has {len(self._script)} step(s) and all were "
@@ -130,6 +148,8 @@ class FakeProvider:
             )
         step = self._script[index]
         self._cursor = index + 1
+        if step.delay_seconds:
+            await asyncio.sleep(step.delay_seconds)
 
         return Completion(
             provider=self.name,

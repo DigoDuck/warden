@@ -3,21 +3,14 @@ import { useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { ApiError, apiFetch } from "../api/client";
 import type { TaskOut } from "../api/types";
+import { DecisionPanel } from "../components/DecisionPanel";
+import { EvidencePanel } from "../components/EvidencePanel";
 import { StatusBadge } from "../components/StatusBadge";
 import { Tabs } from "../components/Tabs";
 import { Timeline } from "../components/Timeline";
 import { useTaskEventStream, type StreamedEvent, type StreamStatus } from "../hooks/useTaskEventStream";
+import { TERMINAL_STATUSES } from "../lib/taskStatuses";
 
-// The state machine from warden/models.py (TASK_STATUSES): once a task reaches one of
-// these, core/worker.py never picks it up again, so polling past this point is pointless
-// and cancelling it is meaningless (routes_tasks.py already answers 409 for it).
-const TERMINAL_STATUSES = new Set([
-  "SUCCEEDED",
-  "FAILED",
-  "CANCELLED",
-  "TIMED_OUT",
-  "BUDGET_EXCEEDED",
-]);
 
 const POLL_INTERVAL_MS = 4000;
 
@@ -197,6 +190,15 @@ export function TaskDetail() {
                   ),
                 },
                 { id: "custo", label: "Custo", panel: <CustoPanel task={task} /> },
+                {
+                  id: "evidencia",
+                  label: "Evidência",
+                  // `live`: a task still running or verifying keeps producing evidence.
+                  panel: (
+                    <EvidencePanel taskPath={taskPath} live={!TERMINAL_STATUSES.has(task.status)} />
+                  ),
+                },
+                { id: "decisao", label: "Decisão", panel: <DecisionPanel task={task} /> },
               ]}
             />
           </div>

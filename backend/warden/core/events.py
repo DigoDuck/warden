@@ -16,7 +16,7 @@ from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from warden.identity import broker
-from warden.models import Evidence, ModelCall, PolicyDecision, TaskEvent, ToolCall
+from warden.models import Evidence, ModelCall, PolicyDecision, TaskEvent, ToolCall, Verdict
 from warden.policy.engine import Decision
 from warden.providers.base import Completion
 from warden.providers.base import ToolCall as ProviderToolCall
@@ -46,6 +46,9 @@ APPROVAL_REJECTED = "approval.rejected"
 # checks are already done.
 VERIFY_STARTED = "verify.started"
 VERIFY_RECORDED = "verify.recorded"
+# ADR-010: the independent reviewer's verdict, committed together with its `verdicts` and
+# `model_calls` rows. Replay reads it to know the (paid) review call must not be made again.
+VERIFY_VERDICT = "verify.verdict"
 
 _SENSITIVE_KEY_PARTS = ("token", "key", "secret", "password", "credential", "authorization")
 _MAX_ARG_CHARS = 2_000
@@ -132,29 +135,31 @@ async def read_events(session: AsyncSession, task_id: UUID) -> list[TaskEvent]:
     return list(result)
 
 
+async def add_model_call(
+    session: AsyncSession, task_id: UUID, completion: Completion, *, purpose: str = "agent"
+) -> ModelCall:
+    """Persist one model call. Cost is computed here, next to the tokens that produced it,
+    so the number in the database and the number the loop bills are the same number."""
+    row = ModelCall(
+        task_id=task_id,
+        provider=completion.provider,
+        model=completion.model,
+        purpose=purpose,
+        tokens_in=completion.usage.input_tokens,
+        tokens_out=completion.usage.output_tokens,
+        cost_usd=cost_usd(completion.model, completion.usage),
+        error=completion.refusal.explanation if completion.refusal else None,
+    )
+    session.add(row)
+    await session.flush()
+    return row
+
+
 async def record_model_call(
     session: AsyncSession, task_id: UUID, completion: Completion, *, purpose: str = "agent"
 ) -> Decimal:
-    """Persist one model call and return what it cost.
-
-    Cost is computed here, next to the tokens that produced it, so the number in the
-    database and the number the loop bills against the budget are the same number.
-    """
-    cost = cost_usd(completion.model, completion.usage)
-    session.add(
-        ModelCall(
-            task_id=task_id,
-            provider=completion.provider,
-            model=completion.model,
-            purpose=purpose,
-            tokens_in=completion.usage.input_tokens,
-            tokens_out=completion.usage.output_tokens,
-            cost_usd=cost,
-            error=completion.refusal.explanation if completion.refusal else None,
-        )
-    )
-    await session.flush()
-    return cost
+    """`add_model_call`, returning only what it cost (what the agent loop bills against)."""
+    return (await add_model_call(session, task_id, completion, purpose=purpose)).cost_usd
 
 
 async def record_tool_call(
@@ -224,5 +229,34 @@ async def record_evidence(
     the database.
     """
     session.add(row := Evidence(task_id=task_id, kind=kind, payload=_redact_value(payload)))
+    await session.flush()
+    return row
+
+
+async def record_verdict(
+    session: AsyncSession,
+    task_id: UUID,
+    *,
+    passed: bool,
+    findings: list[str],
+    malformed_reason: str | None,
+    model_call_id: UUID,
+) -> Verdict:
+    """Persist the independent reviewer's verdict (ADR-010).
+
+    The findings are model text written after reading evidence that came out of the agent's
+    own code, so they pass through the same redaction as every other payload that reaches the
+    database.
+    """
+    session.add(
+        row := Verdict(
+            task_id=task_id,
+            verifier="independent",
+            passed=passed,
+            findings=_redact_value(findings),
+            malformed_reason=_redact_value(malformed_reason),
+            model_call_id=model_call_id,
+        )
+    )
     await session.flush()
     return row

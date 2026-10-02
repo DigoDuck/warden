@@ -12,3 +12,6 @@ export type ApprovalOut = components["schemas"]["ApprovalOut"];
 export type ApprovalDecisionIn = components["schemas"]["ApprovalDecisionIn"];
 export type ValidationError = components["schemas"]["ValidationError"];
 export type HTTPValidationError = components["schemas"]["HTTPValidationError"];
+export type EvidenceOut = components["schemas"]["EvidenceOut"];
+export type EvidenceListOut = components["schemas"]["EvidenceListOut"];
+export type VerdictOut = components["schemas"]["VerdictOut"];

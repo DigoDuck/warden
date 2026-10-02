@@ -8,7 +8,7 @@ export interface TabDef {
 
 /** WAI-ARIA APG "tabs" pattern: roving tabindex (only the selected tab is a Tab stop),
  * ArrowLeft/ArrowRight move focus and select (wrapping at the ends), Home/End jump to the
- * first/last tab. Used once, for Task Detail's Spec/Execução/Custo — kept as its own
+ * first/last tab. Used once, for Task Detail's Spec/Execução/Custo/Evidência/Decisão — kept as its own
  * component rather than inlined so the keyboard behaviour has its own test. */
 export function Tabs({
   label,
