@@ -638,7 +638,7 @@ FEATURE = pathlib.Path(__file__).resolve().parents[1] / "src" / "feature.py"
 
 
 def test_rewrites_the_feature() -> None:
-    FEATURE.write_text("VALUE = 2\n", encoding="utf-8")
+    FEATURE.write_text("VALUE = 2\\n", encoding="utf-8")
 '''
 
 
