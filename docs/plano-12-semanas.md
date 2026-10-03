@@ -26,9 +26,9 @@
 - CI: ruff + mypy + pytest.
 
 **Pronto quando:**
-- [ ] `make demo-fake` roda uma tarefa com FakeProvider e imprime os eventos do DB
-- [ ] `make demo` com `ANTHROPIC_API_KEY` executa "liste os arquivos e resuma o projeto" e grava `model_calls` com tokens e custo em USD
-- [ ] CI verde no primeiro PR
+- [x] `make demo-fake` roda uma tarefa com FakeProvider e imprime os eventos do DB (auditoria 03/10: `docs/auditoria-semanas-1-5.md`)
+- [ ] `make demo` com `ANTHROPIC_API_KEY` executa "liste os arquivos e resuma o projeto" e grava `model_calls` com tokens e custo em USD (pendente, ver `docs/auditoria-semanas-1-5.md`)
+- [x] CI verde no primeiro PR (auditoria 03/10: `docs/auditoria-semanas-1-5.md`)
 
 **Risco da semana:** gastar tempo em estrutura de pastas. Copie o layout do briefing e siga.
 
@@ -49,12 +49,12 @@
 - ADR-001 (runtime próprio), ADR-002 (Postgres como fila), ADR-003 (semântica da policy), ADR-004 (sandbox sem rede).
 
 **Pronto quando:**
-- [ ] teste prova que o container roda non-root, sem rede (`curl` falha) e com fs read-only exceto `/workspace`
-- [ ] `read_file(".env")` retorna deny com `matched_rules=[never-read-secrets]` e o modelo recebe o erro e continua
-- [ ] `run_command("rm -rf /")` negado; `run_command("pytest")` permitido
-- [ ] teste de resume: worker morto após o evento N; novo worker retoma; nenhuma tool executa duas vezes (assert sobre `tool_calls`)
-- [ ] `POST /tasks/{id}/cancel` durante `run_tests` mata o container e finaliza CANCELLED
-- [ ] tarefa com `max_usd: 0.01` termina BUDGET_EXCEEDED
+- [x] teste prova que o container roda non-root, sem rede (`curl` falha) e com fs read-only exceto `/workspace` (auditoria 03/10: `docs/auditoria-semanas-1-5.md`)
+- [x] `read_file(".env")` retorna deny com `matched_rules=[never-read-secrets]` e o modelo recebe o erro e continua (auditoria 03/10: `docs/auditoria-semanas-1-5.md`)
+- [x] `run_command("rm -rf /")` negado; `run_command("pytest")` permitido (auditoria 03/10: `docs/auditoria-semanas-1-5.md`)
+- [x] teste de resume: worker morto após o evento N; novo worker retoma; nenhuma tool executa duas vezes (assert sobre `tool_calls`) (auditoria 03/10: `docs/auditoria-semanas-1-5.md`)
+- [x] `POST /tasks/{id}/cancel` durante `run_tests` mata o container e finaliza CANCELLED (auditoria 03/10: `docs/auditoria-semanas-1-5.md`)
+- [x] tarefa com `max_usd: 0.01` termina BUDGET_EXCEEDED (auditoria 03/10: `docs/auditoria-semanas-1-5.md`)
 
 **Risco:** Docker Desktop no Windows. Se o socket der problema, rode `api` e `worker` dentro do WSL2 já nesta semana.
 
@@ -75,11 +75,11 @@
 - ADR-005 (identidade), ADR-006 (broker), ADR-007 (audit), ADR-008 (observabilidade × audit).
 
 **Pronto quando:**
-- [ ] tool executada por token expirado ou sem scope falha com 401/403 e gera evento de audit
-- [x] round trip de aprovação via API: tarefa pausa, aprovar retoma do checkpoint, rejeitar injeta erro e o loop continua
-- [ ] `UPDATE audit_log SET ...` como `warden_app` falha por permissão (teste de integração)
-- [ ] teste adultera uma linha via superuser e `/audit/verify` aponta o índice quebrado
-- [ ] `grep` em logs e em `task_events` não encontra o token do GitHub
+- [x] tool executada por token expirado ou sem scope falha com 401/403 e gera evento de audit (auditoria 03/10: `docs/auditoria-semanas-1-5.md`)
+- [x] round trip de aprovação via API: tarefa pausa, aprovar retoma do checkpoint, rejeitar injeta erro e o loop continua (auditoria 03/10: `docs/auditoria-semanas-1-5.md`)
+- [x] `UPDATE audit_log SET ...` como `warden_app` falha por permissão (teste de integração) (auditoria 03/10: `docs/auditoria-semanas-1-5.md`)
+- [x] teste adultera uma linha via superuser e `/audit/verify` aponta o índice quebrado (auditoria 03/10: `docs/auditoria-semanas-1-5.md`)
+- [ ] `grep` em logs e em `task_events` não encontra o token do GitHub (pendente, ver `docs/auditoria-semanas-1-5.md`)
 
 ---
 
@@ -98,10 +98,10 @@
 - ESLint + tsc no CI.
 
 **Pronto quando:**
-- [ ] submeter tarefa na UI, ver eventos chegando ao vivo, ver deny inline com a regra
-- [ ] aprovar `open_pr` na Decision Queue retoma a tarefa e o card some
-- [ ] `tsc --noEmit`, ESLint e Vitest verdes no CI
-- [ ] navegação por teclado funciona nas duas telas principais
+- [x] submeter tarefa na UI, ver eventos chegando ao vivo, ver deny inline com a regra (auditoria 03/10: `docs/auditoria-semanas-1-5.md`)
+- [x] aprovar `open_pr` na Decision Queue retoma a tarefa e o card some (auditoria 03/10: `docs/auditoria-semanas-1-5.md`)
+- [x] `tsc --noEmit`, ESLint e Vitest verdes no CI (auditoria 03/10: `docs/auditoria-semanas-1-5.md`)
+- [x] navegação por teclado funciona nas duas telas principais (auditoria 03/10: `docs/auditoria-semanas-1-5.md`)
 
 **Risco:** polir UI. Proibido animar qualquer coisa nesta semana.
 
@@ -123,10 +123,10 @@
 - ADR-010 (verificação independente e definição de sucesso).
 
 **Pronto quando:**
-- [ ] uma issue do repo de exemplo vira PR aberto por agente, com relatório, e o CI do repo alvo passa
-- [ ] verdict é gravado separado do resumo do coder; UI mostra os dois com selos "generated" e "verified"
-- [ ] rodar a mesma tarefa duas vezes com a mesma `Idempotency-Key` não abre dois PRs
-- [ ] PR rejeitado na Decision Queue fecha a tarefa como CANCELLED com nota no audit
+- [ ] uma issue do repo de exemplo vira PR aberto por agente, com relatório, e o CI do repo alvo passa (pendente, ver `docs/auditoria-semanas-1-5.md`)
+- [x] verdict é gravado separado do resumo do coder; UI mostra os dois com selos "generated" e "verified" (auditoria 03/10: `docs/auditoria-semanas-1-5.md`)
+- [x] rodar a mesma tarefa duas vezes com a mesma `Idempotency-Key` não abre dois PRs (auditoria 03/10: `docs/auditoria-semanas-1-5.md`)
+- [x] PR rejeitado na Decision Queue fecha a tarefa como CANCELLED com nota no audit (auditoria 03/10: `docs/auditoria-semanas-1-5.md`)
 
 ---
 
