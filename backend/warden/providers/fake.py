@@ -17,6 +17,7 @@ from typing import Any
 import yaml
 from pydantic import BaseModel, Field
 
+from warden.plan.planner import PLAN_TOOL
 from warden.providers.base import (
     AssistantMessage,
     Completion,
@@ -83,6 +84,29 @@ def _calls_verdict(step: ScriptStep) -> bool:
     return any(call.name == VERDICT_TOOL for call in step.tool_calls)
 
 
+def _calls_plan(step: ScriptStep) -> bool:
+    return any(call.name == PLAN_TOOL for call in step.tool_calls)
+
+
+# What the planner answers when the script has no `submit_plan` step (ADR-031). Only a script
+# that wants to assert on the plan's content carries a step; every other script, including all
+# the existing ones, gets a valid plan for free and keeps its coder turns where they were.
+_DEFAULT_PLAN = ScriptStep(
+    tool_calls=[
+        ToolCall(
+            id="fake-plan-0",
+            name=PLAN_TOOL,
+            arguments={
+                "steps": ["Read the relevant files", "Make the change", "Run the checks"],
+                "likely_files": [],
+                "risks": [],
+                "tests_to_add": [],
+            },
+        )
+    ]
+)
+
+
 class FakeProvider:
     """Replays `script`, one step per `generate()` call. Messages are ignored by design."""
 
@@ -123,17 +147,39 @@ class FakeProvider:
         model: str | None = None,
         max_tokens: int = 16000,
     ) -> Completion:
+        offered = {tool.name for tool in tools or ()}
+        if PLAN_TOOL in offered:
+            # The planner (ADR-031) is the first call of a task and is no turn of the coder's
+            # dialogue, so it never moves the cursor: the coder's first turn stays step 0 of
+            # the script whether or not the script scripts a plan.
+            at_cursor = self._cursor < len(self._script) and _calls_plan(self._script[self._cursor])
+            planned = next((i for i, step in enumerate(self._script) if _calls_plan(step)), None)
+            index = self._cursor if at_cursor else planned if self._resume_aware else None
+            if index is None:
+                return self._completion(_DEFAULT_PLAN, model)
+            return await self._answer(index, model, advance=at_cursor)
+
         # Resume-aware: the step is the model's position in the dialogue, the number of
         # assistant turns already in it. The Worker builds a new provider for every claim, so a
         # task resumed after an approval or a crash meets a fresh instance; a cursor would
         # restart at step 0 and replay tool call ids the event log already holds. Off by
         # default because tests resume with a script of only the remaining steps.
-        index = (
-            sum(isinstance(message, AssistantMessage) for message in messages)
-            if self._resume_aware
-            else self._cursor
-        )
-        if self._resume_aware and any(tool.name == VERDICT_TOOL for tool in tools or ()):
+        #
+        # The plan and verdict steps are not turns of that dialogue (neither answer is an
+        # assistant message in it), so they are left out of the numbering: counting them would
+        # hand the coder `submit_plan` as its first turn, an off-by-one the moment a script
+        # scripts a plan.
+        if self._resume_aware:
+            turns = [
+                i
+                for i, step in enumerate(self._script)
+                if not _calls_plan(step) and not _calls_verdict(step)
+            ]
+            turn = sum(isinstance(message, AssistantMessage) for message in messages)
+            index = turns[turn] if turn < len(turns) else len(self._script)
+        else:
+            index = self._cursor
+        if self._resume_aware and VERDICT_TOOL in offered:
             # The independent reviewer (ADR-010) is a single message with no assistant turn in
             # it, so counting turns would hand it step 0 of the script. Its step is found by
             # content instead: the script's own `submit_verdict` call, wherever it sits.
@@ -141,16 +187,22 @@ class FakeProvider:
                 (i for i, step in enumerate(self._script) if _calls_verdict(step)),
                 len(self._script),
             )
+        return await self._answer(index, model)
+
+    async def _answer(self, index: int, model: str | None, *, advance: bool = True) -> Completion:
         if index >= len(self._script):
             raise ScriptExhausted(
                 f"script {self._source} has {len(self._script)} step(s) and all were "
                 f"consumed; the loop asked for another turn"
             )
         step = self._script[index]
-        self._cursor = index + 1
+        if advance:
+            self._cursor = index + 1
         if step.delay_seconds:
             await asyncio.sleep(step.delay_seconds)
+        return self._completion(step, model)
 
+    def _completion(self, step: ScriptStep, model: str | None) -> Completion:
         return Completion(
             provider=self.name,
             model=model or self._model,

@@ -39,9 +39,11 @@ make user-token email=voce@exemplo.com scopes="tasks:write tasks:read approvals:
    mostra 1.
 4. **Aprovar:** em Aprovações, aprovar a escrita de `NOTES.md`. O card some, o contador zera,
    e a tarefa volta a executar e termina **Concluída**.
-5. **Rejeitar (segunda tarefa):** o botão fica desabilitado até existir uma nota, pede
+5. **Plano:** na aba Spec, o plano do planner (passos, arquivos, riscos) aparece com o selo
+   **Gerado**. É conselho do modelo, não evidência.
+6. **Rejeitar (segunda tarefa):** o botão fica desabilitado até existir uma nota, pede
    confirmação, e a tarefa continua com a recusa em vez de parar.
-6. **Teclado:** do topo, Tab mostra "Pular para o conteúdo". Na lista, Tab chega a cada linha
+7. **Teclado:** do topo, Tab mostra "Pular para o conteúdo". Na lista, Tab chega a cada linha
    e Enter abre o detalhe. No detalhe, as setas trocam de aba.
-7. **Rede:** no DevTools, só requisições `woff2` da própria origem, nenhuma URL com token, e a
+8. **Rede:** no DevTools, só requisições `woff2` da própria origem, nenhuma URL com token, e a
    requisição `/stream` reconectada leva o cabeçalho `Last-Event-ID`.

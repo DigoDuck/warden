@@ -260,11 +260,11 @@ script:
         assert [(a.tool_call_id, a.status) for a in approvals_rows] == [
             (f"publish-{task_id}", "approved")
         ]
-        # The agent's two turns and the reviewer's one, all bought by the first worker.
+        # The planner's, the agent's two turns and the reviewer's, all bought by the first worker.
         calls = await session.scalar(
             select(func.count()).select_from(ModelCall).where(ModelCall.task_id == task_id)
         )
-        assert calls == 3
+        assert calls == 4
         assert client.containers.list(all=True, filters={"label": f"warden.task={task_id}"}) == []
     finally:
         if proc is not None and proc.poll() is None:

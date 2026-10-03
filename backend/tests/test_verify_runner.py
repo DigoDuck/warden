@@ -420,9 +420,10 @@ rules:
         model_calls = await session.scalar(
             select(func.count()).select_from(ModelCall).where(ModelCall.task_id == task_id)
         )
-        # The agent's two turns (replayed from the log, never bought again) plus the
-        # independent reviewer's single call, made by the second worker.
-        assert model_calls == 3
+        # The planner's call (ADR-031) and the agent's two turns (all replayed from the log,
+        # never bought again) plus the independent reviewer's single call, made by the second
+        # worker.
+        assert model_calls == 4
         assert client.containers.list(all=True, filters={"label": f"warden.task={task_id}"}) == []
     finally:
         if proc is not None and proc.poll() is None:
@@ -547,11 +548,12 @@ script:
 
         verdicts = (await session.scalars(select(Verdict).where(Verdict.task_id == task_id))).all()
         assert [(v.verifier, v.passed) for v in verdicts] == [("independent", True)]
-        # One agent call (the `finish` turn) and the reviewer's, made by the second worker.
+        # The planner's call (made before the kill), one agent call (the `finish` turn) and the
+        # reviewer's, made by the second worker.
         purposes = await session.scalars(
             select(ModelCall.purpose).where(ModelCall.task_id == task_id)
         )
-        assert sorted(purposes) == ["agent", "reviewer"]
+        assert sorted(purposes) == ["agent", "planner", "reviewer"]
         assert client.containers.list(all=True, filters={"label": f"warden.task={task_id}"}) == []
     finally:
         if proc is not None and proc.poll() is None:

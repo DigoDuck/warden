@@ -26,6 +26,7 @@ from warden.api.deps import SessionDep, require_scope
 from warden.api.schemas import (
     EvidenceListOut,
     EvidenceOut,
+    PlanOut,
     TaskCreate,
     TaskEventOut,
     TaskEventPage,
@@ -36,7 +37,7 @@ from warden.api.schemas import (
 )
 from warden.core import cancel, queue
 from warden.core import events as core_events
-from warden.core.events import ITERATION_STARTED, VERIFY_STARTED
+from warden.core.events import ITERATION_STARTED, PLAN_RECORDED, VERIFY_STARTED
 from warden.identity import Claims
 from warden.models import (
     TASK_STATUSES,
@@ -101,6 +102,14 @@ async def _to_task_out(session: AsyncSession, task: Task) -> TaskOut:
         .limit(1)
     )
     summary = (summary_payload or {}).get("summary")
+    # The planner's advice (ADR-031) is in the log the same way. A malformed answer is recorded
+    # without a `plan`, so it reads as no plan: the UI has nothing to show for it.
+    plan_payload = await session.scalar(
+        select(TaskEvent.payload)
+        .where(TaskEvent.task_id == task.id, TaskEvent.type == PLAN_RECORDED)
+        .limit(1)
+    )
+    plan = (plan_payload or {}).get("plan")
     verdict = await session.scalar(
         select(Verdict).where(Verdict.task_id == task.id, Verdict.verifier == "independent")
     )
@@ -115,6 +124,7 @@ async def _to_task_out(session: AsyncSession, task: Task) -> TaskOut:
         cost_usd=Decimal(cost or 0),
         iterations=iterations or 0,
         summary=str(summary) if summary is not None else None,
+        plan=PlanOut.model_validate(plan) if plan else None,
         verdict=(
             VerdictOut(
                 passed=verdict.passed,

@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -272,5 +272,40 @@ describe("TaskDetail", () => {
     await userEvent.click(screen.getByRole("button", { name: /cancelar tarefa/i }));
 
     expect(await screen.findByText(/tarefa cancelada/i)).toBeInTheDocument();
+  });
+
+  describe("plan (Spec tab)", () => {
+    const plan = {
+      steps: ["ler src/app.py", "corrigir average()"],
+      likely_files: ["src/app.py"],
+      risks: ["lista vazia"],
+      tests_to_add: ["average([]) levanta erro"],
+    };
+
+    it("shows the planner's plan on the Spec tab, marked as generated", async () => {
+      routeFetch({ [`/tasks/${TASK_ID}`]: [task({ plan })] });
+      renderAt(`/tarefas/${TASK_ID}`);
+      await screen.findByText("Executando");
+
+      await userEvent.click(screen.getByRole("tab", { name: "Spec" }));
+
+      const section = (await screen.findByRole("region", { name: "Plano do planner" })) as HTMLElement;
+      expect(within(section).getByText("Gerado")).toBeInTheDocument();
+      for (const line of [...plan.steps, ...plan.likely_files, ...plan.risks, ...plan.tests_to_add]) {
+        expect(within(section).getByText(line)).toBeInTheDocument();
+      }
+    });
+
+    it("says there is no plan instead of showing an empty section", async () => {
+      routeFetch({ [`/tasks/${TASK_ID}`]: [task({ plan: null })] });
+      renderAt(`/tarefas/${TASK_ID}`);
+      await screen.findByText("Executando");
+
+      await userEvent.click(screen.getByRole("tab", { name: "Spec" }));
+
+      expect(await screen.findByText("faz algo importante")).toBeInTheDocument();
+      expect(screen.getByText(/sem plano/i)).toBeInTheDocument();
+      expect(screen.queryByRole("region", { name: "Plano do planner" })).not.toBeInTheDocument();
+    });
   });
 });

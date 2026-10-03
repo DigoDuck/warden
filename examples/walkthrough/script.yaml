@@ -1,11 +1,27 @@
 # Walkthrough for the UI (week 4): one task that shows every decision the control plane
 # makes. Run the worker with this script and examples/walkthrough/policy.yaml (see README).
 #
+#   plan    submit_plan         -> the planner's answer (ADR-031); shown on the Spec tab
 #   step 1  list_files          -> allow
 #   step 2  read_file .env      -> deny (never-read-secrets); the model gets the refusal
 #   step 3  write_file NOTES.md -> require_approval; the task pauses in the Decision Queue
 #   step 4  finish              -> only reached after a human approves or rejects step 3
+#   verdict submit_verdict      -> the independent reviewer's answer, asked after the checks.
+#                                  Without it the worker's reviewer call has no step to read
+#                                  and the task ends FAILED with "script exhausted" (ADR-010).
+#
+# `submit_plan` and `submit_verdict` are not turns of the coder's conversation: the FakeProvider
+# (resume_aware) finds them by content, so they can sit anywhere in the list.
 script:
+  - tool_call:
+      name: submit_plan
+      args:
+        steps:
+          - Listar os arquivos Python do repositório
+          - Escrever NOTES.md com o resumo
+        likely_files: [NOTES.md]
+        risks: [".env não pode ser lido: a policy recusa"]
+        tests_to_add: []
   - tool_call: { name: list_files, args: { pattern: "**/*.py" } }
   - tool_call: { name: read_file, args: { path: ".env" } }
   - tool_call:
@@ -19,3 +35,4 @@ script:
         summary: >-
           Listed the Python files, was refused .env by policy, and wrote NOTES.md once a human
           decided on it.
+  - tool_call: { name: submit_verdict, args: { passed: true, findings: [] } }

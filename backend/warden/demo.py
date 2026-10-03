@@ -23,6 +23,7 @@ from warden.db import make_engine, make_session_factory
 from warden.identity.jwt import load_keys
 from warden.models import Evidence, User, Verdict
 from warden.models import Task as TaskRow
+from warden.plan.planner import ProviderPlanner
 from warden.policy.engine import load_policy, never_readable
 from warden.providers.base import ModelProvider
 from warden.sandbox.docker import Sandbox, SandboxProfile, discard_workspace_volume
@@ -109,6 +110,7 @@ async def main(kind: str) -> int:
                 budget=DEMO_BUDGET,
                 verifier=Verifier(sandbox, WORKSPACE, exclude=never_readable(policy)),
                 reviewer=ProviderReviewer(provider),
+                planner=ProviderPlanner(provider),
                 publisher=build_publish_registry(sandbox),
             )
             await session.commit()
