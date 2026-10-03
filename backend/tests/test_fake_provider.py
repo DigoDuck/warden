@@ -6,8 +6,8 @@ from decimal import Decimal
 
 import pytest
 
-from warden.providers.base import AssistantMessage, Message, ToolSchema, UserMessage
-from warden.providers.fake import FakeProvider, ScriptExhausted
+from warden.providers.base import AssistantMessage, Message, ToolCall, ToolSchema, UserMessage
+from warden.providers.fake import FakeProvider, ScriptExhausted, ScriptStep
 from warden.providers.pricing import cost_usd
 
 FIXTURE = pathlib.Path(__file__).parent / "fixtures" / "script_minimal.yaml"
@@ -136,3 +136,65 @@ async def test_a_step_can_take_time_to_answer(tmp_path: pathlib.Path) -> None:
     await FakeProvider.from_yaml(script).generate(ONE_TURN)
 
     assert time.monotonic() - started >= 0.15
+
+
+# ADR-031: the planner's `submit_plan` is not an assistant turn of the coder's dialogue, so
+# the scripted provider must not count it (or the reviewer's verdict) as one.
+PLAN_TOOL_SCHEMA = ToolSchema(name="submit_plan", description="plan", input_schema={})
+
+
+def _plan_step() -> ScriptStep:
+    call = ToolCall(
+        id="x",
+        name="submit_plan",
+        arguments={"steps": ["scripted"], "likely_files": [], "risks": [], "tests_to_add": []},
+    )
+    return ScriptStep(tool_calls=[call])
+
+
+def _tool_step(name: str) -> ScriptStep:
+    return ScriptStep(tool_calls=[ToolCall(id="x", name=name, arguments={})])
+
+
+async def test_a_plan_is_answered_by_default_without_consuming_a_script_step() -> None:
+    """A script with no `submit_plan` step still gets a plan, and the coder's first turn is
+    still step 0: only a script that wants to test plan content has to carry a step."""
+    provider = FakeProvider([_tool_step("list_files"), _tool_step("finish")])
+
+    plan = await provider.generate(ONE_TURN, tools=[PLAN_TOOL_SCHEMA])
+    assert [c.name for c in plan.tool_calls] == ["submit_plan"]
+    assert plan.tool_calls[0].arguments["steps"]
+
+    first = await provider.generate(ONE_TURN)
+    assert [c.name for c in first.tool_calls] == ["list_files"]
+
+
+async def test_a_scripted_plan_step_is_used_in_cursor_mode() -> None:
+    provider = FakeProvider([_plan_step(), _tool_step("finish")])
+
+    plan = await provider.generate(ONE_TURN, tools=[PLAN_TOOL_SCHEMA])
+    assert plan.tool_calls[0].arguments["steps"] == ["scripted"]
+    coder = await provider.generate(ONE_TURN)
+    assert [c.name for c in coder.tool_calls] == ["finish"]
+
+
+async def test_resume_aware_turn_index_skips_plan_and_verdict_steps() -> None:
+    """The off-by-one this fixes: `submit_plan` leads the script, but the coder's first turn
+    (no assistant message yet) must be the first step that is not the planner's or the
+    reviewer's."""
+    script = [
+        _plan_step(),
+        _tool_step("list_files"),
+        _tool_step("finish"),
+        _tool_step("submit_verdict"),
+    ]
+    provider = FakeProvider(script, resume_aware=True)
+    assistant = AssistantMessage(raw_content={})
+
+    first = await provider.generate(ONE_TURN)
+    assert [c.name for c in first.tool_calls] == ["list_files"]
+    second = await provider.generate([*ONE_TURN, assistant])
+    assert [c.name for c in second.tool_calls] == ["finish"]
+
+    plan = await provider.generate(ONE_TURN, tools=[PLAN_TOOL_SCHEMA])
+    assert plan.tool_calls[0].arguments["steps"] == ["scripted"]
