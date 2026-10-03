@@ -34,6 +34,7 @@ from warden.core.replay import ResumeState, rebuild
 from warden.db import make_engine, make_session_factory
 from warden.identity.jwt import KeyPair, load_keys
 from warden.models import Task
+from warden.plan.planner import Planner
 from warden.policy.engine import Policy, load_policy, never_readable
 from warden.providers.base import ModelProvider
 from warden.sandbox.docker import (
@@ -222,6 +223,7 @@ async def run_claimed_task(
     verifier: EvidenceCollector | None = None,
     reviewer: Reviewer | None = None,
     publisher: ToolRegistry | None = None,
+    planner: Planner | None = None,
 ) -> RunResult:
     """Run a task from wherever it left off.
 
@@ -250,6 +252,7 @@ async def run_claimed_task(
         verifier=verifier,
         reviewer=reviewer,
         publisher=publisher,
+        planner=planner,
     )
 
 
