@@ -57,7 +57,7 @@ jobs:
       # that starts a container. Built here rather than pulled: nothing publishes it yet.
       - run: docker build -t warden-sandbox:dev sandbox-images/python
 
-      # Week 6 / briefing section 43 criterion: policy/ and core/ at >= 80% coverage, each
+      # MVP criterion (briefing section 42): policy/ and core/ at >= 80% coverage, each
       # package gated on its own so a well-covered one cannot hide a weak one. `coverage run`
       # (not `pytest --cov`) because pyproject sets parallel + subprocess patching, which makes
       # the worker subprocesses the durability tests spawn report too; `combine` merges them.

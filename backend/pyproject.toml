@@ -84,7 +84,7 @@ asyncio_default_test_loop_scope = "session"
 testpaths = ["tests"]
 
 # Coverage is measured for the whole `warden` package; the 80% gate is applied per package
-# (policy/ and core/) in CI with `coverage report --include=...` (briefing, section 43).
+# (policy/ and core/) in CI with `coverage report --include=...` (briefing, section 42).
 [tool.coverage.run]
 source = ["warden"]
 # `parallel` writes one .coverage.<host>.<pid>.<rand> file per process and `coverage combine`
