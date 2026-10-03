@@ -403,9 +403,9 @@ async def test_a_run_that_uses_every_iteration_is_classified_loop(
 async def test_a_scripted_open_pr_cannot_reach_anything(
     ctx: runner.Context, tmp_path: pathlib.Path
 ) -> None:
-    # GitHub is unconfigured, so github.open_pr is not even registered: the model is calling a
-    # tool that does not exist. (The policy still has an approval rule for that name, so the
-    # task parks in WAITING_APPROVAL; nobody approves, and nothing can run either way.)
+    # The agent never has github.open_pr (ADR-028: only the control plane publishes), so the
+    # model is calling a tool that does not exist. `_decide` denies an unregistered tool before
+    # any rule is read, even though `open-pr-needs-human` names it, and the run carries on.
     item = _scripted_item(
         _items()["issue-01"],
         tmp_path,
@@ -421,6 +421,8 @@ async def test_a_scripted_open_pr_cannot_reach_anything(
                     },
                 }
             },
+            {"tool_call": {"name": "finish", "args": {"summary": "opened a PR"}}},
+            {"tool_call": {"name": "submit_verdict", "args": {"passed": True, "findings": []}}},
         ],
     )
     assert item.fake_script is not None
@@ -428,11 +430,19 @@ async def test_a_scripted_open_pr_cannot_reach_anything(
     result = await coding.run_item(item, ctx, _factory_for(item.fake_script), BUDGET)
 
     assert result.state == "done", result.detail
-    assert result.status == "WAITING_APPROVAL"
+    # Nothing changed, so there is nothing to publish and no question for a human: the task
+    # ends, the hidden test fails, and the hallucinated tool is what the run is classified by.
+    assert result.status == "SUCCEEDED"
     assert result.failure_category == "hallucinated_api"
     async with ctx.session_factory() as session:
-        names = list(await session.scalars(select(ToolCallRow.tool_name)))
-    assert "github.open_pr" not in names  # never executed, never even recorded as run
+        rows = list(
+            await session.execute(
+                select(ToolCallRow.tool_name, ToolCallRow.decision).where(
+                    ToolCallRow.tool_name == "github.open_pr"
+                )
+            )
+        )
+    assert [tuple(r) for r in rows] == [("github.open_pr", "deny")]  # recorded, never run
 
     registry = build_registry(cast(Sandbox, None))
     assert not registry.has("github.open_pr")

@@ -66,9 +66,9 @@ mínimo de diff (para isso existe o reviewer).
 (veredito aprovou **e** gating verde **e** teste oculto reprovou), custo (soma de `model_calls`,
 revisor incluído), tokens, latência (`finished_at - started_at`), iterações, chamadas de tool e
 `forbidden_attempts`. As chamadas do modelo vêm dos eventos `tool.requested` cruzados com
-`policy.decided`, não da tabela `tool_calls`: uma chamada que pausa a tarefa para aprovação
-(`github.open_pr`) não tem linha lá, e é justamente o tipo de chamada que o classificador precisa
-ver.
+`policy.decided`, não da tabela `tool_calls`: uma chamada que pausa a tarefa para aprovação não
+tem linha lá até um humano responder, e o classificador precisa ver toda chamada que o modelo
+fez.
 
 **Categoria de falha** (só quando não houve `success`), regra determinística, a primeira que
 casa vence, função pura em `evals/coding_checks.py` com teste em tabela:
@@ -102,11 +102,12 @@ alcança; os restantes saem `pulado (budget cap)`. Um item em andamento pode est
 por no máximo o próprio `max_usd`.
 
 **GitHub desligado.** O runner força `GITHUB_REPO` e `GITHUB_TOKEN` vazios antes de carregar as
-settings: `github.open_pr` não é nem registrada ("ausente, não recusando", ADR-025). Difere de
-`runner.isolate_github`, que registra a tool de propósito para o caso 3 do ADR-027. A URL da API
-aponta para uma porta de loopback onde nada escuta, por garantia. Se o modelo chamar
-`github.open_pr` mesmo assim, a policy ainda tem uma regra de aprovação para esse nome: a tarefa
-estaciona em `WAITING_APPROVAL`, ninguém aprova, e vira `hallucinated_api`.
+settings: `build_publish_registry` devolve `None` e a fase de publicação (ADR-028) não existe
+nesta rodada, mesmo com diff verde. Difere de `runner.isolate_github`, que configura o GitHub de
+propósito para o caso 3 do ADR-027. A URL da API aponta para uma porta de loopback onde nada
+escuta, por garantia. O agente nunca tem `github.open_pr` (ADR-028): se o modelo chamar a tool
+mesmo assim, `_decide` nega a chamada a uma tool fora do registry antes de ler qualquer regra, o
+loop segue, e a rodada vira `hallucinated_api`.
 
 ## Alternativas consideradas
 

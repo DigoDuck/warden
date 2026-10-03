@@ -137,13 +137,13 @@ def hidden_test_argv(test_name: str) -> list[str]:
 def isolate_coding_github() -> None:
     """Make the coding run unable to open a pull request.
 
-    `build_registry` only registers `github.open_pr` when a repo AND a token are set, so
-    empty values mean the tool does not exist for the model at all ("absent, not refusing",
-    ADR-025). Environment variables win over .env in pydantic-settings, so this holds
+    The agent never has `github.open_pr` (ADR-028); the control plane's publish phase does,
+    and only when a repo AND a token are set (`build_publish_registry`). Empty values mean
+    there is no publish phase at all, so a green run here never proposes a pull request. Environment variables win over .env in pydantic-settings, so this holds
     whatever the shell or the file exports. The API URL points at a loopback port nothing
     listens on, the same belt-and-braces runner.isolate_github uses: even a regression that
     registered the tool would get a refused connection, not a real PR. Differs from
-    runner.isolate_github on purpose: that one registers the tool (case 3 needs it to test
+    runner.isolate_github on purpose: that one configures GitHub (case 3 needs it to test
     the approval gate), this one must not.
     """
     os.environ.update(
@@ -264,8 +264,7 @@ async def read_back(ctx: runner.Context, task_id: uuid.UUID) -> _Readback:
         iterations = sum(1 for r in rows if r.type == events.ITERATION_STARTED)
         # Every call the model MADE, from `tool.requested`, joined with what the policy
         # decided about it. Not the `tool_calls` table: a call that parks the task for
-        # approval (`github.open_pr`, which the policy escalates by name) has no row there
-        # until a human answers, but it is exactly the kind of call this has to see.
+        # approval has no row there until a human answers, and this has to see every call.
         decided = {
             str(r.payload["id"]): str(r.payload["effect"])
             for r in rows
