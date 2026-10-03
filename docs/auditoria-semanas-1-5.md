@@ -75,8 +75,9 @@ quando a prova cobre o que ele diz; prova parcial ou bloqueada fica desmarcada, 
    banco. Na auditoria, uma tarefa submetida pela tela teve o `write_file` negado por default deny
    e terminou SUCCEEDED sem mudar nada. Para testar a publicação foi preciso promover o usuário de
    teste no banco de dev (e depois desfazer). **É o achado mais sério:** o fluxo "issue vira PR" da
-   semana 5 nunca funcionaria a partir da tela. Pede uma decisão (papel no `user-token`, ou o que
-   `user.role` deve significar na policy) e uma ADR.
+   semana 5 nunca funcionaria a partir da tela. **Resolvido** em `fix/user-token-role`
+   (ADR-030): `user.role` é o papel de quem submete, e `make user-token ... role=worker` cria um
+   usuário cujas tarefas podem alterar código.
 2. **A Decision Queue mostra o corpo do PR como JSON cru** (`args_safe`), com `\n` literais. Dá para
    decidir, mas é difícil ler. O briefing (§24) pede diff, risco e custo na fila.
 3. **O painel das abas do Detalhe não tem `tabindex="0"`.** Um painel sem nada focável (Custo,
@@ -94,4 +95,4 @@ quando a prova cobre o que ele diz; prova parcial ou bloqueada fica desmarcada, 
 
 - Com a chave (~10/10): `make demo` real.
 - Com chave, PAT e repo alvo real: uma issue vira PR e o CI do repo alvo passa.
-- Sem dependência externa: varrer os logs de processo (semana 3) e resolver o achado 1.
+- Sem dependência externa: varrer os logs de processo (semana 3).

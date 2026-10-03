@@ -75,10 +75,13 @@ api:
 
 # Mints a user JWT for manual testing, e.g.:
 #   TOKEN=$(make user-token email=you@example.com scopes="tasks:write tasks:read audit:read")
+# role=worker creates a user whose tasks may change code (the policy's `write-source` rule
+# reads the submitter's role, ADR-030); without it a new user is `user` and its tasks only read.
+# An existing user's role is never changed: use another email for a different role.
 # The leading @ matters: without it make echoes the recipe line to stdout and $(...) captures
 # that line along with the token.
 user-token:
-	@$(UV) python -m warden.api.user_token --email "$(email)" --scopes $(scopes)
+	@$(UV) python -m warden.api.user_token --email "$(email)" --scopes $(scopes) $(if $(role),--role $(role))
 
 # `npm ci` matches CI/package-lock.json exactly, unlike `npm install`.
 frontend-install:

@@ -26,8 +26,12 @@ export function Settings() {
       <h1>Configurações</h1>
       <p>
         Ainda não existe <code>/auth/login</code>. Gere um token no backend com{" "}
-        <code>make user-token email=voce@exemplo.com scopes="tasks:write tasks:read audit:read"</code>{" "}
-        e cole abaixo.
+        <code>
+          make user-token email=voce@exemplo.com scopes="tasks:write tasks:read audit:read
+          approvals:read approvals:decide" role=worker
+        </code>{" "}
+        e cole abaixo. Sem <code>role=worker</code>, as tarefas desse usuário só leem o
+        repositório: a policy só deixa alterar código a pedido de quem tem esse papel.
       </p>
       {/* sessionStorage, não localStorage: token de dev colado à mão, vale só para esta
           aba/janela e some ao fechá-la (ver frontend/README.md). */}
