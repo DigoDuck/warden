@@ -12,6 +12,7 @@ planted file does win without it, so none of these tests can pass vacuously.
 """
 
 import asyncio
+import dataclasses
 import pathlib
 import sys
 import uuid
@@ -422,7 +423,12 @@ async def test_a_scripted_open_pr_cannot_reach_anything(
                 }
             },
             {"tool_call": {"name": "finish", "args": {"summary": "opened a PR"}}},
-            {"tool_call": {"name": "submit_verdict", "args": {"passed": True, "findings": []}}},
+            {
+                "tool_call": {
+                    "name": "submit_verdict",
+                    "args": {"passed": True, "findings": []},
+                }
+            },
         ],
     )
     assert item.fake_script is not None
@@ -442,7 +448,9 @@ async def test_a_scripted_open_pr_cannot_reach_anything(
                 )
             )
         )
-    assert [tuple(r) for r in rows] == [("github.open_pr", "deny")]  # recorded, never run
+    assert [tuple(r) for r in rows] == [
+        ("github.open_pr", "deny")
+    ]  # recorded, never run
 
     registry = build_registry(cast(Sandbox, None))
     assert not registry.has("github.open_pr")
@@ -538,3 +546,44 @@ async def _drop_database(name: str) -> None:
     async with admin.connect() as conn:
         await conn.execute(text(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)'))
     await admin.dispose()
+
+
+@sandbox_test
+@aio
+async def test_a_task_parked_for_approval_is_an_error_never_a_score(
+    ctx: runner.Context, tmp_path: pathlib.Path
+) -> None:
+    # Nobody approves anything in a capability eval. A policy that parks a call would leave the
+    # task in WAITING_APPROVAL, and scoring that (hidden test vs. a half-done workspace) would
+    # be a failure the model never earned. The parking is caused for real: a policy rule.
+    policy_file = tmp_path / "policy.yaml"
+    policy_file.write_text(
+        POLICY_FILE.read_text(encoding="utf-8")
+        + """
+  - id: listing-needs-human
+    effect: require_approval
+    reason: "test: park the task"
+    when:
+      tool: list_files
+""",
+        encoding="utf-8",
+    )
+    parking = dataclasses.replace(ctx, policy=load_policy(policy_file))
+    item = _scripted_item(
+        _items()["issue-01"],
+        tmp_path,
+        [
+            {"tool_call": {"name": "list_files", "args": {"pattern": "**/*.py"}}},
+            {"tool_call": {"name": "finish", "args": {"summary": "done"}}},
+        ],
+    )
+    assert item.fake_script is not None
+
+    result = await coding.run_item(item, parking, _factory_for(item.fake_script), BUDGET)
+
+    assert result.state == "error"
+    assert "WAITING_APPROVAL" in result.detail
+    task_id = await _latest_task_id(ctx)
+    client = docker.from_env()
+    with pytest.raises(docker.errors.NotFound):
+        client.volumes.get(workspace_volume_name(str(task_id)))
