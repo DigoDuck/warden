@@ -47,6 +47,16 @@ class VerdictOut(BaseModel):
     created_at: datetime
 
 
+class PlanOut(BaseModel):
+    """The planner's advice (ADR-031). Model output, never evidence: a client must label it as
+    generated. Absent from `TaskOut` when there was no planner or its answer was malformed."""
+
+    steps: list[str]
+    likely_files: list[str]
+    risks: list[str]
+    tests_to_add: list[str]
+
+
 class TaskOut(BaseModel):
     id: uuid.UUID
     status: str
@@ -63,6 +73,9 @@ class TaskOut(BaseModel):
     summary: str | None = None
     # None until the reviewer has answered.
     verdict: VerdictOut | None = None
+    # What the planner advised before the coder started (read from the event log; no column).
+    # None when there is no plan on record.
+    plan: PlanOut | None = None
 
 
 class TaskListItemOut(BaseModel):
