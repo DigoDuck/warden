@@ -579,7 +579,9 @@ async def test_a_task_parked_for_approval_is_an_error_never_a_score(
     )
     assert item.fake_script is not None
 
-    result = await coding.run_item(item, parking, _factory_for(item.fake_script), BUDGET)
+    result = await coding.run_item(
+        item, parking, _factory_for(item.fake_script), BUDGET
+    )
 
     assert result.state == "error"
     assert "WAITING_APPROVAL" in result.detail

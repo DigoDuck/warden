@@ -38,7 +38,7 @@ from sqlalchemy import func, select
 from warden.config import get_settings
 from warden.core import events
 from warden.core.loop import Budget
-from warden.core.worker import POLICY_FILE, WORKSPACE, Worker
+from warden.core.worker import POLICY_FILE, TERMINAL_STATUSES, WORKSPACE, Worker
 from warden.models import Evidence, ModelCall, Task, Verdict
 from warden.policy.engine import load_policy
 from warden.providers.base import ModelProvider
@@ -345,6 +345,13 @@ async def run_item(
     try:
         task_id = await run_agent(item, ctx, provider_factory, budget)
         back = await read_back(ctx, task_id)
+        if back.facts.status not in TERMINAL_STATUSES:
+            # Nobody approves anything in a capability eval. A task parked in WAITING_APPROVAL
+            # (a policy rule escalated one of the model's calls) never finished, so its
+            # workspace is half done: scoring it would be a failure the model never earned.
+            raise RuntimeError(
+                f"task ended the run in {back.facts.status}, not terminal"
+            )
         hidden = await run_hidden_test(task_id, item)
     except Exception as exc:  # noqa: BLE001 - a harness/provider failure is reported, never scored
         return ItemResult(

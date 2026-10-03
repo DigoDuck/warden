@@ -93,7 +93,10 @@ visível: o item 01 roteirizado para não mudar nada sai `wrong_file`, não `tes
 roteirizado: publicar isso seria publicar uma não-medição com cara de medição. `--write-metrics`
 recusa o provider `fake`, recusa `--only` (um subconjunto não é o dataset) e recusa uma execução
 em que algum item terminou em `error` (erro do harness ou do provider, que não é resultado do
-modelo). O provider fake existe para provar o runner: o item 09 roteirizado conserta o bug de
+modelo). Uma tarefa que termina a rodada fora de um status terminal também é `error`: num
+capability eval ninguém aprova nada, então uma chamada que a policy manda para aprovação deixa a
+tarefa em `WAITING_APPROVAL` com o workspace pela metade, e pontuar isso seria uma falha que o
+modelo não cometeu. O provider fake existe para provar o runner: o item 09 roteirizado conserta o bug de
 verdade e tem que dar `success`; o 01 aprova sem mudar nada e tem que dar escaped defect.
 
 **Custo.** Por tarefa `Budget(max_usd=1.00, max_seconds=900, max_iterations=30)`, sobrescrevível
