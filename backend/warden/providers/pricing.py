@@ -28,12 +28,18 @@ _CENTS = Decimal("0.000001")
 class ModelPrice:
     input_per_mtok: Decimal
     output_per_mtok: Decimal
+    # The posted cache-read price, when it is not CACHE_READ_MULTIPLIER x input. Claude Opus
+    # 5.5 reads cache at $0.20 per 1M, 5% of input: the flat 10% would publish double.
+    cache_read_per_mtok: Decimal | None = None
 
 
 # Only the models this project actually routes between: one frontier and two cheaper ones,
 # which is what the routing strategies in briefing section 18 need. Listing the whole
 # catalogue would be writing rows nobody reads.
 PRICES: dict[str, ModelPrice] = {
+    "claude-opus-5-5": ModelPrice(Decimal("4.00"), Decimal("20.00"), Decimal("0.20")),
+    # Kept: rows already in `model_calls` were priced with it, and a re-run of an old
+    # experiment must still cost what it cost.
     "claude-opus-5": ModelPrice(Decimal("5.00"), Decimal("25.00")),
     "claude-sonnet-5": ModelPrice(Decimal("2.00"), Decimal("10.00")),
     "claude-haiku-4-5": ModelPrice(Decimal("1.00"), Decimal("5.00")),
@@ -62,12 +68,18 @@ def cost_usd(model: str, usage: Usage) -> Decimal:
             f"Add it to warden.providers.pricing.PRICES."
         ) from None
 
+    cache_read_rate = (
+        price.cache_read_per_mtok
+        if price.cache_read_per_mtok is not None
+        else price.input_per_mtok * CACHE_READ_MULTIPLIER
+    )
     billable_input = (
         Decimal(usage.input_tokens)
         + Decimal(usage.cache_creation_input_tokens) * CACHE_WRITE_MULTIPLIER
-        + Decimal(usage.cache_read_input_tokens) * CACHE_READ_MULTIPLIER
     )
     total = (
-        billable_input * price.input_per_mtok + Decimal(usage.output_tokens) * price.output_per_mtok
+        billable_input * price.input_per_mtok
+        + Decimal(usage.cache_read_input_tokens) * cache_read_rate
+        + Decimal(usage.output_tokens) * price.output_per_mtok
     ) / _PER_MTOK
     return total.quantize(_CENTS)

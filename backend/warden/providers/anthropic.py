@@ -5,6 +5,7 @@ without a network call and without an API key.
 """
 
 from collections.abc import Sequence
+from typing import Final
 
 from anthropic import AsyncAnthropic, omit
 from anthropic.types import (
@@ -29,8 +30,12 @@ from warden.providers.base import (
 )
 
 PROVIDER_NAME = "anthropic"
-DEFAULT_MODEL = "claude-opus-5"
-DEFAULT_EFFORT = "high"
+DEFAULT_MODEL = "claude-opus-5-5"
+# Sent on every call, never left to the model's default. Claude Opus 5.5 defaults to `medium`,
+# one level below Claude Opus 5's `high`: upgrading the model name alone would quietly make the
+# coder, the planner and the reviewer shallower. `high` is the documented minimum for
+# intelligence-sensitive work; routing (week 8) is where a cheaper effort per call would live.
+DEFAULT_EFFORT: Final = "high"
 
 
 def to_anthropic_messages(messages: Sequence[Message]) -> list[MessageParam]:
@@ -161,14 +166,16 @@ class AnthropicProvider:
         # `omit`, not the legacy NOT_GIVEN: in SDK 1.x these parameters are typed against
         # `Omit`, and mypy rejects the old sentinel.
         #
-        # `thinking` is deliberately not passed: on Claude Opus 5 adaptive thinking is on by
-        # default, and disabling it makes the model occasionally write a tool call into
-        # visible text instead of a tool_use block, which an agent loop cannot see.
+        # `thinking` is deliberately not passed: adaptive thinking is on by default, and on
+        # Claude Opus 5.5 an explicit `disabled` is a 400. (On older models disabling it made
+        # the model occasionally write a tool call into visible text instead of a tool_use
+        # block, which an agent loop cannot see.)
         response = await self._client.messages.create(
             model=model or self._model,
             max_tokens=max_tokens,
             messages=to_anthropic_messages(messages),
             tools=to_anthropic_tools(tools) if tools else omit,
             system=system if system is not None else omit,
+            output_config={"effort": DEFAULT_EFFORT},
         )
         return from_anthropic_message(response)
