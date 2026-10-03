@@ -29,6 +29,7 @@ from warden.core import cancel, queue
 from warden.core.events import read_events
 from warden.core.loop import Budget, run_task
 from warden.core.loop import _finish as _loop_finish
+from warden.core.worker import POLICY_FILE as WORKER_POLICY
 from warden.core.worker import WORKSPACE as WORKER_WORKSPACE
 from warden.core.worker import Worker, run_claimed_task
 from warden.db import with_database
@@ -736,6 +737,132 @@ async def test_a_cancel_request_kills_a_long_running_tool_and_the_task_ends_canc
             running.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await running
+        for stray in client.containers.list(all=True, filters={"label": f"warden.task={task_id}"}):
+            stray.remove(force=True)
+        await asyncio.to_thread(discard_workspace_volume, str(task_id))
+
+
+async def test_a_worker_killed_inside_the_planner_call_plans_once_on_resume(
+    docker_available: None,
+    session: AsyncSession,
+    keys: KeyPair,
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: pathlib.Path,
+) -> None:
+    """ADR-031: `kill` on a real worker while it waits on the planner. `task.created` is on
+    record and `plan.recorded` is not; the lost call left nothing to reuse. The next worker
+    plans (once), and the task ends with exactly one `plan.recorded`, one planner call on the
+    books and the plan in the coder's conversation.
+
+    The plan's scripted answer takes 60 s so the kill lands inside the call instead of racing
+    a call that would otherwise finish in a millisecond."""
+    import docker as docker_sdk
+
+    user = User(email=f"{uuid.uuid4()}@warden.test", password_hash="x", role="worker")
+    session.add(user)
+    await session.flush()
+    task = await queue.enqueue(
+        session, user_id=user.id, spec="plan probe", idempotency_key=str(uuid.uuid4())
+    )
+    await session.commit()
+    task_id = task.id
+
+    plan_step = """
+  - tool_call:
+      name: submit_plan
+      args:
+        steps: ["list the files", "finish"]
+        likely_files: []
+        risks: []
+        tests_to_add: []
+"""
+    tail = """
+  - tool_call:
+      name: finish
+      args: { summary: "planned, then done" }
+  - tool_call:
+      name: submit_verdict
+      args: { passed: true, findings: [] }
+"""
+    slow_script = _write_yaml(
+        tmp_path / "slow-plan.yaml", "script:" + plan_step + "    delay_seconds: 60\n" + tail
+    )
+    fast_script = _write_yaml(tmp_path / "fast-plan.yaml", "script:" + plan_step + tail)
+
+    key_path = tmp_path / "jwt-private.pem"
+    key_path.write_bytes(
+        keys.private_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+    )
+    env = {
+        **os.environ,
+        "DATABASE_URL": with_database(get_settings().database_url, TEST_DB),
+        "JWT_PRIVATE_KEY_PATH": str(key_path),
+    }
+
+    client = docker_sdk.from_env()
+    proc: subprocess.Popen[bytes] | None = None
+    try:
+        proc = subprocess.Popen(  # noqa: ASYNC220 - same reasoning as above
+            [sys.executable, "-m", "warden.core.worker", "--script", str(slow_script)],
+            cwd=str(BACKEND_DIR),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+
+        loop_time = asyncio.get_event_loop().time
+        deadline = loop_time() + 180
+        while loop_time() < deadline:
+            assert proc.poll() is None, "the worker exited before reaching the planner"
+            if any(e.type == "task.created" for e in await read_events(session, task_id)):
+                break
+            await asyncio.sleep(0.2)
+        else:
+            raise AssertionError("the worker never recorded task.created")
+
+        # A moment for the worker to pass checkpoint (a) and enter the (60 s) planner call.
+        await asyncio.sleep(2)
+        proc.kill()  # TerminateProcess on Windows, SIGKILL on Linux: no cleanup runs.
+        proc.wait(timeout=15)
+        proc = None
+
+        assert [e.type for e in await read_events(session, task_id)] == ["task.created"]
+        assert (
+            await session.scalar(
+                select(func.count()).select_from(ModelCall).where(ModelCall.task_id == task_id)
+            )
+        ) == 0
+
+        await queue.expire_lease_now(session, task_id)
+        await session.commit()
+
+        worker2 = Worker(
+            session_factory,
+            lambda: FakeProvider.from_yaml(fast_script, resume_aware=True),
+            load_policy(WORKER_POLICY),
+            WORKER_WORKSPACE,
+            keys,
+        )
+        result = await worker2.run_once()
+
+        assert result is not None
+        assert result.status == "SUCCEEDED", result.reason
+        kinds = [e.type for e in await read_events(session, task_id)]
+        assert kinds.count("plan.recorded") == 1
+        assert kinds.index("plan.recorded") < kinds.index("iteration.started")
+        purposes = await session.scalars(
+            select(ModelCall.purpose).where(ModelCall.task_id == task_id)
+        )
+        assert sorted(purposes) == ["agent", "planner", "reviewer"]
+        assert client.containers.list(all=True, filters={"label": f"warden.task={task_id}"}) == []
+    finally:
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=15)
         for stray in client.containers.list(all=True, filters={"label": f"warden.task={task_id}"}):
             stray.remove(force=True)
         await asyncio.to_thread(discard_workspace_volume, str(task_id))
