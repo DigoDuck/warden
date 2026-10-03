@@ -1,0 +1,18 @@
+# Nothing secret or heavy ever enters a build context (and so never an image layer).
+.env
+.env.*
+!.env.example
+.keys
+**/*.pem
+.git
+.worktrees
+.claude
+**/node_modules
+**/.venv
+**/__pycache__
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+frontend/dist
+frontend/src/api/schema.d.ts
+docs

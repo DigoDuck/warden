@@ -18,7 +18,28 @@ Em construção. Fonte de verdade do escopo:
   capability evals quando a chave da Anthropic chegar).
 - [`docs/adr/`](docs/adr/) — decisões não óbvias, uma por arquivo.
 
-## Quickstart
+## Quickstart (Docker, sem chave de API)
+
+Só precisa de Docker (Compose v2). Sem `uv`, sem Node, sem chave: o worker usa o
+`FakeProvider` (briefing §19), um roteiro fixo de tool calls no lugar do modelo.
+
+```bash
+docker compose up -d --build   # db, migrações, chave JWT, api, worker e UI
+docker compose exec api python -m warden.api.user_token   --email voce@exemplo.com --scopes tasks:write tasks:read audit:read --role worker
+```
+
+1. Abra <http://localhost:5180>, vá em **Configurações** e cole o token impresso acima.
+2. Em **Nova tarefa**, envie qualquer texto. O detalhe mostra os eventos chegando ao vivo e a
+   tarefa termina **Concluída** (a verificação roda lint, tipos e testes no sandbox, leva ~1 min).
+3. `docker compose down -v` apaga tudo, inclusive o banco e a chave.
+
+Portas no host (todas configuráveis, ver `.env.example`): UI `WARDEN_WEB_PORT` (5180), API
+`WARDEN_API_PORT` (8010), Postgres `WARDEN_DB_PORT` (5434). A chave JWT é gerada num volume
+próprio na primeira subida e nunca sobrescrita; isso é conveniência de **dev**, em produção ela
+vem de um segredo. O worker monta `/var/run/docker.sock` para criar os sandboxes (risco aceito
+na [ADR-012](docs/adr/ADR-012-worker-docker-socket.md)).
+
+## Quickstart (desenvolvimento local, com `uv`)
 
 Nenhum passo abaixo pede chave de API: o primeiro contato com o projeto usa só o
 `FakeProvider` (briefing §19), um roteiro fixo de tool calls que substitui o modelo. O control
