@@ -296,8 +296,10 @@ async def test_a_live_worker_that_loses_its_lease_stops_without_touching_what_is
         assert current.claimed_by == "worker-b"
         assert current.status == "RUNNING"
         # Everything A did after waking up, the model call it paid for included, stayed out
-        # of the log: its first checkpoint after the lease was gone refused to commit.
-        assert kinds == ["task.created", "iteration.started"]
+        # of the log: its first checkpoint after the lease was gone refused to commit. A's
+        # first model call is the planner's (ADR-031), so the `plan.recorded` it was about to
+        # write is part of what never landed, and it never reached its first iteration either.
+        assert kinds == ["task.created"]
     finally:
         release.set()
         if not running.done():
@@ -593,9 +595,10 @@ script:
         model_call_count = await session.scalar(
             select(func.count()).select_from(ModelCall).where(ModelCall.task_id == task_id)
         )
-        # One for the interrupted iteration (replayed from the log, not bought again), one for
-        # the iteration that produced `finish`, and one for the independent reviewer (ADR-010).
-        assert model_call_count == 3
+        # The planner's (ADR-031, recorded before the crash), one for the interrupted iteration
+        # (replayed from the log, not bought again), one for the iteration that produced
+        # `finish`, and one for the independent reviewer (ADR-010).
+        assert model_call_count == 4
 
         read_file_calls = await session.scalar(
             select(func.count())
@@ -730,8 +733,9 @@ async def test_a_cancel_request_kills_a_long_running_tool_and_the_task_ends_canc
         model_calls = await session.scalar(
             select(func.count()).select_from(ModelCall).where(ModelCall.task_id == task_id)
         )
-        # Exactly the one turn that asked for `run_command`; the cancel pre-empted the next.
-        assert model_calls == 1
+        # The planner's call (ADR-031) and the one turn that asked for `run_command`; the
+        # cancel pre-empted the next.
+        assert model_calls == 2
     finally:
         if not running.done():
             running.cancel()
