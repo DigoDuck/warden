@@ -1,3 +1,18 @@
+# `docker compose up` from a clean clone: db, migrations, signing key, api, worker and UI,
+# with FakeProvider (no API key). Host ports are variables because the usual ones are taken
+# on a dev box (see .env.example).
+
+x-backend: &backend
+  build:
+    context: .
+    dockerfile: backend/Dockerfile
+  image: warden-backend:dev
+  environment: &backend-env
+    # Container-to-container: the service name and Postgres's own port. Environment variables
+    # beat the .env file in pydantic-settings, so a localhost URL there cannot leak in.
+    DATABASE_URL: postgresql+asyncpg://warden:warden@db:5432/warden
+    JWT_PRIVATE_KEY_PATH: /keys/jwt-private.pem
+
 services:
   db:
     image: postgres:16-alpine
@@ -22,5 +37,62 @@ services:
       timeout: 3s
       retries: 10
 
+  # Builds the image the worker's sandboxes start from (the sandbox has no network, so it can
+  # never be pulled at run time) and exits. The entrypoint override makes `run` a no-op.
+  sandbox-image:
+    build: sandbox-images/python
+    image: warden-sandbox:dev
+    entrypoint: ["true"]
+
+  migrate:
+    <<: *backend
+    command: alembic upgrade head
+    depends_on:
+      db: { condition: service_healthy }
+
+  # DEV ONLY: generates the JWT signing key into a named volume shared by api and worker, so
+  # `docker compose up` works with zero setup. It never overwrites an existing key (the
+  # generator refuses; the `|| test -f` turns that refusal into success only if the file is
+  # really there). In production the key comes from a secret, not from this service.
+  keys:
+    <<: *backend
+    command: sh -c "python -m warden.identity.generate_keys || test -f /keys/jwt-private.pem"
+    volumes:
+      - warden-keys:/keys
+
+  api:
+    <<: *backend
+    command: uvicorn warden.api.main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "${WARDEN_API_PORT:-8010}:8000"
+    volumes:
+      - warden-keys:/keys:ro
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      keys: { condition: service_completed_successfully }
+
+  # Holds /var/run/docker.sock (ADR-012): it creates the per-task sandbox containers on the
+  # host's daemon. Root access to the host by design; the agent never sees the socket.
+  worker:
+    <<: *backend
+    command: python -m warden.core.worker
+    volumes:
+      - warden-keys:/keys:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      keys: { condition: service_completed_successfully }
+      sandbox-image: { condition: service_completed_successfully }
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    ports:
+      - "${WARDEN_WEB_PORT:-5180}:80"
+    depends_on:
+      - api
+
 volumes:
   warden-db:
+  warden-keys:

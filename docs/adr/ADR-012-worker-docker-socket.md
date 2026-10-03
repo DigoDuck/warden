@@ -60,3 +60,16 @@ de usuário. O worker não escuta em porta nenhuma.
 - Vale para o README e para entrevista: **não existe sandbox sem alguém privilegiado para
   construí-lo**. A pergunta certa não é "como evitar isso", é "quem é esse alguém, o que
   exatamente ele consegue fazer, e o que separa ele do código que não é confiável".
+
+## Adendo (2026-10-03): o Compose agora separa os serviços
+
+A frase "No Compose já são serviços separados" passou a ser verdade com `feat/compose-stack`:
+`docker-compose.yml` sobe `db`, `api`, `worker` e `frontend` como serviços distintos, e só o
+`worker` monta `/var/run/docker.sock`. A `api` publica porta e não tem o socket; o `worker` não
+publica porta nenhuma. A decisão não muda.
+
+Dois detalhes do desenho em container: o sandbox é semeado por `put_archive` a partir do
+sistema de arquivos do próprio worker (não por bind mount do host), por isso a imagem do backend
+carrega `examples/` e `policies/` nos caminhos que `worker.py` resolve; e o container do worker
+cria os sandboxes no daemon do **host**, então eles são containers irmãos, não filhos.
+

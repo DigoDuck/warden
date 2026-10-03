@@ -1,0 +1,16 @@
+:80 {
+	# Strips the /api prefix, like vite.config.ts's rewrite. flush_interval -1 sends every
+	# chunk immediately: without it the proxy buffers the SSE stream (/tasks/{id}/stream)
+	# and events would arrive in bursts instead of live.
+	handle_path /api/* {
+		reverse_proxy api:8000 {
+			flush_interval -1
+		}
+	}
+
+	handle {
+		root * /srv
+		try_files {path} /index.html
+		file_server
+	}
+}
