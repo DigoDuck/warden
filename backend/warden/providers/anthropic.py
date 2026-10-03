@@ -30,6 +30,7 @@ from warden.providers.base import (
 
 PROVIDER_NAME = "anthropic"
 DEFAULT_MODEL = "claude-opus-5"
+DEFAULT_EFFORT = "high"
 
 
 def to_anthropic_messages(messages: Sequence[Message]) -> list[MessageParam]:
