@@ -7,8 +7,14 @@ without a network call and without an API key.
 from collections.abc import Sequence
 
 from anthropic import AsyncAnthropic, omit
+from anthropic.types import (
+    ContentBlockParam,
+    MessageParam,
+    TextBlockParam,
+    ToolParam,
+    ToolResultBlockParam,
+)
 from anthropic.types import Message as AnthropicMessage
-from anthropic.types import MessageParam, ToolParam, ToolResultBlockParam
 
 from warden.providers.base import (
     AssistantMessage,
@@ -27,26 +33,48 @@ DEFAULT_MODEL = "claude-opus-5"
 
 
 def to_anthropic_messages(messages: Sequence[Message]) -> list[MessageParam]:
-    """Render the three domain message shapes into the wire format."""
+    """Render the three domain message shapes into the wire format.
+
+    Two domain messages in a row can both be the user's (the spec followed by the planner's
+    plan, ADR-031), and the Messages API rejects consecutive same-role messages with a 400
+    ("roles must alternate"). Rather than make every caller avoid that shape, this boundary
+    folds a user turn into the previous user message as extra content blocks, in order. Order
+    keeps any `tool_result` blocks first, which is where the API requires them.
+    """
     rendered: list[MessageParam] = []
+
+    def add_user(blocks: list[ContentBlockParam]) -> None:
+        if rendered and rendered[-1]["role"] == "user":
+            previous = rendered[-1]["content"]
+            if isinstance(previous, str):
+                previous = [TextBlockParam(type="text", text=previous)]
+            rendered[-1] = MessageParam(role="user", content=[*previous, *blocks])
+        else:
+            rendered.append(MessageParam(role="user", content=blocks))
+
     for message in messages:
         match message:
             case UserMessage():
-                rendered.append(MessageParam(role="user", content=message.text))
+                if rendered and rendered[-1]["role"] == "user":
+                    add_user([TextBlockParam(type="text", text=message.text)])
+                else:
+                    # The common single-message case stays a plain string, as before.
+                    rendered.append(MessageParam(role="user", content=message.text))
             case AssistantMessage():
                 # Echoed exactly as the provider returned it. See ADR-016.
                 rendered.append(MessageParam(role="assistant", content=message.raw_content))
             case ToolResultsMessage():
-                blocks: list[ToolResultBlockParam] = [
-                    ToolResultBlockParam(
-                        type="tool_result",
-                        tool_use_id=result.tool_call_id,
-                        content=result.content,
-                        is_error=result.is_error,
-                    )
-                    for result in message.results
-                ]
-                rendered.append(MessageParam(role="user", content=blocks))
+                add_user(
+                    [
+                        ToolResultBlockParam(
+                            type="tool_result",
+                            tool_use_id=result.tool_call_id,
+                            content=result.content,
+                            is_error=result.is_error,
+                        )
+                        for result in message.results
+                    ]
+                )
     return rendered
 
 
