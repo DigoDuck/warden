@@ -93,6 +93,9 @@ class ResumeState:
     # Set once the agent has finished and verification began. `core/loop.py` then skips the
     # agent loop entirely: the conversation is over, only the control plane's checks remain.
     verification: VerificationState | None = None
+    # True once `plan.recorded` is in the log (ADR-031): the planner's call is paid for and must
+    # not be made again. False on a run whose worker died before recording it.
+    plan_recorded: bool = False
 
     @property
     def is_mid_iteration(self) -> bool:

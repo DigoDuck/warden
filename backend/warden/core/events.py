@@ -55,6 +55,10 @@ VERIFY_VERDICT = "verify.verdict"
 # calls from that one. `publish.skipped` records why a verified change was not published.
 PUBLISH_REQUESTED = "publish.requested"
 PUBLISH_SKIPPED = "publish.skipped"
+# ADR-031: the planner's advice, recorded before the coder's first iteration. Carries either the
+# validated `plan` or a `malformed_reason`, plus the call's `cost_usd`, which replay adds back
+# to the task's spend. Committed together with the planner's `model_calls` row.
+PLAN_RECORDED = "plan.recorded"
 
 _SENSITIVE_KEY_PARTS = ("token", "key", "secret", "password", "credential", "authorization")
 _MAX_ARG_CHARS = 2_000

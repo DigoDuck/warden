@@ -27,6 +27,7 @@ from warden.core import approvals, cancel, events, queue
 from warden.core.replay import ApprovalOutcome, ResumeState
 from warden.identity.jwt import KeyPair
 from warden.models import Evidence, Task, User, Verdict
+from warden.plan.planner import Planner
 from warden.policy.engine import Decision, Effect, Policy, PolicyContext, UserRef, combine
 from warden.providers.base import (
     AssistantMessage,
@@ -245,6 +246,7 @@ async def run_task(
     verifier: EvidenceCollector | None = None,
     reviewer: Reviewer | None = None,
     publisher: ToolRegistry | None = None,
+    planner: Planner | None = None,
 ) -> RunResult:
     """Run (or resume) a task until it ends.
 
@@ -1178,6 +1180,7 @@ def _publish_report(
     verdict: Verdict,
     summary: str | None,
     spent: Decimal,
+    plan: Mapping[str, Any] | None = None,
 ) -> str:
     """The body a human reads in the pull request: what the control plane measured, what the
     independent reviewer said, what it cost, and, last and labelled, what the agent claims.
