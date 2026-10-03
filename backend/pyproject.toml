@@ -28,6 +28,7 @@ dev = [
     "ruff>=0.8.0",
     "mypy>=1.14.0",
     "types-pyyaml>=6.0.12.20260906",
+    "pytest-cov>=7.1.0",
 ]
 
 [build-system]
@@ -81,3 +82,19 @@ asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "session"
 asyncio_default_test_loop_scope = "session"
 testpaths = ["tests"]
+
+# Coverage is measured for the whole `warden` package; the 80% gate is applied per package
+# (policy/ and core/) in CI with `coverage report --include=...` (briefing, section 42).
+[tool.coverage.run]
+source = ["warden"]
+# `parallel` writes one .coverage.<host>.<pid>.<rand> file per process and `coverage combine`
+# merges them; `patch = ["subprocess"]` makes every child Python process (the durability tests
+# spawn `python -m warden.core.worker`) start coverage by itself, no sitecustomize needed.
+# Honest limit: a child data file is written at normal interpreter exit. The tests that
+# kill a worker (Popen.kill = TerminateProcess/SIGKILL) skip that exit, so the lines that
+# worker ran are lost; only workers that exit cleanly count.
+parallel = true
+patch = ["subprocess"]
+# asyncio + SQLAlchemy async hop through greenlets; without these, lines after an `await`
+# inside a greenlet-driven call are reported as not executed.
+concurrency = ["greenlet", "thread"]
