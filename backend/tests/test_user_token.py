@@ -77,7 +77,9 @@ async def test_an_existing_users_role_is_never_rewritten(
 
 def test_only_known_roles_are_accepted() -> None:
     with pytest.raises(SystemExit):
-        user_token.parse_args(["--email", "x@warden.test", "--scopes", "tasks:read", "--role", "admin"])
+        user_token.parse_args(
+            ["--email", "x@warden.test", "--scopes", "tasks:read", "--role", "admin"]
+        )
     args = user_token.parse_args(
         ["--email", "x@warden.test", "--scopes", "tasks:read", "--role", "worker"]
     )
