@@ -51,7 +51,7 @@ function PlanSection({ plan }: { plan: TaskOut["plan"] }) {
         <ProvenanceBadge kind="gerado" />
       </div>
       <PlanList title="Passos" items={plan.steps} />
-      <PlanList title="Arquivos prováveis" items={plan.likely_files} />
+      <PlanList title="Arquivos provÃ¡veis" items={plan.likely_files} />
       <PlanList title="Riscos" items={plan.risks} />
       <PlanList title="Testes a criar" items={plan.tests_to_add} />
     </section>
@@ -63,12 +63,12 @@ function SpecPanel({ task }: { task: TaskOut }) {
     <div className="flex flex-col gap-6">
       <dl className="flex flex-col gap-2">
         <div>
-          <dt className="text-fg-muted">Especificação</dt>
+          <dt className="text-fg-muted">EspecificaÃ§Ã£o</dt>
           <dd className="whitespace-pre-wrap">{task.spec}</dd>
         </div>
         <div>
-          <dt className="text-fg-muted">Repositório alvo</dt>
-          <dd className="font-mono text-xs">{task.target_repo ?? "—"}</dd>
+          <dt className="text-fg-muted">RepositÃ³rio alvo</dt>
+          <dd className="font-mono text-xs">{task.target_repo ?? "â€”"}</dd>
         </div>
       </dl>
       <PlanSection plan={task.plan} />
