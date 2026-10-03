@@ -841,3 +841,50 @@ async def test_task_out_carries_the_coders_summary_and_the_independent_verdict(
     assert verdict["created_at"]
     # The reviewer's call is counted in the displayed cost (it is just not budgeted).
     assert Decimal(str(body["cost_usd"])) > 0
+
+
+async def test_task_out_carries_the_plan_the_planner_recorded(
+    client: AsyncClient, session_factory: async_sessionmaker[AsyncSession], keys: KeyPair
+) -> None:
+    """Read from `plan.recorded` in the event log (ADR-031), like the summary: no new column."""
+    token = await _user_token(
+        session_factory, keys, await _user(session_factory), ["tasks:write", "tasks:read"]
+    )
+    task_id = uuid.UUID(await _submit(client, token))
+    plan = {
+        "steps": ["read src/app.py", "fix average()"],
+        "likely_files": ["src/app.py"],
+        "risks": ["empty list"],
+        "tests_to_add": ["average([]) raises"],
+    }
+    async with session_factory() as session:
+        await events.append_event(
+            session, task_id, events.PLAN_RECORDED, {"plan": plan, "cost_usd": "0.000000"}
+        )
+        await session.commit()
+
+    body = (await client.get(f"/tasks/{task_id}", headers=_auth(token))).json()
+
+    assert body["plan"] == plan
+
+
+async def test_task_out_has_no_plan_when_there_is_none_or_it_was_malformed(
+    client: AsyncClient, session_factory: async_sessionmaker[AsyncSession], keys: KeyPair
+) -> None:
+    token = await _user_token(
+        session_factory, keys, await _user(session_factory), ["tasks:write", "tasks:read"]
+    )
+    without = await _submit(client, token)
+    malformed = uuid.UUID(await _submit(client, token))
+    async with session_factory() as session:
+        await events.append_event(
+            session,
+            malformed,
+            events.PLAN_RECORDED,
+            {"malformed_reason": "submit_plan arguments are malformed", "cost_usd": "0"},
+        )
+        await session.commit()
+
+    for task_id in (without, str(malformed)):
+        body = (await client.get(f"/tasks/{task_id}", headers=_auth(token))).json()
+        assert body["plan"] is None
