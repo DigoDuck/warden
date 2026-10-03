@@ -20,6 +20,7 @@ from typing import Any
 
 from warden.core import events as ev
 from warden.models import TaskEvent
+from warden.plan.planner import plan_message
 from warden.providers.base import (
     AssistantMessage,
     Message,
@@ -154,6 +155,16 @@ def rebuild(task_events: Sequence[TaskEvent]) -> ResumeState:
 
         if event.type == ev.TASK_CREATED:
             state.messages.append(UserMessage(text=str(payload.get("spec", ""))))
+
+        elif event.type == ev.PLAN_RECORDED:
+            # The planner's advice (ADR-031) sits between `task.created` and the first
+            # iteration, so appending here puts it right after the spec, where the live run
+            # put it. A malformed plan carries no `plan`: it adds no message but is still
+            # recorded, because its call was paid for and must not be made again.
+            state.plan_recorded = True
+            state.spent += Decimal(str(payload.get("cost_usd", "0")))
+            if payload.get("plan"):
+                state.messages.append(UserMessage(text=plan_message(payload["plan"])))
 
         elif event.type == ev.ITERATION_STARTED:
             # A new iteration means the previous one's results are settled.
