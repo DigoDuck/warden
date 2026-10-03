@@ -59,6 +59,10 @@ class VerificationState:
     # True once the reviewer's verdict is committed (ADR-010): the review call is paid for and
     # must not be made again.
     verdict_recorded: bool = False
+    # ADR-028: the pull request the control plane proposed after the verdict, and what became
+    # of it. Both None until `publish.requested` / its `tool.executed` are on record.
+    publish_call: ToolCall | None = None
+    publish_result: dict[str, Any] | None = None
 
 
 @dataclass
@@ -137,6 +141,10 @@ def rebuild(task_events: Sequence[TaskEvent]) -> ResumeState:
     verify_started: dict[str, Any] | None = None
     verify_recorded: set[str] = set()
     verdict_recorded = False
+    # The control plane's own publication (ADR-028). Kept apart from `requested` on purpose:
+    # that list is the agent's iteration, and a publish call in it would resume as a model
+    # tool call the agent never made and has no tool for.
+    publish_requested: dict[str, Any] | None = None
 
     for event in sorted(task_events, key=lambda e: e.seq):
         payload: dict[str, Any] = dict(event.payload or {})
@@ -165,7 +173,13 @@ def rebuild(task_events: Sequence[TaskEvent]) -> ResumeState:
             if all(item["id"] != payload["id"] for item in requested):
                 requested.append(payload)
 
+        elif event.type == ev.PUBLISH_REQUESTED:
+            publish_requested = payload
+
         elif event.type == ev.TOOL_EXECUTED:
+            # The publish call's own outcome lands here too, under its own id. Harmless for the
+            # agent's pending list (that one is built from `requested`, which never holds it),
+            # and read back below as `publish_result`.
             executed[str(payload["id"])] = payload
 
         elif event.type == ev.TASK_FINISHED:
@@ -210,6 +224,16 @@ def rebuild(task_events: Sequence[TaskEvent]) -> ResumeState:
             iterations=int(verify_started.get("iterations", iteration)),
             recorded=frozenset(verify_recorded),
             verdict_recorded=verdict_recorded,
+            publish_call=ToolCall(
+                id=str(publish_requested["id"]),
+                name=str(publish_requested["tool"]),
+                arguments=dict(publish_requested.get("arguments") or {}),
+            )
+            if publish_requested is not None
+            else None,
+            publish_result=executed.get(str(publish_requested["id"]))
+            if publish_requested is not None
+            else None,
         )
 
     # Whatever is left belongs to the iteration that was cut short.

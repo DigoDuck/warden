@@ -43,7 +43,7 @@ from warden.sandbox.docker import (
     list_task_ids_with_workspace_volumes,
 )
 from warden.tools.registry import ToolRegistry
-from warden.tools.sandboxed import build_registry
+from warden.tools.sandboxed import build_publish_registry, build_registry
 from warden.verify.reviewer import ProviderReviewer, Reviewer
 from warden.verify.runner import EvidenceCollector, Verifier
 
@@ -221,6 +221,7 @@ async def run_claimed_task(
     holder: str | None = None,
     verifier: EvidenceCollector | None = None,
     reviewer: Reviewer | None = None,
+    publisher: ToolRegistry | None = None,
 ) -> RunResult:
     """Run a task from wherever it left off.
 
@@ -248,6 +249,7 @@ async def run_claimed_task(
         holder=holder,
         verifier=verifier,
         reviewer=reviewer,
+        publisher=publisher,
     )
 
 
@@ -404,6 +406,8 @@ class Worker:
                             sandbox, self._workspace, exclude=never_readable(self._policy)
                         ),
                         reviewer=ProviderReviewer(provider),
+                        # None when GitHub is not configured: no publication phase then.
+                        publisher=build_publish_registry(sandbox),
                     )
                 except queue.LeaseLost:
                     # Another worker already reclaimed this task. Every checkpoint fences

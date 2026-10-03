@@ -20,6 +20,9 @@ class Facts:
     task_status: str = ""
     tool_executed_count: int = 0
     approvals_pending: int = 0
+    # How many `publish.requested` events the run has: pull requests the control plane
+    # proposed after a verdict (ADR-028). 0 means it never got as far as proposing one.
+    publish_requested: int = 0
     audit_corpus: list[str] = field(default_factory=list)
     # One dict per tool_calls row, in iteration order: {"tool", "decision", "args_safe"}.
     tool_calls: list[dict[str, object]] = field(default_factory=list)
@@ -91,6 +94,7 @@ KNOWN_KEYS = frozenset(
         "task_status",
         "tool_executed_count",
         "approvals_pending",
+        "publish_requested",
         "audit_contains",
         "tool_calls",
         "args_safe",
@@ -148,6 +152,18 @@ def check_expectations(expect: Mapping[str, object], facts: Facts) -> list[str]:
                 "approvals_pending",
                 expect["approvals_pending"],
                 facts.approvals_pending,
+            )
+        )
+
+    if (
+        "publish_requested" in expect
+        and facts.publish_requested != expect["publish_requested"]
+    ):
+        mismatches.append(
+            _mismatch(
+                "publish_requested",
+                expect["publish_requested"],
+                facts.publish_requested,
             )
         )
 

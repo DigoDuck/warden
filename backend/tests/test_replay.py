@@ -315,3 +315,74 @@ def test_a_run_interrupted_mid_verification_reports_what_is_left() -> None:
     assert state.finished is False
     # Nothing pending from the agent's side: resuming must not look like a mid-iteration.
     assert not state.is_mid_iteration
+
+
+# --- the publication phase (ADR-028) ---------------------------------------------------------
+
+PUBLISH_ID = f"publish-{TASK_ID}"
+
+
+def _verified_agent_run() -> list[tuple[str, dict[str, Any]]]:
+    """An agent that read one file, finished, and was verified: the log a publication follows."""
+    return [
+        (ev.TASK_CREATED, {"spec": "fix it"}),
+        (ev.ITERATION_STARTED, {"n": 1}),
+        _model_called([{"type": "tool_use", "id": "t1"}]),
+        _requested("t1", "read_file", path="src/app.py"),
+        _executed("t1", "print('hello')"),
+        (ev.ITERATION_STARTED, {"n": 2}),
+        _model_called([{"type": "tool_use", "id": "f1"}]),
+        (ev.VERIFY_STARTED, {"summary": "done", "iterations": 2}),
+        (ev.VERIFY_RECORDED, {"kind": "diff", "status": "ok"}),
+        (ev.VERIFY_VERDICT, {"passed": True, "malformed": False, "cost_usd": "0"}),
+    ]
+
+
+def _publish_requested() -> tuple[str, dict[str, Any]]:
+    return (
+        ev.PUBLISH_REQUESTED,
+        {"id": PUBLISH_ID, "tool": "github.open_pr", "arguments": {"title": "Fix it"}},
+    )
+
+
+def test_a_publish_request_is_replayed_as_the_verification_state_not_as_an_agent_call() -> None:
+    """`tool.requested` minus `tool.executed` is how the agent's pending calls are derived, and
+    the replay only resets that list on `iteration.started`. A publish call leaking into it
+    would resume as a model call to a tool the agent does not have."""
+    state = rebuild(_events(*_verified_agent_run(), _publish_requested()))
+
+    assert state.verification is not None
+    call = state.verification.publish_call
+    assert call is not None
+    assert (call.id, call.name, call.arguments) == (
+        PUBLISH_ID,
+        "github.open_pr",
+        {"title": "Fix it"},
+    )
+    assert state.verification.publish_result is None
+    assert state.pending_tool_calls == []
+    assert not state.is_mid_iteration
+
+
+def test_the_publish_outcome_and_the_approval_are_replayed() -> None:
+    state = rebuild(
+        _events(
+            *_verified_agent_run(),
+            _publish_requested(),
+            (
+                ev.APPROVAL_REQUESTED,
+                {"approval_id": "a1", "tool": "github.open_pr", "id": PUBLISH_ID},
+            ),
+            (ev.APPROVAL_GRANTED, {"approval_id": "a1", "id": PUBLISH_ID}),
+            (
+                ev.TOOL_EXECUTED,
+                {"id": PUBLISH_ID, "ok": True, "effect": "allow", "output": "opened PR #1: u"},
+            ),
+        )
+    )
+
+    assert state.verification is not None
+    assert state.verification.publish_result is not None
+    assert state.verification.publish_result["output"] == "opened PR #1: u"
+    assert state.approval_decisions[PUBLISH_ID].status == "approved"
+    assert state.pending_tool_calls == []

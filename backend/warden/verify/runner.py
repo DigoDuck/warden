@@ -19,6 +19,7 @@ Two decisions carry the design:
 """
 
 import difflib
+import hashlib
 import io
 import pathlib
 import tarfile
@@ -89,6 +90,7 @@ class FileChange(BaseModel):
     additions: int
     deletions: int
     binary: bool
+    sha256: str | None = None
 
 
 class DiffEvidence(BaseModel):
@@ -209,9 +211,15 @@ def compute_diff(before: dict[str, bytes], after: dict[str, bytes]) -> DiffEvide
         )
         old_text = _as_text(old) if old is not None else ""
         new_text = _as_text(new) if new is not None else ""
+        # Digest of what the file is NOW (None for a removed one). It is what the publication
+        # phase compares against a second export, to prove nothing rewrote the workspace
+        # between this diff and the pull request (ADR-028).
+        digest = hashlib.sha256(new).hexdigest() if new is not None else None
         if old_text is None or new_text is None:
             changes.append(
-                FileChange(path=path, change=change, additions=0, deletions=0, binary=True)
+                FileChange(
+                    path=path, change=change, additions=0, deletions=0, binary=True, sha256=digest
+                )
             )
             patch_parts.append(f"Binary files a/{path} and b/{path} differ\n")
             continue
@@ -231,6 +239,7 @@ def compute_diff(before: dict[str, bytes], after: dict[str, bytes]) -> DiffEvide
                 additions=sum(1 for line in body if line.startswith("+")),
                 deletions=sum(1 for line in body if line.startswith("-")),
                 binary=False,
+                sha256=digest,
             )
         )
         patch_parts.append("".join(lines))

@@ -120,3 +120,9 @@ SUCCEEDED se o verdict do reviewer independente for bem formado e aprovar **e** 
 verdict" acima descreve o estado deste PR e foi superado.
 A correção da ordem com `open_pr` ("será corrigido no PR do verdict") ficou para um PR
 seguinte; ver "Consequências" da ADR-010.
+
+## Adendo (ADR-028)
+
+A "ordem com `open_pr`" descrita em "Consequências" foi corrigida pela ADR-028: o PR só é
+proposto depois do verdict, pelo control plane. A evidência `diff` ganhou `sha256` por arquivo
+para que a publicação prove que o workspace não mudou desde a verificação.
