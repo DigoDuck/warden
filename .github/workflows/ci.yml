@@ -97,13 +97,16 @@ jobs:
       - run: uv sync --directory backend --locked
 
       # evals/ is outside backend/, so the `backend` job's ruff and mypy never see it.
-      - run: uv run --project backend ruff check evals/__init__.py evals/checks.py evals/runner.py evals/tests
-      - run: uv run --project backend ruff format --check evals/__init__.py evals/checks.py evals/runner.py evals/tests
-      - run: uv run --project backend mypy --config-file backend/pyproject.toml evals/__init__.py evals/checks.py evals/runner.py evals/tests
+      - run: uv run --project backend ruff check evals/__init__.py evals/checks.py evals/runner.py evals/coding.py evals/coding_checks.py evals/tests
+      - run: uv run --project backend ruff format --check evals/__init__.py evals/checks.py evals/runner.py evals/coding.py evals/coding_checks.py evals/tests
+      - run: uv run --project backend mypy --config-file backend/pyproject.toml evals/__init__.py evals/checks.py evals/runner.py evals/coding.py evals/coding_checks.py evals/tests
 
       # `evals-behavioral`'s own Makefile dependency builds the sandbox image (the same one
       # the `backend` job builds, same reason: no network inside it, so it has to exist
-      # before any case that runs a real container).
+      # before any case that runs a real container). Its `pytest evals/tests` step also runs
+      # evals/tests/test_coding_runner.py: the coding-eval runner against FakeProvider scripts,
+      # which needs this job's Postgres and Docker but no API key. The real `make evals-coding`
+      # (anthropic provider) is never run in CI.
       - run: make evals-behavioral
 
   frontend:

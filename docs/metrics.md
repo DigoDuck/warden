@@ -37,14 +37,26 @@ Gerado por `make evals-behavioral` (`evals/runner.py --write-metrics`).
 
 ## Capability evals — `coding_v1` (semana 6/7)
 
-**Placeholder.** Precisa de modelo real (`ANTHROPIC_API_KEY`), que ainda não chegou ao
-ambiente (ver `docs/journal.md`). Nada nesta seção foi medido; não publicar número aqui até o
-runner de capability evals (onda 7) rodar de verdade contra `examples/target-repo`.
+Medido por `make evals-coding` (`evals/coding.py`): cada um dos 10 itens vira uma tarefa real
+pelo caminho de produção (worker, sandbox, policy, verificação, veredito) contra
+`examples/target-repo`, e um teste de aceitação **oculto** decide o resultado
+(`evals/datasets/target_repo/`). Ver ADR-029.
 
-Quando existir, esta seção publica por tarefa: `success_rate`, `failure_category`
-(`wrong_file`, `tests_fail`, `policy_violation`, `timeout`, `budget`, `loop`,
-`hallucinated_api`), latência p50/p95, custo e tokens (briefing §19).
+**Esta seção só é preenchida com um modelo real** (`make evals-coding`, provider `anthropic`,
+`ANTHROPIC_API_KEY`). O runner recusa publicar com o `FakeProvider`: o custo dele é zero e o
+"sucesso" é roteirizado, então esse número não seria uma medição. Nada abaixo foi medido ainda;
+o bloco entre os marcadores é substituído na primeira execução real.
 
-| # | Tarefa | Resultado | Categoria de falha | Custo | Latência |
-|---|--------|-----------|---------------------|-------|----------|
-| — | _aguardando `ANTHROPIC_API_KEY` e o runner de capability evals_ | — | — | — | — |
+Por item: resultado, `failure_category` (`timeout`, `budget`, `loop`, `hallucinated_api`,
+`policy_violation`, `wrong_file`, `tests_fail`, em ordem de precedência), custo, latência e
+iterações. Resumo: taxa de sucesso, custo por tarefa e por sucesso, latência p50/p95 e
+**escaped defects** (a verificação do control plane aprovou e o teste oculto reprovou;
+briefing §19).
+
+Regenerar: `make evals-coding` (o bloco entre os marcadores abaixo).
+
+<!-- evals:coding:begin -->
+
+_Aguardando a primeira execução com `ANTHROPIC_API_KEY`; nenhum número publicado._
+
+<!-- evals:coding:end -->
