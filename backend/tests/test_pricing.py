@@ -50,3 +50,17 @@ def test_unknown_model_raises_and_names_it() -> None:
         cost_usd("gpt-9-ultra", Usage(input_tokens=10))
     assert "gpt-9-ultra" in str(excinfo.value)
     assert "claude-opus-5" in str(excinfo.value)
+
+
+def test_opus_5_5_costs_its_posted_rate() -> None:
+    # claude-opus-5-5: $4.00 per 1M input, $20.00 per 1M output.
+    usage = Usage(input_tokens=1_000_000, output_tokens=100_000)
+    assert cost_usd("claude-opus-5-5", usage) == Decimal("6.000000")
+
+
+def test_opus_5_5_cache_reads_cost_their_own_rate() -> None:
+    # Posted cache-read price is $0.20 per 1M: 5% of input, not the 10% older models use.
+    # A flat multiplier would publish twice the real cost of a cache-heavy run.
+    assert cost_usd("claude-opus-5-5", Usage(cache_read_input_tokens=1_000_000)) == Decimal(
+        "0.200000"
+    )
