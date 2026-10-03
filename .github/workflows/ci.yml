@@ -57,7 +57,20 @@ jobs:
       # that starts a container. Built here rather than pulled: nothing publishes it yet.
       - run: docker build -t warden-sandbox:dev sandbox-images/python
 
-      - run: uv run --directory backend pytest
+      # Week 6 / briefing section 43 criterion: policy/ and core/ at >= 80% coverage, each
+      # package gated on its own so a well-covered one cannot hide a weak one. `coverage run`
+      # (not `pytest --cov`) because pyproject sets parallel + subprocess patching, which makes
+      # the worker subprocesses the durability tests spawn report too; `combine` merges them.
+      # A worker the tests kill (TerminateProcess/SIGKILL) never writes its data: not counted.
+      - run: uv run --directory backend coverage run -m pytest
+
+      - run: uv run --directory backend coverage combine
+
+      - name: Coverage gate, warden/policy
+        run: uv run --directory backend coverage report --include="warden/policy/*" --fail-under=80
+
+      - name: Coverage gate, warden/core
+        run: uv run --directory backend coverage report --include="warden/core/*" --fail-under=80
 
   # Week 6 checklist item: "12/12 behavioral evals passam no CI, custo zero" (scoped to the
   # 9 the control plane can express today; 3 are `status: pending` in the dataset). Costs
