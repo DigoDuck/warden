@@ -38,11 +38,16 @@ services:
       retries: 10
 
   # Builds the image the worker's sandboxes start from (the sandbox has no network, so it can
-  # never be pulled at run time) and exits. The entrypoint override makes `run` a no-op.
+  # never be pulled at run time) and exits. A plain `docker build` through the socket, NOT a
+  # Compose `build:`: Compose stamps its own labels (project, service) on every image it builds,
+  # and a container inherits its image's labels. Every sandbox would then pose as this project's
+  # `sandbox-image` service, which `docker compose down` neither owns nor removes.
   sandbox-image:
-    build: sandbox-images/python
-    image: warden-sandbox:dev
-    entrypoint: ["true"]
+    image: docker:27-cli
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./sandbox-images/python:/build:ro
+    command: docker build -q -t warden-sandbox:dev /build
 
   migrate:
     <<: *backend
@@ -76,6 +81,10 @@ services:
   worker:
     <<: *backend
     command: python -m warden.core.worker
+    # SIGTERM makes the worker finish the task it holds and then exit (worker.stop). Compose's
+    # default 10 s before SIGKILL is shorter than one verification (mypy alone takes ~30 s on
+    # the target repo), and a worker killed mid-task leaves its sandbox container running.
+    stop_grace_period: 3m
     volumes:
       - warden-keys:/keys:ro
       - /var/run/docker.sock:/var/run/docker.sock
