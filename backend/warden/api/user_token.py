@@ -25,7 +25,11 @@ from warden.models import User
 DEFAULT_TTL_SECONDS = 3600
 
 
-async def _get_or_create_user(session: AsyncSession, email: str) -> User:
+class RoleMismatch(Exception):
+    """The email belongs to a user whose role differs from the one asked for."""
+
+
+async def get_or_create_user(session: AsyncSession, email: str, role: str | None) -> User:
     user = await session.scalar(select(User).where(User.email == email))
     if user is not None:
         return user
@@ -43,7 +47,7 @@ async def _issue(email: str, scopes: list[str], ttl_seconds: int) -> str:
     keys = identity.load_keys(settings)
     session_factory = make_session_factory(make_engine(settings.database_url))
     async with session_factory() as session:
-        user = await _get_or_create_user(session, email)
+        user = await get_or_create_user(session, email, None)
         token = await identity.issue_user_token(
             session, keys, user, scopes=scopes, ttl_seconds=ttl_seconds
         )
@@ -51,12 +55,17 @@ async def _issue(email: str, scopes: list[str], ttl_seconds: int) -> str:
     return token
 
 
-def main() -> int:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--email", required=True)
     parser.add_argument("--scopes", nargs="+", required=True)
     parser.add_argument("--ttl-seconds", type=int, default=DEFAULT_TTL_SECONDS)
-    args = parser.parse_args()
+    parser.add_argument("--role", default=None)
+    return parser.parse_args(argv)
+
+
+def main() -> int:
+    args = parse_args()
 
     token = asyncio.run(_issue(args.email, args.scopes, args.ttl_seconds))
     print(token)  # the only line this ever prints
