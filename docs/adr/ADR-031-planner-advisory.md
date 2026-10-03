@@ -40,6 +40,11 @@ checkpoint → planner.plan(spec) → model_calls(purpose="planner") + plan.reco
 - **O coder lê o plano como segunda `UserMessage`**, depois da spec, rotulado como gerado pelo
   planner e não verificado, para ser usado como sugestão e não como instrução. A mensagem é montada
   por `plan_message` a partir do dict gravado, o mesmo texto no run ao vivo e no replay.
+  **Duas mensagens `user` seguidas são um 400 na API da Anthropic** ("roles must alternate"), e o
+  FakeProvider aceita qualquer sequência, então nenhum teste de loop pegaria isso antes da
+  primeira chamada real. A junção mora na fronteira: `providers/anthropic.py` dobra um turno
+  `user` no anterior como blocos de conteúdo extras, na ordem (os `tool_result` continuam
+  primeiro, onde a API exige). O domínio continua com duas mensagens; só o formato de fio muda.
 - **O custo soma em `spent`.** O `max_usd` já vale a partir da iteração 1: o teto é checado depois
   da primeira chamada do coder, e a do planner já está na conta.
 - **O planner só enxerga a spec.** Não tem tools nem acesso ao repositório, então `likely_files`
