@@ -5,6 +5,7 @@ import { ApiError, apiFetch } from "../api/client";
 import type { TaskOut } from "../api/types";
 import { DecisionPanel } from "../components/DecisionPanel";
 import { EvidencePanel } from "../components/EvidencePanel";
+import { ProvenanceBadge } from "../components/ProvenanceBadge";
 import { StatusBadge } from "../components/StatusBadge";
 import { Tabs } from "../components/Tabs";
 import { Timeline } from "../components/Timeline";
@@ -21,18 +22,57 @@ function formatCost(cost: string): string {
   return `US$ ${cost}`;
 }
 
+function PlanList({ title, items }: { title: string; items: string[] }) {
+  if (items.length === 0) return null;
+  return (
+    <div>
+      <h4 className="text-fg-muted">{title}</h4>
+      <ul className="list-disc pl-5">
+        {items.map((item, index) => (
+          <li key={index}>{item}</li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+// ADR-031: the planner's advice is model output, so it carries "Gerado" like the coder's summary
+// and the reviewer's verdict. It is context for the spec, never evidence: nothing here says the
+// coder followed it.
+function PlanSection({ plan }: { plan: TaskOut["plan"] }) {
+  // No heading and no "Gerado" badge when there is nothing generated to label.
+  if (!plan) return <p className="text-fg-muted">Sem plano para esta tarefa.</p>;
+  return (
+    <section aria-labelledby="spec-plan" className="flex flex-col gap-2">
+      <div className="flex flex-wrap items-center gap-3">
+        <h3 id="spec-plan" className="text-sm font-semibold">
+          Plano do planner
+        </h3>
+        <ProvenanceBadge kind="gerado" />
+      </div>
+      <PlanList title="Passos" items={plan.steps} />
+      <PlanList title="Arquivos prováveis" items={plan.likely_files} />
+      <PlanList title="Riscos" items={plan.risks} />
+      <PlanList title="Testes a criar" items={plan.tests_to_add} />
+    </section>
+  );
+}
+
 function SpecPanel({ task }: { task: TaskOut }) {
   return (
-    <dl className="flex flex-col gap-2">
-      <div>
-        <dt className="text-fg-muted">EspecificaÃ§Ã£o</dt>
-        <dd className="whitespace-pre-wrap">{task.spec}</dd>
-      </div>
-      <div>
-        <dt className="text-fg-muted">RepositÃ³rio alvo</dt>
-        <dd className="font-mono text-xs">{task.target_repo ?? "â€”"}</dd>
-      </div>
-    </dl>
+    <div className="flex flex-col gap-6">
+      <dl className="flex flex-col gap-2">
+        <div>
+          <dt className="text-fg-muted">Especificação</dt>
+          <dd className="whitespace-pre-wrap">{task.spec}</dd>
+        </div>
+        <div>
+          <dt className="text-fg-muted">Repositório alvo</dt>
+          <dd className="font-mono text-xs">{task.target_repo ?? "—"}</dd>
+        </div>
+      </dl>
+      <PlanSection plan={task.plan} />
+    </div>
   );
 }
 
