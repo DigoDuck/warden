@@ -22,6 +22,7 @@ from collections.abc import Callable
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+import yaml
 from docker.errors import DockerException
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
@@ -44,6 +45,7 @@ from warden.sandbox.docker import (
 )
 from warden.tools.registry import ToolRegistry
 from warden.tools.sandboxed import build_registry
+from warden.verify.reviewer import Reviewer
 from warden.verify.runner import EvidenceCollector, Verifier
 
 HEARTBEAT_FRACTION = 0.4
@@ -219,6 +221,7 @@ async def run_claimed_task(
     budget: Budget | None = None,
     holder: str | None = None,
     verifier: EvidenceCollector | None = None,
+    reviewer: Reviewer | None = None,
 ) -> RunResult:
     """Run a task from wherever it left off.
 
@@ -245,6 +248,7 @@ async def run_claimed_task(
         resume=resume,
         holder=holder,
         verifier=verifier,
+        reviewer=reviewer,
     )
 
 
@@ -318,6 +322,7 @@ class Worker:
         lease_seconds: int = queue.DEFAULT_LEASE_SECONDS,
         budget: Budget | None = None,
         profile: SandboxProfile | None = None,
+        reviewer_factory: Callable[[], ModelProvider] | None = None,
     ) -> None:
         self._sessions = session_factory
         self._provider_factory = provider_factory
@@ -331,6 +336,10 @@ class Worker:
         self._lease_seconds = lease_seconds
         self._budget = budget
         self._profile = profile or SandboxProfile()
+        # ADR-010: a separate factory, never the coder's provider instance, so the reviewer
+        # starts from an empty conversation. None means a gate-only verdict, which the verdict
+        # row records as `reviewer="none"` rather than hiding.
+        self._reviewer_factory = reviewer_factory
         self.id = worker_id()
         self._stopping = asyncio.Event()
 
@@ -395,6 +404,11 @@ class Worker:
                         # sandbox itself, so the diff compares like with like (ADR-026).
                         verifier=Verifier(
                             sandbox, self._workspace, exclude=never_readable(self._policy)
+                        ),
+                        reviewer=(
+                            Reviewer(self._reviewer_factory())
+                            if self._reviewer_factory is not None
+                            else None
                         ),
                     )
                 except queue.LeaseLost:
@@ -479,7 +493,24 @@ async def main() -> int:  # pragma: no cover - process entry point
         # approval or a crash) must continue the script, not replay it from step 0.
         return FakeProvider.from_yaml(args.script, resume_aware=True)
 
-    worker = Worker(sessions, provider_factory, load_policy(args.policy), WORKSPACE, keys)
+    # The script's `review:` section is the reviewer's answer. A script without one gets a
+    # gate-only verdict, recorded as such (`reviewer="none"`), not an invented approval.
+    reviewer_factory: Callable[[], ModelProvider] | None = None
+    if "review" in (yaml.safe_load(args.script.read_text(encoding="utf-8")) or {}):
+
+        def reviewer_factory() -> ModelProvider:
+            from warden.providers.fake import FakeProvider
+
+            return FakeProvider.from_yaml(args.script, section="review")
+
+    worker = Worker(
+        sessions,
+        provider_factory,
+        load_policy(args.policy),
+        WORKSPACE,
+        keys,
+        reviewer_factory=reviewer_factory,
+    )
 
     loop = asyncio.get_running_loop()
     for signame in ("SIGINT", "SIGTERM"):

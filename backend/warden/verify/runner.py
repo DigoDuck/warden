@@ -63,7 +63,12 @@ _TYPES_COMMANDS = (["mypy", "--cache-dir=/dev/null", "--explicit-package-bases",
 # green" are the same command. What differs is who ran it and when.
 _TESTS_COMMANDS = (["python", "-m", "pytest", "-q", "-p", "no:cacheprovider"],)
 
-CheckStatus = Literal["passed", "failed", "timeout", "error"]
+CheckStatus = Literal["passed", "failed", "timeout", "error", "no_tests"]
+
+# pytest's documented exit code for "no tests were collected". A repository without tests is
+# not a repository with failing tests, and the verdict's gate (ADR-010) must be able to tell
+# the two apart, so it gets a status of its own instead of being folded into "failed".
+PYTEST_NO_TESTS_COLLECTED = 5
 
 
 class CommandRun(BaseModel):
@@ -330,6 +335,8 @@ class Verifier:
                 )
             )
 
+        if kind == "tests" and runs[-1].exit_code == PYTEST_NO_TESTS_COLLECTED:
+            return CommandEvidence(kind=kind, status="no_tests", passed=False, commands=runs)
         passed = all(run.exit_code == 0 for run in runs)
         return CommandEvidence(
             kind=kind, status="passed" if passed else "failed", passed=passed, commands=runs

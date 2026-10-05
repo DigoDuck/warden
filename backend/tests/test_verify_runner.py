@@ -30,7 +30,7 @@ from warden.core.worker import WORKSPACE as WORKER_WORKSPACE
 from warden.core.worker import Worker
 from warden.db import with_database
 from warden.identity.jwt import KeyPair
-from warden.models import Evidence, ModelCall, User
+from warden.models import Evidence, ModelCall, User, Verdict
 from warden.policy.engine import Effect, Policy, Rule, load_policy
 from warden.providers.base import Completion
 from warden.providers.base import ToolCall as ProviderToolCall
@@ -391,4 +391,89 @@ rules:
             proc.wait(timeout=15)
         for stray in client.containers.list(all=True, filters={"label": f"warden.task={task_id}"}):
             stray.remove(force=True)
+        await asyncio.to_thread(discard_workspace_volume, str(task_id))
+
+
+async def test_a_repo_without_tests_reports_no_tests_not_failed(
+    docker_available: None, tmp_path: pathlib.Path
+) -> None:
+    """pytest exits 5 when it collects nothing. That has to stay distinguishable from red
+    tests, or every repo without a suite would fail the verdict's gate (ADR-010)."""
+    repo = tmp_path / "no-tests"
+    (repo / "src").mkdir(parents=True)
+    (repo / "src" / "app.py").write_text('print("hi")\n', encoding="utf-8", newline="\n")
+    box = await Sandbox.create(SandboxProfile(), repo)
+    try:
+        tests = await Verifier(box, repo).check("tests")
+    finally:
+        await box.destroy()
+
+    assert tests["status"] == "no_tests"
+    assert tests["commands"][0]["exit_code"] == 5
+
+
+async def test_red_tests_end_the_task_failed_through_a_real_worker(
+    docker_available: None,
+    empty_queue: None,
+    session: AsyncSession,
+    keys: KeyPair,
+    session_factory: async_sessionmaker[AsyncSession],
+    target_repo: pathlib.Path,
+) -> None:
+    """ADR-010 end to end: the agent adds a failing test, the scripted reviewer approves
+    anyway, and the task is FAILED because the gate read the real pytest result."""
+    user = User(email=f"{uuid.uuid4()}@warden.test", password_hash="x", role="worker")
+    session.add(user)
+    await session.flush()
+    task = await queue.enqueue(
+        session, user_id=user.id, spec="break it", idempotency_key=str(uuid.uuid4())
+    )
+    await session.commit()
+    task_id = task.id
+
+    def coder() -> FakeProvider:
+        return FakeProvider(
+            [
+                ScriptStep(
+                    tool_calls=[
+                        ProviderToolCall(
+                            id="w1",
+                            name="write_file",
+                            arguments={
+                                "path": "tests/test_broken.py",
+                                "content": "def test_broken() -> None:\n    assert 1 == 2\n",
+                            },
+                        )
+                    ]
+                ),
+                ScriptStep(
+                    tool_calls=[
+                        ProviderToolCall(id="f1", name="finish", arguments={"summary": "done"})
+                    ]
+                ),
+            ]
+        )
+
+    def reviewer() -> FakeProvider:
+        call = ProviderToolCall(
+            id="v1",
+            name="submit_verdict",
+            arguments={"passed": True, "summary": "approved", "findings": []},
+        )
+        return FakeProvider([ScriptStep(tool_calls=[call])], model="reviewer-model")
+
+    worker = Worker(
+        session_factory, coder, _allow_all(), target_repo, keys, reviewer_factory=reviewer
+    )
+    try:
+        result = await worker.run_once()
+
+        assert result is not None
+        assert result.status == "FAILED"
+        assert result.reason == "gate blocked by: tests"
+        verdict = await session.scalar(select(Verdict).where(Verdict.task_id == task_id))
+        assert verdict is not None
+        assert (verdict.passed, verdict.reviewer) == (False, "reviewer-model")
+        assert verdict.gate == {"passed": False, "blocked_by": ["tests"]}
+    finally:
         await asyncio.to_thread(discard_workspace_volume, str(task_id))

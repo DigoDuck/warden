@@ -315,3 +315,20 @@ def test_a_run_interrupted_mid_verification_reports_what_is_left() -> None:
     assert state.finished is False
     # Nothing pending from the agent's side: resuming must not look like a mid-iteration.
     assert not state.is_mid_iteration
+
+
+def test_a_recorded_verdict_is_reported_and_its_cost_counted() -> None:
+    state = rebuild(
+        _events(
+            (ev.TASK_CREATED, {"spec": "x"}),
+            (ev.ITERATION_STARTED, {"n": 1}),
+            _model_called([], cost="0.10"),
+            (ev.VERIFY_STARTED, {"summary": "done", "iterations": 1}),
+            (ev.VERIFY_RECORDED, {"kind": "tests", "status": "passed"}),
+            (ev.VERIFY_VERDICT, {"passed": True, "cost_usd": "0.02"}),
+        )
+    )
+    assert state.verification is not None
+    assert state.verification.verdict_recorded is True
+    # The review is billed to the task like the agent's own turns (ADR-010).
+    assert state.spent == Decimal("0.12")

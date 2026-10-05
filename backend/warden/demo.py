@@ -21,12 +21,13 @@ from warden.core import events
 from warden.core.loop import Budget, run_task
 from warden.db import make_engine, make_session_factory
 from warden.identity.jwt import load_keys
-from warden.models import Evidence, User
+from warden.models import Evidence, User, Verdict
 from warden.models import Task as TaskRow
 from warden.policy.engine import load_policy, never_readable
 from warden.providers.base import ModelProvider
 from warden.sandbox.docker import Sandbox, SandboxProfile, discard_workspace_volume
 from warden.tools.sandboxed import build_registry
+from warden.verify.reviewer import Reviewer
 from warden.verify.runner import Verifier
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -61,8 +62,19 @@ def build_provider(kind: str) -> ModelProvider:
     return AnthropicProvider(AsyncAnthropic(api_key=api_key))
 
 
+def build_reviewer(kind: str) -> Reviewer:
+    """The verdict's independent half (ADR-010): its own provider instance, so it starts from
+    an empty conversation. Fake mode reads the script's `review:` section."""
+    if kind == "fake":
+        from warden.providers.fake import FakeProvider
+
+        return Reviewer(FakeProvider.from_yaml(FAKE_SCRIPT, section="review"))
+    return Reviewer(build_provider(kind))
+
+
 async def main(kind: str) -> int:
     provider = build_provider(kind)
+    reviewer = build_reviewer(kind)
     engine = make_engine(get_settings().database_url)
     session_factory = make_session_factory(engine)
 
@@ -107,6 +119,7 @@ async def main(kind: str) -> int:
                 workspace=WORKSPACE,
                 budget=DEMO_BUDGET,
                 verifier=Verifier(sandbox, WORKSPACE, exclude=never_readable(policy)),
+                reviewer=reviewer,
             )
             await session.commit()
         finally:
@@ -125,6 +138,12 @@ async def main(kind: str) -> int:
         print("\nevidence collected by the verifier:")
         for row in evidence:
             print(f"  {row.kind:<6} {row.payload.get('status')}")
+
+        verdict = await session.scalar(select(Verdict).where(Verdict.task_id == task.id))
+        if verdict is not None:
+            print(f"\nverdict    passed={verdict.passed}  reviewer={verdict.reviewer}")
+            print(f"           gate={verdict.gate}")
+            print(f"           {verdict.summary}")
 
         print(f"\nstatus     {result.status}")
         print(f"iterations {result.iterations}")

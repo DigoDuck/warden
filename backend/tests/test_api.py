@@ -24,7 +24,7 @@ from warden import audit, identity
 from warden.api.app import create_app
 from warden.core import events, queue
 from warden.identity.jwt import ALGORITHM, KeyPair
-from warden.models import AuditLog, Evidence, Task, TaskEvent, User
+from warden.models import AuditLog, Evidence, Task, TaskEvent, User, Verdict
 
 
 @pytest.fixture
@@ -556,6 +556,39 @@ async def test_another_users_evidence_is_404(
     )
     response = await client.get(f"/tasks/{task_id}/evidence", headers=_auth(stranger))
     assert response.status_code == 404
+
+
+async def test_a_task_carries_its_verdict_once_there_is_one(
+    client: AsyncClient, session_factory: async_sessionmaker[AsyncSession], keys: KeyPair
+) -> None:
+    """Briefing §14: GET /tasks/{id} is "snapshot + custo + verdict" (ADR-010)."""
+    user = await _user(session_factory)
+    token = await _user_token(session_factory, keys, user, ["tasks:write", "tasks:read"])
+    task_id = await _submit(client, token)
+
+    before = await client.get(f"/tasks/{task_id}", headers=_auth(token))
+    assert before.json()["verdict"] is None
+
+    async with session_factory() as session:
+        session.add(
+            Verdict(
+                task_id=uuid.UUID(task_id),
+                verifier="independent",
+                status="ok",
+                passed=False,
+                gate={"passed": False, "blocked_by": ["tests"]},
+                findings=[],
+                summary="looks right but tests are red",
+                reviewer="reviewer-model",
+            )
+        )
+        await session.commit()
+
+    after = await client.get(f"/tasks/{task_id}", headers=_auth(token))
+    verdict = after.json()["verdict"]
+    assert verdict["passed"] is False
+    assert verdict["gate"]["blocked_by"] == ["tests"]
+    assert verdict["reviewer"] == "reviewer-model"
 
 
 # --- POST /tasks/{id}/cancel ------------------------------------------------------------------

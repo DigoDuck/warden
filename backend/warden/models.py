@@ -17,6 +17,7 @@ from typing import Any
 from sqlalchemy import (
     CHAR,
     BigInteger,
+    Boolean,
     CheckConstraint,
     DateTime,
     ForeignKey,
@@ -344,4 +345,45 @@ class Evidence(Base):
     )
     kind: Mapped[str] = mapped_column(String(32))
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class Verdict(Base):
+    """Whether a finished task counts as a success, and why (ADR-010).
+
+    `passed` is the gate and the reviewer together: the deterministic checks that must be
+    green (`gate`, from `evidence`) AND an independent model's reading of spec + diff. The
+    reviewer can never pass a task the gate blocked, because the combination is computed in
+    code after the model answers, not by the model. `ck_verdicts_error_never_passes` keeps
+    a review that could not be parsed from ever reading as a pass.
+
+    `verifier` is `independent` only for now; `coder_self` arrives with the week 8 experiment
+    that compares the two, together with the migration that widens the CHECK.
+    """
+
+    __tablename__ = "verdicts"
+    __table_args__ = (
+        CheckConstraint("verifier IN ('independent')", name="ck_verdicts_verifier"),
+        CheckConstraint("status IN ('ok', 'error')", name="ck_verdicts_status"),
+        CheckConstraint("status = 'ok' OR NOT passed", name="ck_verdicts_error_never_passes"),
+        UniqueConstraint("task_id", "verifier", name="uq_verdicts_task_verifier"),
+    )
+
+    id: Mapped[uuid.UUID] = _pk()
+    task_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("tasks.id", ondelete="CASCADE"), index=True
+    )
+    verifier: Mapped[str] = mapped_column(String(32))
+    status: Mapped[str] = mapped_column(String(16))
+    passed: Mapped[bool] = mapped_column(Boolean)
+    # {"passed": bool, "blocked_by": [kind, ...]}: the deterministic half, kept apart from
+    # the reviewer's opinion so a reader can always tell which one failed a task.
+    gate: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
+    findings: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, default=list)
+    summary: Mapped[str | None] = mapped_column(Text, default=None)
+    # The model that reviewed, or "none" when no reviewer was configured (gate-only verdict).
+    reviewer: Mapped[str] = mapped_column(String(64))
+    model_call_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("model_calls.id", ondelete="SET NULL"), default=None
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

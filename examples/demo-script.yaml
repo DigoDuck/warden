@@ -13,3 +13,17 @@ script:
         summary: >-
           A small FastAPI widget service: four endpoints (health, list, get, create) over an
           in-memory store, with five tests under tests/. Reading .env was refused by policy.
+
+# The independent reviewer's answer (ADR-010). A separate section, read by a separate provider
+# instance: the reviewer never sees the conversation above. The demo task changes no code, so
+# the reviewer passes it; the deterministic gate (tests + lint on the target repo) still has to
+# be green on its own for the verdict to pass.
+review:
+  - tool_call:
+      name: submit_verdict
+      args:
+        passed: true
+        summary: >-
+          The task asked for a summary of the repository and no code change; the diff is
+          empty, as expected.
+        findings: []

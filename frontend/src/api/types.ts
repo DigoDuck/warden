@@ -4,6 +4,7 @@ import type { components } from "./schema";
 
 export type TaskCreate = components["schemas"]["TaskCreate"];
 export type TaskOut = components["schemas"]["TaskOut"];
+export type VerdictOut = components["schemas"]["VerdictOut"];
 export type TaskListItemOut = components["schemas"]["TaskListItemOut"];
 export type TaskListOut = components["schemas"]["TaskListOut"];
 export type TaskEventOut = components["schemas"]["TaskEventOut"];

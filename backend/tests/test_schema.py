@@ -11,7 +11,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from warden.models import Evidence, Task, TaskEvent, User
+from warden.models import Evidence, Task, TaskEvent, User, Verdict
 
 EXPECTED_TABLES = {
     "users",
@@ -104,5 +104,53 @@ async def test_evidence_kind_check_rejects_unknown_kind(session: AsyncSession) -
     await session.flush()
 
     session.add(Evidence(task_id=task.id, kind="vibes", payload={}))
+    with pytest.raises(IntegrityError):
+        await session.flush()
+
+
+def _verdict(task_id: uuid.UUID, **overrides: object) -> Verdict:
+    fields: dict[str, object] = {
+        "task_id": task_id,
+        "verifier": "independent",
+        "status": "ok",
+        "passed": True,
+        "gate": {"passed": True, "blocked_by": []},
+        "findings": [],
+        "reviewer": "none",
+    }
+    fields.update(overrides)
+    return Verdict(**fields)
+
+
+async def _a_task(session: AsyncSession) -> Task:
+    user = await _a_user(session)
+    task = Task(idempotency_key=str(uuid.uuid4()), user_id=user.id, spec="anything")
+    session.add(task)
+    await session.flush()
+    return task
+
+
+async def test_a_task_has_at_most_one_independent_verdict(session: AsyncSession) -> None:
+    """ADR-010: a resumed verification can never decide twice."""
+    task = await _a_task(session)
+    session.add(_verdict(task.id))
+    await session.flush()
+
+    session.add(_verdict(task.id, passed=False))
+    with pytest.raises(IntegrityError):
+        await session.flush()
+
+
+async def test_an_errored_review_can_never_be_a_pass(session: AsyncSession) -> None:
+    """Fail closed in the database itself, not only in `reviewer.decide`."""
+    task = await _a_task(session)
+    session.add(_verdict(task.id, status="error", passed=True))
+    with pytest.raises(IntegrityError):
+        await session.flush()
+
+
+async def test_verifier_check_rejects_an_unknown_verifier(session: AsyncSession) -> None:
+    task = await _a_task(session)
+    session.add(_verdict(task.id, verifier="vibes"))
     with pytest.raises(IntegrityError):
         await session.flush()

@@ -94,13 +94,22 @@ class FakeProvider:
 
     @classmethod
     def from_yaml(
-        cls, path: str | pathlib.Path, *, model: str = "fake-model", resume_aware: bool = False
+        cls,
+        path: str | pathlib.Path,
+        *,
+        model: str = "fake-model",
+        resume_aware: bool = False,
+        section: str = "script",
     ) -> "FakeProvider":
+        """Load one section of a script file. `script` is the coding agent; `review` is the
+        independent reviewer's answer (ADR-010), kept in the same file so one scenario is
+        one file. A missing section is an error, never an empty or default script: a
+        reviewer that silently approves is exactly what this project exists to prevent."""
         path = pathlib.Path(path)
         document = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-        raw_steps = document.get("script")
+        raw_steps = document.get(section)
         if not raw_steps:
-            raise ValueError(f"{path}: no 'script' key, or it is empty")
+            raise ValueError(f"{path}: no {section!r} key, or it is empty")
         steps = [_parse_step(raw, index) for index, raw in enumerate(raw_steps)]
         return cls(steps, source=str(path), model=model, resume_aware=resume_aware)
 

@@ -32,12 +32,13 @@ from warden.api.schemas import (
     TaskListItemOut,
     TaskListOut,
     TaskOut,
+    VerdictOut,
 )
 from warden.core import cancel, queue
 from warden.core import events as core_events
 from warden.core.events import ITERATION_STARTED
 from warden.identity import Claims
-from warden.models import TASK_STATUSES, AuditLog, Evidence, ModelCall, Task, TaskEvent
+from warden.models import TASK_STATUSES, AuditLog, Evidence, ModelCall, Task, TaskEvent, Verdict
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
 
@@ -84,6 +85,7 @@ async def _to_task_out(session: AsyncSession, task: Task) -> TaskOut:
         .select_from(TaskEvent)
         .where(TaskEvent.task_id == task.id, TaskEvent.type == ITERATION_STARTED)
     )
+    verdict = await session.scalar(select(Verdict).where(Verdict.task_id == task.id))
     return TaskOut(
         id=task.id,
         status=task.status,
@@ -94,6 +96,19 @@ async def _to_task_out(session: AsyncSession, task: Task) -> TaskOut:
         finished_at=task.finished_at,
         cost_usd=Decimal(cost or 0),
         iterations=iterations or 0,
+        verdict=(
+            VerdictOut(
+                passed=verdict.passed,
+                status=verdict.status,
+                gate=verdict.gate,
+                reviewer=verdict.reviewer,
+                summary=verdict.summary,
+                findings=verdict.findings,
+                created_at=verdict.created_at,
+            )
+            if verdict is not None
+            else None
+        ),
     )
 
 

@@ -8,7 +8,6 @@ database rather than in this module.
 
 import hashlib
 import json
-from decimal import Decimal
 from typing import Any
 from uuid import UUID
 
@@ -16,7 +15,7 @@ from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from warden.identity import broker
-from warden.models import Evidence, ModelCall, PolicyDecision, TaskEvent, ToolCall
+from warden.models import Evidence, ModelCall, PolicyDecision, TaskEvent, ToolCall, Verdict
 from warden.policy.engine import Decision
 from warden.providers.base import Completion
 from warden.providers.base import ToolCall as ProviderToolCall
@@ -46,6 +45,9 @@ APPROVAL_REJECTED = "approval.rejected"
 # checks are already done.
 VERIFY_STARTED = "verify.started"
 VERIFY_RECORDED = "verify.recorded"
+# ADR-010: the verdict, committed with its `verdicts` row and the reviewer's `model_calls` row.
+# Carries the review's cost so replay can keep `spent` right after a resume.
+VERIFY_VERDICT = "verify.verdict"
 
 _SENSITIVE_KEY_PARTS = ("token", "key", "secret", "password", "credential", "authorization")
 _MAX_ARG_CHARS = 2_000
@@ -133,20 +135,26 @@ async def read_events(session: AsyncSession, task_id: UUID) -> list[TaskEvent]:
 
 
 async def record_model_call(
-    session: AsyncSession, task_id: UUID, completion: Completion, *, purpose: str = "agent"
-) -> Decimal:
-    """Persist one model call and return what it cost.
+    session: AsyncSession,
+    task_id: UUID,
+    completion: Completion,
+    *,
+    purpose: str = "agent",
+    prompt_version: str | None = None,
+) -> ModelCall:
+    """Persist one model call; the row's `cost_usd` is what it cost.
 
     Cost is computed here, next to the tokens that produced it, so the number in the
     database and the number the loop bills against the budget are the same number.
     """
     cost = cost_usd(completion.model, completion.usage)
     session.add(
-        ModelCall(
+        row := ModelCall(
             task_id=task_id,
             provider=completion.provider,
             model=completion.model,
             purpose=purpose,
+            prompt_version=prompt_version,
             tokens_in=completion.usage.input_tokens,
             tokens_out=completion.usage.output_tokens,
             cost_usd=cost,
@@ -154,7 +162,7 @@ async def record_model_call(
         )
     )
     await session.flush()
-    return cost
+    return row
 
 
 async def record_tool_call(
@@ -224,5 +232,36 @@ async def record_evidence(
     the database.
     """
     session.add(row := Evidence(task_id=task_id, kind=kind, payload=_redact_value(payload)))
+    await session.flush()
+    return row
+
+
+async def record_verdict(
+    session: AsyncSession,
+    task_id: UUID,
+    *,
+    passed: bool,
+    status: str,
+    gate: dict[str, Any],
+    findings: list[dict[str, Any]],
+    summary: str | None,
+    reviewer: str,
+    model_call_id: UUID | None,
+) -> Verdict:
+    """Persist the verdict (ADR-010). Findings and summary are model output that quotes the
+    agent's diff, so they get the same redaction as every event payload."""
+    session.add(
+        row := Verdict(
+            task_id=task_id,
+            verifier="independent",
+            passed=passed,
+            status=status,
+            gate=gate,
+            findings=_redact_value(findings),
+            summary=_redact_value(summary),
+            reviewer=reviewer,
+            model_call_id=model_call_id,
+        )
+    )
     await session.flush()
     return row

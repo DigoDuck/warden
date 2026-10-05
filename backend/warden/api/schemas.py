@@ -35,6 +35,20 @@ class TaskCreate(BaseModel):
     budget: BudgetIn | None = None
 
 
+class VerdictOut(BaseModel):
+    """ADR-010. `gate` is the deterministic half and `summary`/`findings` the reviewer's, kept
+    apart so a reader can always tell which one failed a task. `reviewer` is "none" for a
+    gate-only verdict."""
+
+    passed: bool
+    status: str
+    gate: dict[str, Any]
+    reviewer: str
+    summary: str | None
+    findings: list[dict[str, Any]]
+    created_at: datetime
+
+
 class TaskOut(BaseModel):
     id: uuid.UUID
     status: str
@@ -45,6 +59,8 @@ class TaskOut(BaseModel):
     finished_at: datetime | None
     cost_usd: Decimal
     iterations: int
+    # Briefing §14: "snapshot + custo + verdict". None until verification reaches a verdict.
+    verdict: VerdictOut | None = None
 
 
 class TaskListItemOut(BaseModel):

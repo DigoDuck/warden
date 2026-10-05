@@ -61,7 +61,9 @@ async def empty_queue(session: AsyncSession) -> AsyncIterator[None]:
 def workspace(tmp_path: pathlib.Path) -> pathlib.Path:
     root = tmp_path / "repo"
     (root / "src").mkdir(parents=True)
-    (root / "src" / "app.py").write_text("print('hello')\n", encoding="utf-8", newline="\n")
+    # Double quotes on purpose: this task ends through a real Worker, so its verdict's gate
+    # (ADR-010) runs `ruff format --check` on this file, and single quotes would fail it.
+    (root / "src" / "app.py").write_text('print("hello")\n', encoding="utf-8", newline="\n")
     return root
 
 
