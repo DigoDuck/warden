@@ -53,6 +53,12 @@ describe("AppShell", () => {
     expect(heading).toHaveFocus();
   });
 
+  it("lists Métricas in the navigation", () => {
+    renderShell();
+    const links = screen.getAllByRole("link", { name: "Métricas" });
+    expect(links.at(-1)).toHaveAttribute("href", "/metricas");
+  });
+
   it("closes the mobile <details> menu after navigating to a new page", async () => {
     renderShell();
     const details = document.querySelector("details");

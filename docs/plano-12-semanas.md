@@ -169,7 +169,7 @@
 **Pronto quando:**
 - [ ] abrir uma tarefa no Jaeger e ver `task.run → agent.iteration → model.generate/policy.evaluate/tool.execute → sandbox.exec → verify.run`
 - [ ] teste garante que atributos de span nunca contêm padrão de segredo nem conteúdo de arquivo
-- [ ] tela Metrics reflete os números de `docs/metrics.md` para o mesmo período
+- [ ] para o mesmo conjunto de tarefas, a tela Metrics e o runner de evals dão números idênticos (teste de paridade: `evals/tests/test_metrics_parity.py`; as fórmulas vivem em `backend/warden/metrics/summary.py`, usado pelos dois)
 
 ---
 
