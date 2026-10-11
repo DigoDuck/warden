@@ -4,6 +4,7 @@ import { BrowserRouter, Route, Routes, useNavigate } from "react-router-dom";
 import { onUnauthorized } from "./api/client";
 import { AppShell } from "./components/AppShell";
 import { Approvals } from "./pages/Approvals";
+import { Metrics } from "./pages/Metrics";
 import { Settings } from "./pages/Settings";
 import { SubmitTask } from "./pages/SubmitTask";
 import { TaskDetail } from "./pages/TaskDetail";
@@ -32,6 +33,7 @@ export function App() {
             <Route path="/tarefas/nova" element={<SubmitTask />} />
             <Route path="/tarefas/:id" element={<TaskDetail />} />
             <Route path="/aprovacoes" element={<Approvals />} />
+            <Route path="/metricas" element={<Metrics />} />
             <Route path="/configuracoes" element={<Settings />} />
           </Route>
         </Routes>

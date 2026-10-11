@@ -105,7 +105,7 @@ justa é `--danger` no raised, com 4,8:1. O componente
 
 ## Layout e navegação
 
-- ≥1024px: barra lateral fixa com os destinos principais (Tarefas, Nova tarefa, Aprovações,
+- ≥1024px: barra lateral fixa com os destinos principais (Tarefas, Nova tarefa, Aprovações, Métricas,
   Configurações), com ícone e texto, e o item atual destacado por cor e barra à esquerda.
 - <1024px: a barra vira um cabeçalho com menu. Nunca rolagem horizontal da página; tabela
   larga rola dentro do próprio contêiner.

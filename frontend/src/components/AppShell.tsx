@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { ClipboardCheck, ListChecks, Menu, Plus, Settings, type LucideIcon } from "lucide-react";
+import { BarChart3, ClipboardCheck, ListChecks, Menu, Plus, Settings, type LucideIcon } from "lucide-react";
 import { type ReactNode, useEffect, useRef } from "react";
 import { NavLink, Outlet, useLocation } from "react-router-dom";
 import { apiFetch } from "../api/client";
@@ -17,6 +17,7 @@ const NAV_ITEMS: NavItem[] = [
   { to: "/", label: "Tarefas", icon: ListChecks, end: true },
   { to: "/tarefas/nova", label: "Nova tarefa", icon: Plus },
   { to: "/aprovacoes", label: "Aprovações", icon: ClipboardCheck, badge: true },
+  { to: "/metricas", label: "Métricas", icon: BarChart3 },
   { to: "/configuracoes", label: "Configurações", icon: Settings },
 ];
 

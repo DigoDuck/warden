@@ -93,7 +93,7 @@ describe("Metrics", () => {
     // Numbers are read as columns of digits.
     expect(screen.getByText("75%")).toHaveClass("tabular-nums");
     // Counts by status come with the status text, not color alone.
-    expect(screen.getByRole("row", { name: /concluída/i })).toHaveTextContent("3");
+    expect(screen.getByRole("row", { name: /^concluída 3$/i })).toBeInTheDocument();
   });
 
   it("asks for the selected period", async () => {
