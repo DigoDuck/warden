@@ -30,7 +30,9 @@ def jwt() -> str:
     def part(data: dict[str, object]) -> str:
         return base64.urlsafe_b64encode(json.dumps(data).encode()).decode().rstrip("=")
 
-    return ".".join([part({"alg": "RS256", "typ": "JWT"}), part({"sub": "agent:1"}), "c2lnbmF0dXJl"])
+    return ".".join(
+        [part({"alg": "RS256", "typ": "JWT"}), part({"sub": "agent:1"}), "c2lnbmF0dXJl"]
+    )
 
 
 def pem_private_key() -> str:

@@ -37,10 +37,34 @@ _SCOPE_TO_SETTING: dict[str, str] = {
 _MIN_REDACTABLE_LENGTH = 8
 
 
-# Shapes of credentials that are secret wherever they show up, configured or not. Filled in by
-# the next commit; empty here so redact() keeps its current behaviour while the tests that
-# pin the new one are written first.
-SECRET_PATTERNS: tuple[re.Pattern[str], ...] = ()
+# Shapes of credentials that are secret wherever they show up, configured or not.
+#
+# `redact` used to know exactly one value, the configured GitHub token. A token the agent read
+# out of a file, or that a tool echoed back, passed straight through into events, `args_safe`,
+# evidence and span attributes. This is the second line: recognise the SHAPE. It is a heuristic
+# with a known ceiling (a secret with no recognisable prefix is not found), which is why the
+# first line stays: nothing the model sees contains a credential in the first place (ADR-006),
+# and span attributes are an allow-list of keys on top of this (telemetry/tracing.py).
+#
+# Each pattern is anchored on a distinctive prefix plus a minimum length, so ordinary words and
+# ids do not match: `disk-usage-...` must not trip the `sk-` rule (hence the lookbehind).
+SECRET_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(pattern)
+    for pattern in (
+        # GitHub: classic/OAuth/user/server/refresh tokens, then fine-grained personal tokens.
+        r"\bgh[pousr]_[A-Za-z0-9]{30,}",
+        r"\bgithub_pat_[A-Za-z0-9_]{40,}",
+        # Anthropic (`sk-ant-...`) and OpenAI-style (`sk-...`) keys.
+        r"(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{20,}",
+        # AWS access key id: fixed prefix, then exactly 16 upper-case alphanumerics.
+        r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b",
+        # A JWT: header and payload are base64url JSON, which always starts with `eyJ` ("{\"").
+        r"\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{8,}",
+        # A PEM private key, up to its END line or, when the text was truncated before it
+        # (stored output is capped), to the end of the string: a cut footer must not save the body.
+        r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|\Z)",
+    )
+)
 
 
 class UnknownScope(ValueError):
