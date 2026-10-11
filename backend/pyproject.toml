@@ -19,6 +19,8 @@ dependencies = [
     # of dev because it is now a runtime call path, not only a test double
     # (httpx.MockTransport), the way it was while only the FastAPI test client used it.
     "httpx>=0.28.1",
+    "opentelemetry-sdk>=1.45.1",
+    "opentelemetry-exporter-otlp-proto-http>=1.45.1",
 ]
 
 [dependency-groups]

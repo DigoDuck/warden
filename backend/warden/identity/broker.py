@@ -11,6 +11,7 @@ happens upstream when the token is issued (`identity.issue_agent_token`, on the 
 scope, get this one credential".
 """
 
+import re
 from datetime import UTC, datetime
 
 from pydantic import SecretStr
@@ -34,6 +35,12 @@ _SCOPE_TO_SETTING: dict[str, str] = {
 # redact() skips values shorter than this: replacing an empty or one-character string would
 # otherwise mangle almost every string it is run on instead of hiding a real token.
 _MIN_REDACTABLE_LENGTH = 8
+
+
+# Shapes of credentials that are secret wherever they show up, configured or not. Filled in by
+# the next commit; empty here so redact() keeps its current behaviour while the tests that
+# pin the new one are written first.
+SECRET_PATTERNS: tuple[re.Pattern[str], ...] = ()
 
 
 class UnknownScope(ValueError):
@@ -189,4 +196,6 @@ def redact(text: str, *, settings: Settings | None = None) -> str:
     for value in _configured_secrets(resolved_settings):
         if len(value) >= _MIN_REDACTABLE_LENGTH:
             text = text.replace(value, "[redacted]")
+    for pattern in SECRET_PATTERNS:
+        text = pattern.sub("[redacted]", text)
     return text
