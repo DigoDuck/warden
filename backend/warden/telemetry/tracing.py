@@ -22,7 +22,7 @@ def setup_tracing(service_name: str = "warden") -> TracerProvider | None:
 
 
 class SpanHandle:
-    def set(self, **attributes: object) -> None:
+    def set(self, attributes: Mapping[str, object]) -> None:
         return None
 
     def ids(self) -> tuple[str, str] | None:
@@ -35,6 +35,6 @@ def remote_parent(trace_id: str | None, span_id: str | None) -> Context | None:
 
 @contextmanager
 def span(
-    name: str, *, context: Context | None = None, **attributes: object
+    name: str, attributes: Mapping[str, object] | None = None, *, context: Context | None = None
 ) -> Iterator[SpanHandle]:
     yield SpanHandle()

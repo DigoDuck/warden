@@ -68,8 +68,8 @@ def test_a_long_string_is_cut() -> None:
 
 def test_a_span_carries_only_its_safe_attributes() -> None:
     with capture_spans() as exporter:
-        with telemetry.span("tool.execute", **{"warden.tool": "read_file"}) as s:
-            s.set(**{"warden.duration_ms": 12})
+        with telemetry.span("tool.execute", {"warden.tool": "read_file"}) as s:
+            s.set({"warden.duration_ms": 12})
 
     (done,) = exporter.get_finished_spans()
     assert done.name == "tool.execute"
