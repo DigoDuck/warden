@@ -82,6 +82,11 @@ def redact_args(arguments: dict[str, Any]) -> dict[str, Any]:
     return safe
 
 
+def args_hash(arguments: dict[str, Any]) -> str:
+    """Skeleton: filled in by the next commit."""
+    return ""
+
+
 def _redact_value(value: Any) -> Any:
     """Walk a JSON-shaped value (what a `task_events.payload`/tool output always is) and run
     every string leaf through `broker.redact()`, whatever shape it is nested in: a bare
