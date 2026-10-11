@@ -83,6 +83,27 @@ describe("TaskDetail", () => {
     expect(screen.getByText(/0\.120000/)).toBeInTheDocument();
   });
 
+  it("links to the task's trace in Jaeger when it has one", async () => {
+    const traceId = "4bf92f3577b34da6a3ce929d0e0e4736";
+    routeFetch({ [`/tasks/${TASK_ID}`]: [task({ trace_id: traceId })] });
+    renderAt(`/tarefas/${TASK_ID}`);
+    await screen.findByText("Executando");
+
+    const link = screen.getByRole("link", { name: "Trace" });
+    expect(link).toHaveAttribute("href", `http://localhost:16686/trace/${traceId}`);
+    // Opens a different origin from the app: it must not get a handle back to this window.
+    expect(link).toHaveAttribute("target", "_blank");
+    expect(link).toHaveAttribute("rel", expect.stringContaining("noopener"));
+  });
+
+  it("shows no trace link when the task has no trace", async () => {
+    routeFetch({ [`/tasks/${TASK_ID}`]: [task({ trace_id: null })] });
+    renderAt(`/tarefas/${TASK_ID}`);
+    await screen.findByText("Executando");
+
+    expect(screen.queryByRole("link", { name: "Trace" })).not.toBeInTheDocument();
+  });
+
   it("shows a not-found message for a missing task", async () => {
     routeFetch({});
     renderAt(`/tarefas/${TASK_ID}`);
