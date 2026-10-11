@@ -22,7 +22,6 @@ from warden import identity
 from warden.api.app import create_app
 from warden.core import events
 from warden.core.worker import POLICY_FILE
-from warden.identity.jwt import KeyPair
 from warden.models import Approval, ModelCall, Task, ToolCall, User
 from warden.policy.engine import load_policy
 
@@ -84,7 +83,9 @@ async def _seed_task(
                 )
             )
         for n in range(iterations):
-            await events.append_event(s, task.id, events.ITERATION_STARTED, {"n": n + 1})
+            await events.append_event(
+                s, task.id, events.ITERATION_STARTED, {"n": n + 1}
+            )
         for n in range(requested):
             await events.append_event(
                 s, task.id, events.TOOL_REQUESTED, {"id": f"c{n}", "tool": "read_file"}
@@ -119,7 +120,9 @@ async def _seed_task(
 
 
 @aio
-async def test_the_endpoint_and_the_runner_publish_identical_numbers(ctx: runner.Context) -> None:
+async def test_the_endpoint_and_the_runner_publish_identical_numbers(
+    ctx: runner.Context,
+) -> None:
     sf = ctx.session_factory
     async with sf() as s:
         user = User(email=f"{uuid.uuid4()}@warden.test", password_hash="!", role="user")
@@ -190,7 +193,9 @@ async def test_the_endpoint_and_the_runner_publish_identical_numbers(ctx: runner
 
     # The screen's way: an admin token (the seeded user is nobody's) over the whole database.
     async with sf() as s:
-        admin = User(email=f"{uuid.uuid4()}@warden.test", password_hash="!", role="user")
+        admin = User(
+            email=f"{uuid.uuid4()}@warden.test", password_hash="!", role="user"
+        )
         s.add(admin)
         await s.flush()
         token = await identity.issue_user_token(
@@ -198,7 +203,9 @@ async def test_the_endpoint_and_the_runner_publish_identical_numbers(ctx: runner
         )
         await s.commit()
     app = create_app(session_factory=sf, keys=ctx.keys)
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
         response = await client.get(
             "/metrics/summary", headers={"Authorization": f"Bearer {token}"}
         )
@@ -220,5 +227,7 @@ async def test_the_endpoint_and_the_runner_publish_identical_numbers(ctx: runner
     assert screen["avg_iterations"] == sum(r.iterations for r in results) / n
     assert screen["tool_calls_per_task"] == sum(r.tool_calls for r in results) / n
     # And the two figures only the screen has, from the same rows, checked by hand.
-    assert screen["tool_failure_rate"] == 0.5  # read_file ok, run_command failed; finish ignored
+    assert (
+        screen["tool_failure_rate"] == 0.5
+    )  # read_file ok, run_command failed; finish ignored
     assert screen["deny_rate"] == 1 / 6  # 1 deny among 6 policy.decided events
