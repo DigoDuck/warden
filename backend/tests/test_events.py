@@ -6,8 +6,15 @@ import pytest
 from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from tests import fake_secrets
 from warden.config import Settings
-from warden.core.events import append_event, read_events, record_tool_call, redact_args
+from warden.core.events import (
+    append_event,
+    args_hash,
+    read_events,
+    record_tool_call,
+    redact_args,
+)
 from warden.models import Task, User
 from warden.providers.base import ToolCall as ProviderToolCall
 
@@ -161,3 +168,29 @@ async def test_record_tool_call_redacts_result_summary_and_error(
 
     assert FAKE_TOKEN not in (row.result_summary or "")
     assert FAKE_TOKEN not in (row.error or "")
+
+
+def test_redact_args_finds_a_credential_by_shape_under_an_innocent_key() -> None:
+    """The key-name rule misses `{"cmd": "... ghp_..."}`: nothing about "cmd" or "body" is
+    sensitive, the value is. Nested values too (a patch's files, a list of paths)."""
+    token = fake_secrets.github_pat()
+
+    safe = redact_args(
+        {"cmd": f"git clone https://x:{token}@host/r", "files": [{"note": f"see {token}"}]}
+    )
+
+    assert token not in str(safe)
+    assert safe["cmd"] == "git clone https://x:[redacted]@host/r"
+    assert safe["files"] == [{"note": "see [redacted]"}]
+
+
+async def test_args_hash_is_the_hash_stored_with_the_tool_call(session: AsyncSession) -> None:
+    """Spans carry this hash instead of the arguments; it only identifies a call if it is the
+    same number the `tool_calls` row holds."""
+    task = await _a_task(session)
+    call = ProviderToolCall(id="c1", name="read_file", arguments={"path": "src/app.py"})
+
+    row = await record_tool_call(session, task.id, 1, call, decision="allow")
+
+    assert len(args_hash(call.arguments)) == 64
+    assert args_hash(call.arguments) == row.args_hash
