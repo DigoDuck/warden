@@ -15,6 +15,10 @@ import { TERMINAL_STATUSES } from "../lib/taskStatuses";
 
 const POLL_INTERVAL_MS = 4000;
 
+// Where the browser opens a trace (ADR-033). Read when the frontend is built, and opened by the
+// browser, so it is the host's address of Jaeger (Compose publishes it on WARDEN_JAEGER_PORT).
+const JAEGER_URL = (import.meta.env.VITE_JAEGER_URL ?? "http://localhost:16686").replace(/\/$/, "");
+
 // Kept as the exact string from tasks.cost_usd (a Postgres NUMERIC, serialised as a
 // string): parsing it through Number and reformatting would risk the very floating-point
 // rounding the backend's Decimal column exists to avoid (see warden/models.py::ModelCall).
@@ -196,6 +200,17 @@ export function TaskDetail() {
           <div className="mt-2 flex flex-wrap items-center gap-4">
             <StatusBadge status={task.status} />
             <span className="tabular-nums text-sm text-fg-muted">{formatCost(task.cost_usd)}</span>
+            {/* No link when the task was not traced: a link to a trace that does not exist is a
+                dead end in a different tab. noopener: it opens another origin. */}
+            {task.trace_id && (
+              <a
+                href={`${JAEGER_URL}/trace/${encodeURIComponent(task.trace_id)}`}
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                Trace
+              </a>
+            )}
             <button
               type="button"
               className="bg-danger-solid text-fg"
