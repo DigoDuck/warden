@@ -27,6 +27,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from warden import telemetry
 from warden.config import get_settings
 from warden.core import cancel, events, queue
 from warden.core.loop import Budget, RunResult, run_task
@@ -47,6 +48,10 @@ from warden.tools.registry import ToolRegistry
 from warden.tools.sandboxed import build_publish_registry, build_registry
 from warden.verify.reviewer import ProviderReviewer, Reviewer
 from warden.verify.runner import EvidenceCollector, Verifier
+
+# Where the first claim of a task keeps the id of its root span, next to `tasks.trace_id`
+# (ADR-033). A later claim hangs its own `task.run` under it, which is how one task stays one trace.
+ROOT_SPAN_KEY = "root_span_id"
 
 HEARTBEAT_FRACTION = 0.4
 IDLE_POLL_SECONDS = 1.0
@@ -238,22 +243,48 @@ async def run_claimed_task(
     if history:
         resume = rebuild(history)
 
-    return await run_task(
-        session,
-        task,
-        provider,
-        registry,
-        policy,
-        keys=keys,
-        workspace=workspace,
-        budget=budget,
-        resume=resume,
-        holder=holder,
-        verifier=verifier,
-        reviewer=reviewer,
-        publisher=publisher,
-        planner=planner,
-    )
+    # One task, one trace (ADR-033), although a task is claimed more than once (after an
+    # approval, after a crash) and each claim re-enters here. The first claim starts the trace
+    # and records its ids on the task; every later claim opens a new `task.run` as a child of
+    # that first root, so Jaeger shows the claims side by side in one trace.
+    parent = telemetry.remote_parent(task.trace_id, task.state.get(ROOT_SPAN_KEY))
+    with telemetry.span(
+        "task.run",
+        {"warden.task_id": str(task.id), "warden.resumed": resume is not None},
+        context=parent,
+    ) as run_span:
+        ids = run_span.ids()
+        if task.trace_id is None and ids is not None:
+            # Committed by the run's first checkpoint, with everything else the claim wrote.
+            # A claim that dies before it leaves no trace id, and the next one starts the trace.
+            # A new dict, not an in-place edit: SQLAlchemy does not see a mutated JSONB value.
+            task.trace_id = ids[0]
+            task.state = {**task.state, ROOT_SPAN_KEY: ids[1]}
+
+        result = await run_task(
+            session,
+            task,
+            provider,
+            registry,
+            policy,
+            keys=keys,
+            workspace=workspace,
+            budget=budget,
+            resume=resume,
+            holder=holder,
+            verifier=verifier,
+            reviewer=reviewer,
+            publisher=publisher,
+            planner=planner,
+        )
+        run_span.set(
+            {
+                "warden.status": result.status,
+                "warden.iterations": result.iterations,
+                "warden.cost_usd": result.cost_usd,
+            }
+        )
+        return result
 
 
 async def discard_orphaned_workspace_volumes(
@@ -493,6 +524,9 @@ async def main() -> int:  # pragma: no cover - process entry point
     # agent tokens with (ADR-025), so finding out at the first claim, mid-run, would be worse
     # than refusing to start at all.
     keys = load_keys(settings)
+    # Export spans when OTEL_EXPORTER_OTLP_ENDPOINT is set, nothing otherwise. Never fatal: a
+    # collector that is down costs a log line in the exporter's thread, not a task.
+    tracing = telemetry.setup_tracing("warden-worker")
     engine = make_engine(settings.database_url)
     sessions = make_session_factory(engine)
 
@@ -517,6 +551,9 @@ async def main() -> int:  # pragma: no cover - process entry point
         worker.stop()
     print("worker stopped")
     await engine.dispose()
+    if tracing is not None:
+        # Flushes what the batch exporter still holds; bounded by the exporter's own timeout.
+        tracing.shutdown()
     return 0
 
 

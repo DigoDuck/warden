@@ -24,6 +24,7 @@ import docker
 from docker.errors import ImageNotFound, NotFound
 from docker.models.containers import Container
 
+from warden import telemetry
 from warden.tools.workspace import is_ignored
 
 # A uid that exists neither in the image nor on the host: if a file ever escaped, it would
@@ -242,8 +243,10 @@ class Sandbox:
         volume_name: str,
         *,
         task_scoped: bool,
+        image: str = "",
     ) -> None:
         self._container = container
+        self._image = image
         self._client = client
         self._volume_name = volume_name
         # A task-scoped volume outlives its container because another worker may attach to
@@ -359,7 +362,9 @@ class Sandbox:
                 container.remove(force=True)
             discard_new_volume()
             raise
-        return Sandbox(container, client, volume.name, task_scoped=task_id is not None)
+        return Sandbox(
+            container, client, volume.name, task_scoped=task_id is not None, image=profile.image
+        )
 
     # Named kill_after, not timeout, and the difference is the behaviour. A timeout says
     # "stop waiting", which for a container means abandoning a command that keeps running.
@@ -372,15 +377,26 @@ class Sandbox:
         killing the container, which is also how cooperative cancellation will stop a long
         command later.
         """
-        try:
-            return await asyncio.wait_for(
-                asyncio.to_thread(self._exec_sync, command), timeout=kill_after
-            )
-        except TimeoutError:
-            await asyncio.to_thread(self._kill_sync)
-            raise CommandTimeout(
-                f"command {command!r} exceeded {kill_after}s; the container was killed"
-            ) from None
+        # The span names the container and the image, never `command` (the agent chose it) and
+        # never the output (it is whatever the command printed, file content included). The
+        # span is opened here, in the coroutine, not inside `_exec_sync`: `to_thread` would
+        # carry the context over, but there is nothing to gain from a span in the worker thread.
+        with telemetry.span(
+            "sandbox.exec",
+            {"warden.container_id": self.id[:12], "warden.image": self._image},
+        ) as exec_span:
+            try:
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(self._exec_sync, command), timeout=kill_after
+                )
+            except TimeoutError:
+                exec_span.set({"warden.status": "timeout"})
+                await asyncio.to_thread(self._kill_sync)
+                raise CommandTimeout(
+                    f"command {command!r} exceeded {kill_after}s; the container was killed"
+                ) from None
+            exec_span.set({"warden.status": "exit_0" if result.exit_code == 0 else "exit_nonzero"})
+            return result
 
     def _exec_sync(self, command: list[str]) -> ExecResult:
         result = self._container.exec_run(command, user=str(SANDBOX_UID), workdir=WORKSPACE)

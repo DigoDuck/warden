@@ -7,6 +7,7 @@ token in it, a token in an argument), because a test that only checks the helper
 if a call site bypassed it.
 """
 
+import logging
 import os
 import pathlib
 import socket
@@ -197,6 +198,8 @@ async def test_one_task_is_one_trace_with_a_single_root(planted_run: TracedRun) 
 
 async def test_the_span_tree_follows_briefing_section_20(planted_run: TracedRun) -> None:
     spans = planted_run.spans
+    # verify.run and review sit under the iteration that finished the task, or under task.run when
+    # a resumed claim goes straight to verification.
     expected_parents = {
         "planner.plan": {"task.run"},
         "agent.iteration": {"task.run"},
@@ -204,8 +207,8 @@ async def test_the_span_tree_follows_briefing_section_20(planted_run: TracedRun)
         "policy.evaluate": {"agent.iteration"},
         "tool.execute": {"agent.iteration"},
         "sandbox.exec": {"tool.execute", "verify.run", "policy.evaluate"},
-        "verify.run": {"task.run"},
-        "review": {"task.run"},
+        "verify.run": {"task.run", "agent.iteration"},
+        "review": {"task.run", "agent.iteration"},
     }
     for name, parents in expected_parents.items():
         found = _by_name(spans, name)
@@ -404,6 +407,11 @@ async def test_a_collector_that_is_down_does_not_change_the_task(
     _, task_id = await _enqueue(session_factory)
     steps = [_call("read_file", path="src/app.py"), _call("finish", summary="done"), verdict_step()]
 
+    # The session fixture runs Alembic, whose env.py calls logging.fileConfig and thereby DISABLES
+    # every logger that already exists, the exporter's included (verified: its record never
+    # reaches caplog otherwise). Re-enable it so the failure can be observed.
+    exporter_log = logging.getLogger("opentelemetry.exporter.otlp.proto.http.trace_exporter")
+    exporter_log.disabled = False
     provider = telemetry.setup_tracing("warden-closed-port-test")
     assert provider is not None
     try:
