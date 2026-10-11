@@ -98,9 +98,8 @@ def test_an_exception_marked_expected_is_not_an_error() -> None:
     class Parked(Exception):
         trace_expected = True
 
-    with capture_spans() as exporter:
-        with pytest.raises(Parked), telemetry.span("task.run"):
-            raise Parked
+    with capture_spans() as exporter, pytest.raises(Parked), telemetry.span("task.run"):
+        raise Parked
 
     (done,) = exporter.get_finished_spans()
     assert done.status.status_code is StatusCode.UNSET
@@ -110,9 +109,8 @@ def test_ids_are_none_without_a_provider_and_hex_with_one() -> None:
     with telemetry.span("task.run") as s:
         assert s.ids() is None
 
-    with capture_spans():
-        with telemetry.span("task.run") as s:
-            ids = s.ids()
+    with capture_spans(), telemetry.span("task.run") as s:
+        ids = s.ids()
     assert ids is not None
     trace_id, span_id = ids
     assert len(trace_id) == 32
