@@ -108,7 +108,7 @@ function Summary({ data }: { data: MetricsSummaryOut }): ReactNode {
 
       {/* DESIGN.md: never a horizontal page scroll; a wide table scrolls in its own box. */}
       <div className="mt-4 overflow-x-auto">
-        <table className="w-full text-left text-sm">
+        <table className="w-full text-left text-sm [&_td]:px-3 [&_th]:px-3">
           <caption className="sr-only">Indicadores do período</caption>
           <thead>
             <tr className={TABLE_HEAD}>
@@ -135,7 +135,7 @@ function Summary({ data }: { data: MetricsSummaryOut }): ReactNode {
 
       <h2 className="mt-8">Tarefas por status</h2>
       <div className="mt-2 max-w-md overflow-x-auto">
-        <table className="w-full text-left text-sm">
+        <table className="w-full text-left text-sm [&_td]:px-3 [&_th]:px-3">
           <caption className="sr-only">Tarefas encerradas por status</caption>
           <thead>
             <tr className={TABLE_HEAD}>
