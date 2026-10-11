@@ -5,7 +5,6 @@ Same split as checks.py/runner.py: the part with branching logic lives here and 
 tests (evals/tests/test_coding_checks.py); evals/coding.py talks to Postgres and Docker.
 """
 
-import math
 import pathlib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -13,6 +12,7 @@ from decimal import Decimal
 from typing import Any
 
 import yaml
+from warden.metrics.summary import RunMetrics, summarize
 from warden.tools.workspace import normalize_path
 from warden.verify.reviewer import GATING_KINDS
 
@@ -305,31 +305,41 @@ class Summary:
     escaped_defects: int
 
 
-def percentile(values: Sequence[float], p: int) -> float | None:
-    """Nearest-rank percentile: the smallest value with at least p% of the sample at or below
-    it. No interpolation, so the number is always one that was actually measured."""
-    if not values:
-        return None
-    ordered = sorted(values)
-    return ordered[max(0, math.ceil(p / 100 * len(ordered)) - 1)]
-
-
 def summarize_items(results: Sequence[ItemResult]) -> Summary:
     executed = [r for r in results if r.state == "done"]
-    successes = sum(1 for r in executed if r.success)
-    total = sum((r.cost_usd for r in executed), Decimal(0))
-    latencies = [r.latency_s for r in executed if r.latency_s is not None]
+    # The formulas are warden.metrics.summary's, the same ones GET /metrics/summary uses: the
+    # eval's table and the Metrics screen cannot disagree about what a success costs. Only
+    # what is specific to an eval (skipped items, escaped defects) is counted here.
+    shared = summarize(
+        [
+            RunMetrics(
+                status=r.status,
+                success=r.success,
+                cost_usd=r.cost_usd,
+                tokens_in=r.tokens_in,
+                tokens_out=r.tokens_out,
+                latency_s=r.latency_s,
+                iterations=r.iterations,
+                tool_calls=r.tool_calls,
+                tool_attempts=0,
+                tool_failures=0,
+                interventions=0,
+                decisions=0,
+                denies=0,
+            )
+            for r in executed
+        ]
+    )
     return Summary(
         executed=len(executed),
         skipped=sum(1 for r in results if r.state == "skipped"),
-        successes=successes,
-        success_rate=successes / len(executed) if executed else None,
-        cost_total=total,
-        cost_per_task=total / len(executed) if executed else None,
-        # Everything spent over what worked: a failed attempt is part of the price of a success.
-        cost_per_success=total / successes if successes else None,
-        latency_p50=percentile(latencies, 50),
-        latency_p95=percentile(latencies, 95),
+        successes=shared.successes,
+        success_rate=shared.success_rate,
+        cost_total=shared.cost_total,
+        cost_per_task=shared.cost_per_task,
+        cost_per_success=shared.cost_per_success,
+        latency_p50=shared.latency_p50,
+        latency_p95=shared.latency_p95,
         escaped_defects=sum(1 for r in executed if r.escaped_defect),
     )
 

@@ -34,12 +34,13 @@ from typing import Any
 
 import docker
 import docker.errors
-from sqlalchemy import func, select
+from sqlalchemy import select
 from warden.config import get_settings
 from warden.core import events
 from warden.core.loop import Budget
 from warden.core.worker import POLICY_FILE, TERMINAL_STATUSES, WORKSPACE, Worker
-from warden.models import Evidence, ModelCall, Task, Verdict
+from warden.metrics.summary import read_runs
+from warden.models import Evidence, Task, Verdict
 from warden.policy.engine import load_policy
 from warden.providers.base import ModelProvider
 from warden.providers.fake import FakeProvider
@@ -261,7 +262,6 @@ async def read_back(ctx: runner.Context, task_id: uuid.UUID) -> _Readback:
             (r for r in reversed(rows) if r.type == events.TASK_FINISHED), None
         )
         reason = finished.payload.get("reason") if finished else None
-        iterations = sum(1 for r in rows if r.type == events.ITERATION_STARTED)
         # Every call the model MADE, from `tool.requested`, joined with what the policy
         # decided about it. Not the `tool_calls` table: a call that parks the task for
         # approval has no row there until a human answers, and this has to see every call.
@@ -296,22 +296,11 @@ async def read_back(ctx: runner.Context, task_id: uuid.UUID) -> _Readback:
             select(Verdict).where(Verdict.task_id == task_id)
         )
 
-        # Every model call, the reviewer's included: what the item cost is what was spent.
-        cost, tokens_in, tokens_out = (
-            await session.execute(
-                select(
-                    func.coalesce(func.sum(ModelCall.cost_usd), 0),
-                    func.coalesce(func.sum(ModelCall.tokens_in), 0),
-                    func.coalesce(func.sum(ModelCall.tokens_out), 0),
-                ).where(ModelCall.task_id == task_id)
-            )
-        ).one()
+        # The numbers (cost, tokens, latency, iterations, tool calls) come from the same
+        # function GET /metrics/summary uses, so the table this run publishes and the Metrics
+        # screen cannot disagree. Every model call counts, the reviewer's included.
+        (run,) = await read_runs(session, Task.id == task_id, terminal_only=False)
 
-        latency = (
-            (task.finished_at - task.started_at).total_seconds()
-            if task.finished_at and task.started_at
-            else None
-        )
         return _Readback(
             facts=RunFacts(
                 status=task.status,
@@ -325,13 +314,12 @@ async def read_back(ctx: runner.Context, task_id: uuid.UUID) -> _Readback:
                 diff_files=diff_files,
                 tool_calls=tool_calls,
             ),
-            cost_usd=Decimal(cost),
-            tokens_in=int(tokens_in),
-            tokens_out=int(tokens_out),
-            latency_s=latency,
-            iterations=iterations,
-            # `finish` never emits `tool.requested`, so this is the tools the agent used.
-            tool_calls=len(tool_calls),
+            cost_usd=run.cost_usd,
+            tokens_in=run.tokens_in,
+            tokens_out=run.tokens_out,
+            latency_s=run.latency_s,
+            iterations=run.iterations,
+            tool_calls=run.tool_calls,
         )
 
 

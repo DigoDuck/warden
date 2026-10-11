@@ -391,15 +391,6 @@ def _done(
     )
 
 
-def test_percentile_is_nearest_rank() -> None:
-    values = [float(n) for n in range(1, 11)]
-    assert cc.percentile(values, 50) == 5.0
-    assert cc.percentile(values, 95) == 10.0
-    assert cc.percentile([7.0], 95) == 7.0
-    assert cc.percentile([], 50) is None
-    assert cc.percentile([3.0, 1.0, 2.0], 50) == 2.0  # unsorted input
-
-
 def test_summary_of_a_mixed_run() -> None:
     results = [
         _done(1, success=True, cost="0.10", latency=10),
