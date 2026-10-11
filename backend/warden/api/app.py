@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from warden.api.routes_approvals import router as approvals_router
 from warden.api.routes_audit import router as audit_router
+from warden.api.routes_metrics import router as metrics_router
 from warden.api.routes_tasks import router as tasks_router
 from warden.identity import KeyPair
 
@@ -34,6 +35,7 @@ def create_app(*, session_factory: async_sessionmaker[AsyncSession], keys: KeyPa
     app.include_router(tasks_router)
     app.include_router(audit_router)
     app.include_router(approvals_router)
+    app.include_router(metrics_router)
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
