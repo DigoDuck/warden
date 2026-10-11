@@ -17,6 +17,7 @@ COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci
 COPY frontend/ ./
 COPY --from=openapi /openapi.json /tmp/openapi.json
+ARG VITE_JAEGER_URL
 RUN npx openapi-typescript /tmp/openapi.json -o src/api/schema.d.ts && npx vite build
 
 # 3. Static files + reverse proxy for /api (same job as the Vite dev proxy).

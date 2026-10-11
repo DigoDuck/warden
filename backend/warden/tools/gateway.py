@@ -17,6 +17,7 @@ and immediately spends the token in the same call, and the failure modes below e
 the broker a hand-built `Claims` either (`identity/broker.py`'s own docstring).
 """
 
+import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 from uuid import UUID
@@ -24,7 +25,8 @@ from uuid import UUID
 import jwt as pyjwt
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from warden import audit
+from warden import audit, telemetry
+from warden.core.events import args_hash
 from warden.identity.jwt import InvalidToken, KeyPair, verify
 from warden.tools.registry import ToolContext, ToolError, ToolRegistry
 
@@ -146,4 +148,14 @@ async def execute(
     # is the fenced commit, so a worker that lost its lease stops here, before the tool runs.
     await checkpoint()
     context = ToolContext(claims=claims, session=session, checkpoint=checkpoint)
-    return await registry.execute(name, arguments, context=context)
+    # What the span says about the call: which tool, which hash (the same one `tool_calls` stores,
+    # so a trace line and a database row find each other), how long. Never the arguments and never
+    # the output; both can hold file content or a credential (ADR-033).
+    started = time.monotonic()
+    with telemetry.span(
+        "tool.execute", {"warden.tool": name, "warden.args_hash": args_hash(arguments)}
+    ) as tool_span:
+        try:
+            return await registry.execute(name, arguments, context=context)
+        finally:
+            tool_span.set({"warden.duration_ms": int((time.monotonic() - started) * 1000)})

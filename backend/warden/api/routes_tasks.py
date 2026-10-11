@@ -125,6 +125,7 @@ async def _to_task_out(session: AsyncSession, task: Task) -> TaskOut:
         iterations=iterations or 0,
         summary=str(summary) if summary is not None else None,
         plan=PlanOut.model_validate(plan) if plan else None,
+        trace_id=task.trace_id,
         verdict=(
             VerdictOut(
                 passed=verdict.passed,

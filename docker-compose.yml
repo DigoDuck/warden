@@ -76,11 +76,28 @@ services:
       migrate: { condition: service_completed_successfully }
       keys: { condition: service_completed_successfully }
 
+  # Where the worker's traces go (ADR-033). All-in-one keeps them in memory (a restart forgets
+  # them, which is fine for a dev trace viewer), takes OTLP/HTTP on 4318 from other services of
+  # this Compose project only (no host port: nothing outside needs to push spans), and serves
+  # the UI on 16686. Only the UI is published.
+  jaeger:
+    image: jaegertracing/all-in-one:1.76.0
+    environment:
+      MEMORY_MAX_TRACES: "5000"
+    ports:
+      - "${WARDEN_JAEGER_PORT:-16686}:16686"
+
   # Holds /var/run/docker.sock (ADR-012): it creates the per-task sandbox containers on the
   # host's daemon. Root access to the host by design; the agent never sees the socket.
   worker:
     <<: *backend
     command: python -m warden.core.worker
+    environment:
+      <<: *backend-env
+      # Standard OpenTelemetry variables. Remove the endpoint to run without tracing; a Jaeger
+      # that is down never fails a task, the exporter just logs it.
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+      OTEL_SERVICE_NAME: warden-worker
     # SIGTERM makes the worker finish the task it holds and then exit (worker.stop). Compose's
     # default 10 s before SIGKILL is shorter than one verification (mypy alone takes ~30 s on
     # the target repo), and a worker killed mid-task leaves its sandbox container running.
@@ -92,11 +109,15 @@ services:
       migrate: { condition: service_completed_successfully }
       keys: { condition: service_completed_successfully }
       sandbox-image: { condition: service_completed_successfully }
+      jaeger: { condition: service_started }
 
   frontend:
     build:
       context: .
       dockerfile: frontend/Dockerfile
+      args:
+        # Baked in at build time (Vite env), and opened by the browser, so it is the HOST port.
+        VITE_JAEGER_URL: http://localhost:${WARDEN_JAEGER_PORT:-16686}
     ports:
       - "${WARDEN_WEB_PORT:-5180}:80"
     depends_on:

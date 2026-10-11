@@ -68,18 +68,33 @@ def redact_args(arguments: dict[str, Any]) -> dict[str, Any]:
     """Make tool arguments safe to store and to ship to telemetry.
 
     The column is called `args_safe`, so writing raw arguments into it would be a quiet lie.
-    In week 1 the arguments are paths and nothing here triggers, but the function exists
-    from the same commit as the column rather than arriving after the secret broker does.
+    Two complementary rules: a key with a sensitive NAME is masked outright, and every other
+    value is scanned by SHAPE (`broker.redact`, which knows configured secrets and credential
+    patterns), nested values included, then bounded. The scan comes before the cut: truncating
+    first could split a token in half and hide it from the pattern.
     """
     safe: dict[str, Any] = {}
     for key, value in arguments.items():
         if any(part in key.lower() for part in _SENSITIVE_KEY_PARTS):
             safe[key] = "[redacted]"
-        elif isinstance(value, str) and len(value) > _MAX_ARG_CHARS:
-            safe[key] = value[:_MAX_ARG_CHARS] + f"[truncated: {len(value)} chars]"
-        else:
-            safe[key] = value
+            continue
+        value = _redact_value(value)
+        if isinstance(value, str) and len(value) > _MAX_ARG_CHARS:
+            value = value[:_MAX_ARG_CHARS] + f"[truncated: {len(value)} chars]"
+        safe[key] = value
     return safe
+
+
+def args_hash(arguments: dict[str, Any]) -> str:
+    """Identify a call by its arguments without carrying them.
+
+    The hash of the REDACTED arguments, the one stored in `tool_calls.args_hash`: enough to tell
+    two calls apart (the "no tool ran twice" assertion in the resume tests) without keeping a
+    second copy of the arguments around. Spans carry it too, which is why it has one definition.
+    """
+    return hashlib.sha256(
+        json.dumps(redact_args(arguments), sort_keys=True, default=str).encode()
+    ).hexdigest()
 
 
 def _redact_value(value: Any) -> Any:
@@ -193,9 +208,7 @@ async def record_tool_call(
             # Hash of the redacted arguments: enough to tell two calls apart for the
             # "no tool ran twice" assertion in the week 2 resume tests, without keeping a
             # second copy of the arguments around.
-            args_hash=hashlib.sha256(
-                json.dumps(safe, sort_keys=True, default=str).encode()
-            ).hexdigest(),
+            args_hash=args_hash(call.arguments),
             decision=decision,
             # Same choke point as `append_event`'s payload: the tool's own text, not just
             # its arguments, can echo a secret back.

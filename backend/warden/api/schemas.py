@@ -76,6 +76,9 @@ class TaskOut(BaseModel):
     # What the planner advised before the coder started (read from the event log; no column).
     # None when there is no plan on record.
     plan: PlanOut | None = None
+    # The OpenTelemetry trace id (32 hex) of the whole task, set by the worker's first claim
+    # (ADR-033). None when tracing was off: the UI shows no link then.
+    trace_id: str | None = None
 
 
 class TaskListItemOut(BaseModel):
