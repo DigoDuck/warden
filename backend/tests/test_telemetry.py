@@ -67,9 +67,11 @@ def test_a_long_string_is_cut() -> None:
 
 
 def test_a_span_carries_only_its_safe_attributes() -> None:
-    with capture_spans() as exporter:
-        with telemetry.span("tool.execute", {"warden.tool": "read_file"}) as s:
-            s.set({"warden.duration_ms": 12})
+    with (
+        capture_spans() as exporter,
+        telemetry.span("tool.execute", {"warden.tool": "read_file"}) as s,
+    ):
+        s.set({"warden.duration_ms": 12})
 
     (done,) = exporter.get_finished_spans()
     assert done.name == "tool.execute"
@@ -81,9 +83,8 @@ def test_a_failing_span_records_the_exception_type_and_never_its_message() -> No
     (a ToolError says which path it refused). OpenTelemetry's default would copy it into an
     event; this must not."""
     secret = fake_secrets.github_pat()
-    with capture_spans() as exporter:
-        with pytest.raises(RuntimeError), telemetry.span("tool.execute"):
-            raise RuntimeError(f"failed while reading {secret}")
+    with capture_spans() as exporter, pytest.raises(RuntimeError), telemetry.span("tool.execute"):
+        raise RuntimeError(f"failed while reading {secret}")
 
     (done,) = exporter.get_finished_spans()
     assert done.status.status_code is StatusCode.ERROR
